@@ -499,6 +499,38 @@ static uint32_t primary_plane(int crtc_idx)
     return found;
 }
 
+/* PINDI_ROTATE (0/180) and PINDI_MIRROR (none/horizontal/vertical), done by the
+ * display hardware for both splash and video. The Pi's HVS can't do 90/270. */
+static void apply_rotation(void)
+{
+    const char *rot = cfg("PINDI_ROTATE", "0"), *mirror = cfg("PINDI_MIRROR", "none");
+    uint64_t want = !strcmp(rot, "180") ? DRM_MODE_ROTATE_180 : DRM_MODE_ROTATE_0;
+    if (!strcasecmp(mirror, "horizontal"))
+        want |= DRM_MODE_REFLECT_X;
+    else if (!strcasecmp(mirror, "vertical"))
+        want |= DRM_MODE_REFLECT_Y;
+
+    uint32_t prop = 0;
+    drmModeObjectProperties *props = drmModeObjectGetProperties(D.fd, D.plane, DRM_MODE_OBJECT_PLANE);
+    for (uint32_t k = 0; props && k < props->count_props && !prop; k++) {
+        drmModePropertyRes *pp = drmModeGetProperty(D.fd, props->props[k]);
+        if (pp && !strcmp(pp->name, "rotation"))
+            prop = pp->prop_id;
+        drmModeFreeProperty(pp);
+    }
+    drmModeFreeObjectProperties(props);
+
+    if (!prop) {
+        if (want != DRM_MODE_ROTATE_0)
+            LOG("display: rotation/mirror not supported by this display driver");
+        return;
+    }
+    if (drmModeObjectSetProperty(D.fd, D.plane, DRM_MODE_OBJECT_PLANE, prop, want))
+        LOG("display: rotate %s / mirror %s rejected: %s", rot, mirror, strerror(errno));
+    else if (want != DRM_MODE_ROTATE_0)
+        LOG("display: rotate %s, mirror %s", rot, mirror);
+}
+
 static void splash_update_text(const char *ip, bool force)
 {
     if (!D.ok || (!force && !strcmp(ip, D.shown_ip)))
@@ -582,6 +614,7 @@ static bool display_setup(void)
     char ip[64];
     read_ip(ip, sizeof ip);
     splash_update_text(ip, true);
+    apply_rotation();
     if (drmModeSetCrtc(D.fd, D.crtc, D.splash.fb, 0, 0, &D.conn, 1, &D.mode)) {
         LOG("display: set mode failed: %s", strerror(errno));
         display_teardown();

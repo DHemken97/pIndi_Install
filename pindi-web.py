@@ -363,7 +363,7 @@ main{max-width:860px;margin:0 auto;padding:16px}
 .card h2{margin:0 0 12px;font-size:16px}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:0}dt{color:var(--muted)}dd{margin:0;word-break:break-all}
 label{display:block;margin:10px 0 4px;color:var(--muted);font-size:13px}
-input[type=text],input[type=password]{width:100%;padding:9px 10px;border-radius:7px;border:1px solid var(--line);
+input[type=text],input[type=password],select{width:100%;padding:9px 10px;border-radius:7px;border:1px solid var(--line);
 background:#0d1319;color:var(--text);font:inherit}
 input:focus{outline:2px solid var(--accent2);border-color:var(--accent2)}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
@@ -478,6 +478,21 @@ def dashboard(session):
         '</form>%s</section>' %
         (hidden, esc(stream), esc(DEFAULT_STREAM), esc(source_ip), esc(DEFAULT_STREAM), table))
 
+    # Display
+    rotate = env.get("PINDI_ROTATE", "0")
+    mirror = env.get("PINDI_MIRROR", "none")
+
+    def options(choices, current):
+        return "".join('<option value="%s"%s>%s</option>' % (v, " selected" if v == current else "", label)
+                       for v, label in choices)
+    parts.append(
+        '<section class="card"><h2>Display</h2><form method="post" action="/display">%s'
+        '<div class="row"><div><label>Rotation</label><select name="rotate">%s</select></div>'
+        '<div><label>Mirror</label><select name="mirror">%s</select></div></div>'
+        '<p class="hint">Applies to the video and the splash screen. 180&deg; is for upside-down (ceiling) '
+        'mounting; mirror is for rear projection.</p><button>Save display</button></form></section>' %
+        (hidden, options(ROTATIONS, rotate), options(MIRRORS, mirror)))
+
     # Network
     cfg = read_network_config()
     fill = cfg if not cfg["dhcp"] else {"address": net["address"], "prefix": net["prefix"],
@@ -545,6 +560,21 @@ def act_source(form):
     log("source: stream=%s ip=%s" % (env.get("PINDI_STREAM") or DEFAULT_STREAM, env.get("PINDI_SOURCE_IP") or "any"))
     return ("ok", "Source saved: %s from %s. The player is restarting." %
             (env.get("PINDI_STREAM") or DEFAULT_STREAM, env.get("PINDI_SOURCE_IP") or "any host"))
+
+
+ROTATIONS = [("0", "0&deg; (normal)"), ("180", "180&deg; (upside down)")]
+MIRRORS = [("none", "None"), ("horizontal", "Horizontal (left/right)"), ("vertical", "Vertical (top/bottom)")]
+
+
+def act_display(form):
+    rotate, mirror = form.get("rotate", "0"), form.get("mirror", "none")
+    if rotate not in dict(ROTATIONS) or mirror not in dict(MIRRORS):
+        return ("err", "Invalid display setting.")
+    write_env({"PINDI_ROTATE": "" if rotate == "0" else rotate,
+               "PINDI_MIRROR": "" if mirror == "none" else mirror})
+    later(0.5, run, "systemctl", "restart", "pindi.service")
+    log("display: rotate=%s mirror=%s" % (rotate, mirror))
+    return ("ok", "Display saved: rotation %s°, mirror %s. The player is restarting." % (rotate, mirror))
 
 
 def act_network(form):
@@ -699,6 +729,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.redirect("/login", [("Set-Cookie", "pindi_session=; Path=/; Max-Age=0")])
         if path == "/source":
             s["flash"] = act_source(form)
+        elif path == "/display":
+            s["flash"] = act_display(form)
         elif path == "/network":
             s["flash"] = act_network(form)
         elif path == "/network/confirm":
