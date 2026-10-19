@@ -1,0 +1,19 @@
+[Unit]
+Description=PiNDI splash screen and NDI receiver
+# Start as early as possible: the player loads the display driver itself and
+# waits for the network and avahi on its own.
+DefaultDependencies=no
+Conflicts=getty@tty1.service shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/pindi
+Environment=HOME=/root
+ExecStart=/usr/local/bin/pindi-player
+Restart=always
+RestartSec=1
+Nice=-10
+
+[Install]
+WantedBy=sysinit.target
