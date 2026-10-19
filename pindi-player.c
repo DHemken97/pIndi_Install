@@ -28,6 +28,7 @@
 #include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -759,6 +760,64 @@ static bool name_matches(const char *ndi_name, const char *target, const char *a
            (alt[0] && strlen(alt) == len && !strncasecmp(s, alt, len));
 }
 
+/* "192.168.1.5:5961" -> true if the host part equals ip. */
+static bool url_has_ip(const char *url, const char *ip)
+{
+    size_t n = strlen(ip);
+    return url && !strncmp(url, ip, n) && (url[n] == ':' || url[n] == 0);
+}
+
+/* ------------------------------------------------------------------ status for the web UI */
+
+#define RUN_DIR "/run/pindi"
+
+static void write_file_atomic(const char *path, const char *data)
+{
+    char tmp[128];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return;
+    fputs(data, f);
+    fclose(f);
+    rename(tmp, path);
+}
+
+static struct { char state[24], target[160], source[256], url[128], video[64]; } st;
+
+static void status_set(const char *state, const char *source, const char *url, const char *video)
+{
+    char buf[1024];
+    if (!strcmp(st.state, state) && !strcmp(st.source, source) && !strcmp(st.url, url) && !strcmp(st.video, video))
+        return;
+    snprintf(st.state, sizeof st.state, "%s", state);
+    snprintf(st.source, sizeof st.source, "%s", source);
+    snprintf(st.url, sizeof st.url, "%s", url);
+    snprintf(st.video, sizeof st.video, "%s", video);
+    snprintf(buf, sizeof buf, "state=%s\ntarget=%s\nsource=%s\nurl=%s\nvideo=%s\n",
+             st.state, st.target, st.source, st.url, st.video);
+    write_file_atomic(RUN_DIR "/status", buf);
+}
+
+/* Visible sources, one "name<TAB>url" per line; rewritten only when the list changes. */
+static void sources_publish(const NDIlib_source_t *srcs, uint32_t count)
+{
+    static char last[16384];
+    char buf[16384];
+    size_t len = 0;
+    buf[0] = 0;
+    for (uint32_t i = 0; i < count && len < sizeof buf - 1; i++)
+        len += snprintf(buf + len, sizeof buf - len, "%s\t%s\n",
+                        srcs[i].p_ndi_name ? srcs[i].p_ndi_name : "",
+                        srcs[i].p_url_address ? srcs[i].p_url_address : "");
+    if (len >= sizeof buf)
+        len = sizeof buf - 1;
+    if (!strcmp(buf, last))
+        return;
+    memcpy(last, buf, len + 1);
+    write_file_atomic(RUN_DIR "/sources", buf);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -782,7 +841,11 @@ int main(void)
         if (s != serial)
             snprintf(alt, sizeof alt, "OUT_%s", s); /* also accept without leading zeros */
     }
-    LOG("serial %s, looking for NDI stream %s", serial, target);
+    const char *source_ip = cfg("PINDI_SOURCE_IP", "");
+    LOG("serial %s, looking for NDI stream %s from %s", serial, target, *source_ip ? source_ip : "any host");
+    mkdir(RUN_DIR, 0755);
+    snprintf(st.target, sizeof st.target, "%s", target);
+    status_set("starting", "", "", "");
 
     /* Splash first - everything else can wait. Load the display driver (and the
      * I2C driver HDMI needs for EDID) now instead of waiting for udev. */
@@ -812,7 +875,10 @@ int main(void)
         !strcasecmp(bw_s, "lowest") ? NDIlib_recv_bandwidth_lowest : NDIlib_recv_bandwidth_highest;
     /* Many senders (screen capture, static graphics) only send frames on change. */
     int frame_timeout = atoi(cfg("PINDI_FRAME_TIMEOUT_MS", "0"));
-    const char *extra_ips = getenv("PINDI_EXTRA_IPS");
+    /* A fixed source IP is also given to discovery directly, so it works across subnets. */
+    char extra_ips[512];
+    snprintf(extra_ips, sizeof extra_ips, "%s%s%s", cfg("PINDI_EXTRA_IPS", ""),
+             *source_ip && *cfg("PINDI_EXTRA_IPS", "") ? "," : "", source_ip);
     char recv_name[128];
     snprintf(recv_name, sizeof recv_name, "PiNDI %s", serial);
 
@@ -829,10 +895,10 @@ int main(void)
     NDIlib_find_instance_t find = NULL;
     NDIlib_recv_instance_t recv = NULL;
     uint64_t find_created = 0, last_match = 0, last_ip_check = 0;
-    uint64_t recv_start = 0, last_alive = 0, last_frame = 0, last_stats = 0;
+    uint64_t recv_start = 0, last_alive = 0, last_frame = 0, last_stats = 0, last_sources = 0;
     int stats_ms = atoi(cfg("PINDI_STATS_SEC", "60")) * 1000;
     uint32_t last_count = UINT32_MAX;
-    char cur_src[256] = "", failed_src[256] = "", ip[64] = "";
+    char cur_src[256] = "", cur_url[128] = "", failed_src[256] = "", ip[64] = "";
     bool got_frame = false;
 
     while (running) {
@@ -857,7 +923,7 @@ int main(void)
                 continue;
             }
             NDIlib_find_create_t fc = { .show_local_sources = true, .p_groups = NULL,
-                                        .p_extra_ips = (extra_ips && *extra_ips) ? extra_ips : NULL };
+                                        .p_extra_ips = *extra_ips ? extra_ips : NULL };
             find = ndi->find_create_v2(&fc);
             find_created = last_match = now;
             last_count = UINT32_MAX;
@@ -869,10 +935,20 @@ int main(void)
             LOG("ndi: discovery started");
         }
 
+        /* Keep the visible-sources list fresh for the web UI while playing too. */
+        if (recv && now - last_sources >= 2000) {
+            uint32_t count = 0;
+            const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+            sources_publish(srcs, count);
+            last_sources = now;
+        }
+
         if (!recv) {
+            status_set("searching", "", "", "");
             ndi->find_wait_for_sources(find, 250);
             uint32_t count = 0;
             const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+            sources_publish(srcs, count);
             if (count != last_count) {
                 LOG("ndi: %u source(s) visible", count);
                 for (uint32_t i = 0; i < count; i++)
@@ -882,6 +958,8 @@ int main(void)
             const NDIlib_source_t *pick = NULL;
             for (uint32_t i = 0; i < count; i++) {
                 if (!srcs[i].p_ndi_name || !name_matches(srcs[i].p_ndi_name, target, alt))
+                    continue;
+                if (*source_ip && !url_has_ip(srcs[i].p_url_address, source_ip))
                     continue;
                 /* Prefer a match that has not just failed (e.g. stale entry on another host). */
                 if (!pick || !strcmp(pick->p_ndi_name, failed_src))
@@ -896,9 +974,11 @@ int main(void)
                     .p_ndi_recv_name = recv_name,
                 };
                 snprintf(cur_src, sizeof cur_src, "%s", pick->p_ndi_name);
+                snprintf(cur_url, sizeof cur_url, "%s", pick->p_url_address ? pick->p_url_address : "");
                 recv = ndi->recv_create_v3(&rc);
                 if (recv) {
-                    LOG("ndi: connecting to %s", cur_src);
+                    LOG("ndi: connecting to %s (%s)", cur_src, cur_url);
+                    status_set("connecting", cur_src, cur_url, "");
                     recv_start = now;
                     last_alive = now + 5000; /* grace period for the first connection */
                     got_frame = false;
@@ -923,6 +1003,10 @@ int main(void)
             if (!got_frame)
                 LOG("ndi: first frame after %llu ms", (unsigned long long)(now - recv_start));
             show_frame(&v);
+            char vid[64];
+            snprintf(vid, sizeof vid, "%dx%d %.2f fps", v.xres, v.yres,
+                     v.frame_rate_D ? (double)v.frame_rate_N / v.frame_rate_D : 0.0);
+            status_set("playing", cur_src, cur_url, vid);
             ndi->recv_free_video_v2(recv, &v);
             got_frame = true;
             last_frame = last_alive = now;
@@ -943,6 +1027,7 @@ int main(void)
         if (D.video_on && frame_timeout > 0 && now - last_frame > (uint64_t)frame_timeout) {
             LOG("ndi: no frames for %d ms, showing splash", frame_timeout);
             show_splash();
+            status_set("connected, no frames", cur_src, cur_url, "");
         }
         if (t == NDIlib_frame_type_error || (now > last_alive && now - last_alive > 3000)) {
             LOG("ndi: lost %s", cur_src);

@@ -29,7 +29,8 @@ done
 step() { echo; echo "==> $*"; }
 
 # Files edited on Windows get CRLF line endings; normalise the ones we use.
-sed -i 's/\r$//' "$SRC/pindi-player.c" "$SRC/pindi.service" "$SRC/pindi.conf"
+sed -i 's/\r$//' "$SRC/pindi-player.c" "$SRC/pindi.service" "$SRC/pindi.conf" \
+    "$SRC/pindi-web.py" "$SRC/pindi-web.service"
 
 BOOT=/boot/firmware
 [ -f "$BOOT/config.txt" ] || BOOT=/boot
@@ -56,7 +57,8 @@ apt-get "${APT_OPTS[@]}" install --no-install-recommends \
     libdrm-dev libfreetype-dev libjpeg-dev \
     fonts-dejavu-core \
     avahi-daemon libavahi-client3 \
-    systemd-resolved
+    systemd-resolved \
+    python3 libpam-runtime
 
 # ---------------------------------------------------------------- NDI runtime
 step "Installing NDI SDK runtime"
@@ -122,8 +124,19 @@ fi
 rm -f /usr/local/bin/pindi-splash-render /usr/share/pindi/splash-live.jpg
 
 install -m 644 "$SRC/pindi.service" /etc/systemd/system/pindi.service
+
+# Web administration (port 80). Logins are the Pi's own users in the sudo group.
+install -d /usr/local/lib/pindi
+install -m 755 "$SRC/pindi-web.py" /usr/local/lib/pindi/pindi-web.py
+cat > /etc/pam.d/pindi-web <<'EOF'
+# PiNDI web interface: same password check as a normal login / SSH.
+@include common-auth
+@include common-account
+EOF
+install -m 644 "$SRC/pindi-web.service" /etc/systemd/system/pindi-web.service
+
 systemctl daemon-reload
-systemctl enable pindi.service
+systemctl enable pindi.service pindi-web.service
 
 # ---------------------------------------------------------------- boot speed
 step "Optimising boot ($BOOT)"
@@ -241,6 +254,7 @@ step "Done"
 echo "Serial: $(tr -d '\0' < /sys/firmware/devicetree/base/serial-number)"
 echo "NDI stream to send: OUT_$(tr -d '\0' < /sys/firmware/devicetree/base/serial-number)"
 echo "Settings: /etc/default/pindi   Logs: journalctl -u pindi -f"
+echo "Web admin: http://<this device's IP>/ (log in as a sudo user, e.g. the SSH user)"
 echo "Original boot files saved as $CFG.pindi-orig and $CMDLINE.pindi-orig"
 if [ "$REBOOT" -eq 1 ]; then
     echo "Rebooting in 5 seconds (Ctrl+C to cancel)..."

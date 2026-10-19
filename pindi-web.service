@@ -1,0 +1,14 @@
+[Unit]
+Description=PiNDI web administration
+# Not needed for the picture: start after the player so it never delays it.
+After=network.target pindi.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/pindi/pindi-web.py
+Restart=always
+RestartSec=2
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
