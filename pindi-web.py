@@ -662,14 +662,14 @@ def dashboard(session):
         k = "out%d." % n
         status_rows = "" if not o["enabled"] else (
             '<dl><dt>State</dt><dd><span data-k="%sstate" class="state%s">%s</span></dd>'
-            '<dt>Looking for</dt><dd>%s</dd>'
+            '<dt>Looking for</dt><dd data-k="%starget">%s</dd>'
             '<dt>Connected to</dt><dd data-k="%ssource">%s</dd>'
             '<dt>Video</dt><dd data-k="%svideo">%s</dd>'
             '<dt>Latency</dt><dd><span data-k="%slatency">%s</span>'
             '<span class="hint block">Measured per frame: from the moment the sender handed '
             'it to NDI until it was on screen. Not included: the camera/capture before the sender and the '
             'monitor&#39;s own processing.</span></dd></dl>' %
-            (k, " playing" if o["state"] == "playing" else "", esc(o["state"]), esc(o["target"]),
+            (k, " playing" if o["state"] == "playing" else "", esc(o["state"]), k, esc(o["target"]),
              k, esc(o["source"] or "-"), k, esc(o["video"] or "-"), k, esc(o["latency"] or "-")))
         parts.append(
             '<section class="card" id="out%d"><h2>Output %d &middot; %s %s</h2>%s'
@@ -1010,7 +1010,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/status":
             st = {"ip": live_network()["address"], "rollback": NET.seconds_left() if NET.pending() else None}
             for o in outputs():
-                for k in ("state", "source", "video", "latency"):
+                for k in ("state", "target", "source", "video", "latency"):
                     st["out%d.%s" % (o["n"], k)] = o[k]
             # Status files only: cheap enough to poll (no device enumeration).
             for n, conf in configured_inputs(read_env()).items():
