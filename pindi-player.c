@@ -478,6 +478,8 @@ struct output {
     struct buf vid[NBUF];
     int vstate[NBUF];
     double vaspect[NBUF];
+    int64_t vsent[NBUF];  /* sender's submit time, 100 ns UTC (NDI timestamp), or INT64_MAX */
+    uint64_t vrecv[NBUF]; /* when this Pi got the frame from NDI, monotonic us */
     int pw, ph;
     uint32_t pfmt; /* format of the current buffer pool */
     int ww, wh;
@@ -489,6 +491,9 @@ struct output {
     bool disabled; /* PINDI_OUT<n>_ENABLED=0: no NDI, HDMI signal off (e.g. encoder-only units) */
     char target[160], alt[160], source_ip[64];
     const char *rot_s, *mirror_s;
+
+    /* Latency of frames that reached the screen (main thread), published every 5 s. */
+    struct { double pi_sum, pi_min, pi_max, tot_sum, tot_min, tot_max; int n, tot_n; uint64_t since; } lat;
 
     /* Receiver thread. */
     pthread_t thr;
@@ -926,17 +931,69 @@ out:
     return ok;
 }
 
+static uint64_t clock_us(clockid_t id)
+{
+    struct timespec ts;
+    clock_gettime(id, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+/* A video frame reached the screen at flip_us (monotonic, from the vblank event). */
+static void latency_add(struct output *o, int idx, uint64_t flip_us)
+{
+    if (!o->lat.n && !o->lat.tot_n) {
+        o->lat.pi_min = o->lat.tot_min = 1e9;
+        o->lat.pi_max = o->lat.tot_max = -1e9;
+    }
+    double pi = (double)(int64_t)(flip_us - o->vrecv[idx]) / 1000.0;
+    o->lat.pi_sum += pi;
+    o->lat.pi_min = fmin(o->lat.pi_min, pi);
+    o->lat.pi_max = fmax(o->lat.pi_max, pi);
+    o->lat.n++;
+    if (o->vsent[idx] != INT64_MAX) {
+        /* Sender time is UTC: move the flip time from the monotonic to the realtime clock. */
+        int64_t offset_us = (int64_t)clock_us(CLOCK_REALTIME) - (int64_t)clock_us(CLOCK_MONOTONIC);
+        double tot = ((double)((int64_t)flip_us + offset_us) * 10.0 - (double)o->vsent[idx]) / 10000.0;
+        o->lat.tot_sum += tot;
+        o->lat.tot_min = fmin(o->lat.tot_min, tot);
+        o->lat.tot_max = fmax(o->lat.tot_max, tot);
+        o->lat.tot_n++;
+    }
+}
+
+/* Every 5 s: write the averages for the web UI (empty file when no video is shown). */
+static void latency_publish(struct output *o, uint64_t now)
+{
+    if (now - o->lat.since < 5000)
+        return;
+    char path[64], buf[256] = "";
+    snprintf(path, sizeof path, RUN_DIR "/out%d.latency", o->n);
+    if (o->lat.n)
+        snprintf(buf, sizeof buf, "pi_avg=%.1f\npi_min=%.1f\npi_max=%.1f\n", o->lat.pi_sum / o->lat.n,
+                 o->lat.pi_min, o->lat.pi_max);
+    if (o->lat.tot_n)
+        snprintf(buf + strlen(buf), sizeof buf - strlen(buf), "total_avg=%.1f\ntotal_min=%.1f\ntotal_max=%.1f\n",
+                 o->lat.tot_sum / o->lat.tot_n, o->lat.tot_min, o->lat.tot_max);
+    if (o->lat.n)
+        snprintf(buf + strlen(buf), sizeof buf - strlen(buf), "frames=%d\n", o->lat.n);
+    write_file_atomic(path, buf);
+    memset(&o->lat, 0, sizeof o->lat);
+    o->lat.since = now;
+}
+
 static void on_flip(int fd, unsigned seq, unsigned sec, unsigned usec, unsigned crtc, void *data)
 {
-    (void)fd; (void)seq; (void)sec; (void)usec; (void)crtc;
+    (void)fd; (void)seq; (void)crtc;
     struct output *o = data;
     pthread_mutex_lock(&o->lock);
     if (o->pending == P_VIDEO) {
         if (o->scanout >= 0)
             o->vstate[o->scanout] = B_FREE;
         o->scanout = o->queued;
-        if (o->scanout >= 0)
+        if (o->scanout >= 0) {
             o->vstate[o->scanout] = B_SCANOUT;
+            latency_add(o, o->scanout, (uint64_t)sec * 1000000 + usec);
+        }
         o->queued = -1;
         o->on_splash = false;
     } else if (o->pending == P_SPLASH) {
@@ -1014,7 +1071,7 @@ static void output_service(struct output *o)
 }
 
 /* Receiver thread: hand a frame to the display. Drops it if no buffer is free. */
-static void post_frame(struct output *o, const NDIlib_video_frame_v2_t *v)
+static void post_frame(struct output *o, const NDIlib_video_frame_v2_t *v, uint64_t recv_us)
 {
     uint32_t fmt;
     switch (v->FourCC) {
@@ -1081,6 +1138,8 @@ static void post_frame(struct output *o, const NDIlib_video_frame_v2_t *v)
         o->ready = idx;
         o->vstate[idx] = B_READY;
         o->vaspect[idx] = v->picture_aspect_ratio > 0 ? v->picture_aspect_ratio : (double)v->xres / v->yres;
+        o->vsent[idx] = v->timestamp;
+        o->vrecv[idx] = recv_us;
     }
     pthread_mutex_unlock(&o->lock);
     wake();
@@ -1324,12 +1383,13 @@ static void *receiver(void *arg)
 
         NDIlib_video_frame_v2_t v;
         NDIlib_frame_type_e t = ndi->recv_capture_v3(recv, &v, NULL, NULL, 100);
+        uint64_t recv_us = clock_us(CLOCK_MONOTONIC);
         now = now_ms();
         if (t == NDIlib_frame_type_video) {
             if (!got_frame)
                 LOG("ndi: output %d: first frame after %llu ms (%dx%d)", o->n,
                     (unsigned long long)(now - recv_start), v.xres, v.yres);
-            post_frame(o, &v);
+            post_frame(o, &v, recv_us);
             char vid[64];
             snprintf(vid, sizeof vid, "%dx%d %.2f fps", v.xres, v.yres,
                      v.frame_rate_D ? (double)v.frame_rate_N / v.frame_rate_D : 0.0);
@@ -1528,6 +1588,8 @@ int main(void)
             output_service(&outs[i]);
 
         uint64_t now = now_ms();
+        for (int i = 0; i < nout; i++)
+            latency_publish(&outs[i], now);
         if (drm_fd < 0 && now - last_poll >= 1000) {
             /* Display driver appeared late: set up now. */
             last_poll = now;

@@ -269,6 +269,16 @@ ClientIdentifier=mac
 EOF
 fi
 systemctl enable systemd-networkd.service systemd-resolved.service
+
+# Clock: the Pi has no RTC. Public NTP servers in addition to any from DHCP or the
+# web UI: timesyncd rotates through all of them, so a DHCP-advertised server that
+# doesn't answer no longer leaves the clock unsynced (latency figures need it).
+install -d /etc/systemd/timesyncd.conf.d
+cat > /etc/systemd/timesyncd.conf.d/pindi.conf <<'EOF'
+[Time]
+NTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org 3.debian.pool.ntp.org
+EOF
+systemctl restart systemd-timesyncd.service || true
 for u in NetworkManager.service NetworkManager-dispatcher.service; do
     if unit_exists "$u"; then
         systemctl disable "$u" >/dev/null 2>&1 || true

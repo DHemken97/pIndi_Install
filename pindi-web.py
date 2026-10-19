@@ -211,7 +211,7 @@ def live_network():
 
 
 def read_network_config():
-    cfg = {"dhcp": True, "address": "", "prefix": "", "gateway": "", "dns": []}
+    cfg = {"dhcp": True, "address": "", "prefix": "", "gateway": "", "dns": [], "ntp": []}
     for line in read_text(NETWORK_FILE).splitlines():
         key, _, val = line.strip().partition("=")
         if key == "Address":
@@ -221,11 +221,15 @@ def read_network_config():
             cfg["gateway"] = val
         elif key == "DNS":
             cfg["dns"] += val.split()
+        elif key == "NTP":
+            cfg["ntp"] += val.split()
     return cfg
 
 
-def render_network_config(dhcp, iface=None, gateway="", dns=()):
+def render_network_config(dhcp, iface=None, gateway="", dns=(), ntp=()):
     text = "# Written by the PiNDI web interface.\n[Match]\nType=ether\n\n[Network]\n"
+    for server in ntp:
+        text += "NTP=%s\n" % server
     if dhcp:
         return text + "DHCP=yes\n\n[DHCPv4]\nClientIdentifier=mac\n"
     text += "Address=%s\n" % iface.with_prefixlen
@@ -320,6 +324,50 @@ def out_setting(env, n, key, default=""):
     return v if v else default
 
 
+_ntp = {"t": 0, "ok": False}
+
+
+def clock_synced():
+    if time.time() - _ntp["t"] > 30:
+        _ntp["ok"] = run("timedatectl", "show", "-p", "NTPSynchronized", "--value").stdout.strip() == "yes"
+        _ntp["t"] = time.time()
+    return _ntp["ok"]
+
+
+def clock_text():
+    out = run("timedatectl", "timesync-status").stdout
+    server = re.search(r"Server: (\S+)", out)
+    offset = re.search(r"Offset: (\S+)", out)
+    if clock_synced():
+        return "synchronised%s%s" % (" with %s" % esc(server.group(1)) if server else "",
+                                    " (offset %s)" % esc(offset.group(1)) if offset else "")
+    return ('<span class="warn">not synchronised</span>%s' %
+            (" &ndash; trying %s" % esc(server.group(1)) if server else ""))
+
+
+def latency_text(n):
+    """Human summary of /run/pindi/out<n>.latency (5 s averages of frames that reached the screen)."""
+    lat = read_kv("%s/out%d.latency" % (RUN_DIR, n))
+    if "pi_avg" not in lat:
+        return ""
+    pi = "%.0f ms on this Pi" % float(lat["pi_avg"])
+    if "total_avg" not in lat:
+        return pi + " (sender gives no timestamp)"
+    total = float(lat["total_avg"])
+    if not -10000 < total < 10000:
+        return pi + " (sender and Pi clocks disagree)"
+    if total < float(lat["pi_avg"]):
+        # Impossible unless the sender's clock runs ahead of this Pi's.
+        return pi + (" – sender → screen not measurable: the sender's clock is at least %.0f ms ahead "
+                     "of this Pi's. Sync the sender's clock (Windows: w32tm /resync)." %
+                     (float(lat["pi_avg"]) - total))
+    text = "%.0f ms sender → screen (%.0f–%.0f), of which %s" % (
+        total, float(lat["total_min"]), float(lat["total_max"]), pi)
+    if not clock_synced():
+        text += " – Pi clock not NTP-synced, sender figure approximate"
+    return text
+
+
 def outputs():
     """Display outputs as detected by the player, with their settings and live status."""
     env = read_env()
@@ -340,6 +388,7 @@ def outputs():
             "rotate": out_setting(env, n, "ROTATE", "0"), "mirror": out_setting(env, n, "MIRROR", "none"),
             "state": st.get("state", "-"), "target": st.get("target", default_out_stream(n)),
             "source": st.get("source", ""), "video": st.get("video", ""),
+            "latency": latency_text(n) if running and st.get("state") == "playing" else "",
         })
     return out
 
@@ -514,7 +563,7 @@ label.check{display:flex;gap:8px;align-items:center;color:var(--text);font-size:
 label.check .hint{margin:0}
 .sub{border-top:1px solid var(--line);padding:12px 0 4px}.sub:first-of-type{border-top:0}
 .sub h3{margin:0 0 2px;font-size:15px}.sub p{margin:4px 0}
-.card dl{margin-bottom:6px}
+.card dl{margin-bottom:6px}.warn{color:var(--warn)}.hint.block{display:block;margin-top:2px}
 form.inline{display:inline}
 @media(max-width:600px){.row{grid-template-columns:1fr}main{padding:12px}}
 """
@@ -592,6 +641,7 @@ def dashboard(session):
         ("IP address", '<span data-k="ip">%s</span>' % esc(net["address"] or "-")),
         ("Serial", esc(SERIAL)),
         ("Hostname", esc(socket.gethostname())),
+        ("Clock", clock_text()),
         ("Outputs", "%d display output%s" % (len(outs), "" if len(outs) == 1 else "s")),
         ("Inputs", "%d capture device%s" % (len(ins), "" if len(ins) == 1 else "s")),
     ]
@@ -612,9 +662,13 @@ def dashboard(session):
             '<dl><dt>State</dt><dd><span data-k="%sstate" class="state%s">%s</span></dd>'
             '<dt>Looking for</dt><dd>%s</dd>'
             '<dt>Connected to</dt><dd data-k="%ssource">%s</dd>'
-            '<dt>Video</dt><dd data-k="%svideo">%s</dd></dl>' %
+            '<dt>Video</dt><dd data-k="%svideo">%s</dd>'
+            '<dt>Latency</dt><dd><span data-k="%slatency">%s</span>'
+            '<span class="hint block">Measured per frame: from the moment the sender handed '
+            'it to NDI until it was on screen. Not included: the camera/capture before the sender and the '
+            'monitor&#39;s own processing.</span></dd></dl>' %
             (k, " playing" if o["state"] == "playing" else "", esc(o["state"]), esc(o["target"]),
-             k, esc(o["source"] or "-"), k, esc(o["video"] or "-")))
+             k, esc(o["source"] or "-"), k, esc(o["video"] or "-"), k, esc(o["latency"] or "-")))
         parts.append(
             '<section class="card" id="out%d"><h2>Output %d &middot; %s %s</h2>%s'
             '<form method="post" action="/output">%s<input type="hidden" name="n" value="%d">'
@@ -700,11 +754,16 @@ def dashboard(session):
         '<div><label>Gateway</label><input type="text" name="gateway" value="%s" placeholder="192.168.1.1"></div>'
         '<div><label>DNS servers</label><input type="text" name="dns" value="%s" placeholder="192.168.1.1, 1.1.1.1">'
         '</div></div></div>'
+        '<label>NTP time servers (optional)</label><input type="text" name="ntp" value="%s" '
+        'placeholder="e.g. 192.168.1.1 or time.example.com">'
+        '<p class="hint">The public pool.ntp.org servers are always tried as well; add a local server for sites '
+        'without internet access. An accurate clock is needed for the sender &rarr; screen latency figure.</p>'
         '<p class="hint">After applying, open the device at its new address within %d seconds and press '
         '<b>Keep</b>, otherwise the previous settings come back automatically. The current IP is always '
         'shown on the splash screen.</p><button>Apply network settings</button></form></section>' %
         (hidden, "checked" if cfg["dhcp"] else "", "" if cfg["dhcp"] else "checked",
-         esc(fill["address"]), esc(mask), esc(fill["gateway"]), esc(", ".join(fill["dns"])), ROLLBACK_SECONDS))
+         esc(fill["address"]), esc(mask), esc(fill["gateway"]), esc(", ".join(fill["dns"])),
+         esc(", ".join(cfg["ntp"])), ROLLBACK_SECONDS))
 
     # Password
     parts.append(
@@ -815,8 +874,12 @@ def act_outgoing(form):
 
 
 def act_network(form):
+    ntp = [s for s in re.split(r"[\s,;]+", form.get("ntp", "").strip()) if s]
+    for s in ntp:
+        if not re.match(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})$", s):
+            return ("err", "NTP server %s is not a valid host name or IP address." % s)
     if form.get("mode") == "dhcp":
-        text = render_network_config(True)
+        text = render_network_config(True, ntp=ntp)
         target = "DHCP"
     else:
         try:
@@ -844,7 +907,7 @@ def act_network(form):
                 dns.append(str(ipaddress.IPv4Address(d)))
             except ValueError:
                 return ("err", "DNS server %s is not an IPv4 address." % d)
-        text = render_network_config(False, iface, gateway, dns)
+        text = render_network_config(False, iface, gateway, dns, ntp)
         target = str(iface.ip)
     if text == read_text(NETWORK_FILE) and not NET.pending():
         return ("ok", "Network settings unchanged.")
@@ -938,7 +1001,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/status":
             st = {"ip": live_network()["address"], "rollback": NET.seconds_left() if NET.pending() else None}
             for o in outputs():
-                for k in ("state", "source", "video"):
+                for k in ("state", "source", "video", "latency"):
                     st["out%d.%s" % (o["n"], k)] = o[k]
             # Status files only: cheap enough to poll (no device enumeration).
             for n, conf in configured_inputs(read_env()).items():
