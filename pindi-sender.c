@@ -213,11 +213,12 @@ struct input {
     pthread_t thr;
 };
 
-static void status(struct input *in, const char *state, const char *mode, double fps)
+/* fps = frames sent, cam_fps = frames from the device, damaged = frames skipped (last 2 s). */
+static void status(struct input *in, const char *state, const char *mode, double fps, double cam_fps, int damaged)
 {
     char buf[768], path[64];
-    snprintf(buf, sizeof buf, "state=%s\ndevice=%s\nname=%s\nmode=%s\nfps=%.1f\n", state, in->device, in->name,
-             mode ? mode : "", fps);
+    snprintf(buf, sizeof buf, "state=%s\ndevice=%s\nname=%s\nmode=%s\nfps=%.1f\ncam_fps=%.1f\ndamaged=%d\n", state,
+             in->device, in->name, mode ? mode : "", fps, cam_fps, damaged);
     snprintf(path, sizeof path, RUN_DIR "/in%d.status", in->n);
     write_file_atomic(path, buf);
 }
@@ -228,7 +229,7 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
 {
     int fd = open(in->device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
-        status(in, "waiting for device", NULL, 0);
+        status(in, "waiting for device", NULL, 0, 0, 0);
         return;
     }
     struct capbuf cap[NCAP] = { 0 };
@@ -239,7 +240,7 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
     char mode_desc[64] = "";
 
     if (!choose_mode(fd, in->mode_s, &m)) {
-        status(in, "no usable video format", NULL, 0);
+        status(in, "no usable video format", NULL, 0, 0, 0);
         goto out;
     }
     struct v4l2_format fmt = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
@@ -248,7 +249,7 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
     fmt.fmt.pix.pixelformat = m.fourcc;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
     if (xioctl(fd, VIDIOC_S_FMT, &fmt)) {
-        status(in, "cannot set format", NULL, 0);
+        status(in, "cannot set format", NULL, 0, 0, 0);
         goto out;
     }
     m.w = fmt.fmt.pix.width;
@@ -265,7 +266,7 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
 
     struct v4l2_requestbuffers req = { .count = NCAP, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP };
     if (xioctl(fd, VIDIOC_REQBUFS, &req) || req.count < 2) {
-        status(in, "cannot allocate capture buffers", mode_desc, 0);
+        status(in, "cannot allocate capture buffers", mode_desc, 0, 0, 0);
         goto out;
     }
     for (ncap = 0; ncap < (int)req.count && ncap < NCAP; ncap++) {
@@ -282,7 +283,7 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
     }
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ncap < 2 || xioctl(fd, VIDIOC_STREAMON, &type)) {
-        status(in, "cannot start capture", mode_desc, 0);
+        status(in, "cannot start capture", mode_desc, 0, 0, 0);
         goto out;
     }
 
@@ -294,16 +295,20 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
     if (m.fourcc == V4L2_PIX_FMT_MJPEG)
         tj = tjInitDecompress();
     LOG("input %d: %s from %s as NDI \"%s\"", in->n, mode_desc, in->device, in->name);
-    status(in, "starting", mode_desc, 0);
+    status(in, "starting", mode_desc, 0, 0, 0);
 
-    int cur = 0, timeouts = 0, frames = 0;
-    uint64_t t0 = now_ms();
-    bool warned = false;
+    int cur = 0, timeouts = 0, frames = 0, cam = 0, damaged = 0;
+    int log_cam = 0, log_sent = 0, log_damaged = 0;
+    uint64_t t0 = now_ms(), t_log = t0;
+    /* Share of recent frames the decoder warned about. Warnings usually mean a truncated
+     * frame (grey/garbage band = visible flicker), so those are dropped - unless the camera
+     * warns on nearly every frame, in which case the warning is a harmless quirk. */
+    double warn_rate = 0;
     while (running) {
         struct pollfd p = { .fd = fd, .events = POLLIN };
         int r = poll(&p, 1, 1000);
         if (r == 0) {
-            status(in, "no signal", mode_desc, 0);
+            status(in, "no signal", mode_desc, 0, 0, 0);
             if (++timeouts >= 5)
                 break; /* re-open the device */
             continue;
@@ -317,6 +322,7 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
             break;
         }
         timeouts = 0;
+        cam++;
         const uint8_t *src = cap[b.index].start;
         NDIlib_video_frame_v2_t f = {
             .xres = m.w, .yres = m.h,
@@ -328,7 +334,8 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
         };
         bool ok = true;
         if (m.fourcc == V4L2_PIX_FMT_MJPEG) {
-            int jw, jh, sub, cs;
+            int jw, jh, sub, cs, rc = -1;
+            bool warn = false;
             if (!b.bytesused || tjDecompressHeader3(tj, src, b.bytesused, &jw, &jh, &sub, &cs) || jw != m.w ||
                 jh != m.h) {
                 ok = false;
@@ -337,31 +344,34 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
                 unsigned char *dst[3] = { frame[cur], frame[cur] + (size_t)m.w * m.h,
                                           frame[cur] + (size_t)m.w * m.h * 5 / 4 };
                 int strides[3] = { m.w, m.w / 2, m.w / 2 };
-                ok = !tjDecompressToYUVPlanes(tj, src, b.bytesused, dst, m.w, strides, m.h, TJFLAG_FASTDCT) ||
-                     tjGetErrorCode(tj) == TJERR_WARNING;
+                rc = tjDecompressToYUVPlanes(tj, src, b.bytesused, dst, m.w, strides, m.h, TJFLAG_FASTDCT);
                 f.FourCC = NDIlib_FourCC_video_type_I420;
                 f.line_stride_in_bytes = m.w;
             } else if (sub == TJSAMP_422) {
                 /* Decode to planar 4:2:2, then interleave to UYVY (NDI's native format). */
                 unsigned char *dst[3] = { planes, planes + (size_t)m.w * m.h, planes + (size_t)m.w * m.h * 3 / 2 };
                 int strides[3] = { m.w, m.w / 2, m.w / 2 };
-                ok = !tjDecompressToYUVPlanes(tj, src, b.bytesused, dst, m.w, strides, m.h, TJFLAG_FASTDCT) ||
-                     tjGetErrorCode(tj) == TJERR_WARNING;
-                for (int y = 0; ok && y < m.h; y++)
-                    yuv422p_to_uyvy(dst[0] + (size_t)y * m.w, dst[1] + (size_t)y * m.w / 2,
-                                    dst[2] + (size_t)y * m.w / 2, frame[cur] + (size_t)y * m.w * 2, m.w);
+                rc = tjDecompressToYUVPlanes(tj, src, b.bytesused, dst, m.w, strides, m.h, TJFLAG_FASTDCT);
                 f.FourCC = NDIlib_FourCC_video_type_UYVY;
                 f.line_stride_in_bytes = m.w * 2;
             } else {
-                ok = !tjDecompress2(tj, src, b.bytesused, frame[cur], m.w, m.w * 4, m.h, TJPF_BGRX, TJFLAG_FASTDCT) ||
-                     tjGetErrorCode(tj) == TJERR_WARNING;
+                rc = tjDecompress2(tj, src, b.bytesused, frame[cur], m.w, m.w * 4, m.h, TJPF_BGRX, TJFLAG_FASTDCT);
                 f.FourCC = NDIlib_FourCC_video_type_BGRX;
                 f.line_stride_in_bytes = m.w * 4;
             }
-            if (!ok && !warned) {
-                LOG("input %d: skipping undecodable MJPEG frame(s)", in->n);
-                warned = true;
+            if (ok) {
+                warn = rc && tjGetErrorCode(tj) == TJERR_WARNING;
+                ok = !rc || (warn && warn_rate > 0.8);
+                warn_rate = warn_rate * 0.95 + (warn ? 0.05 : 0);
             }
+            if (ok && sub == TJSAMP_422) {
+                unsigned char *y = planes, *u = planes + (size_t)m.w * m.h, *v = planes + (size_t)m.w * m.h * 3 / 2;
+                for (int row = 0; row < m.h; row++)
+                    yuv422p_to_uyvy(y + (size_t)row * m.w, u + (size_t)row * m.w / 2, v + (size_t)row * m.w / 2,
+                                    frame[cur] + (size_t)row * m.w * 2, m.w);
+            }
+            if (!ok)
+                damaged++;
         } else if (m.fourcc == V4L2_PIX_FMT_YUYV) {
             yuyv_to_uyvy(src, frame[cur], (size_t)m.w * m.h * 2);
             f.FourCC = NDIlib_FourCC_video_type_UYVY;
@@ -372,20 +382,30 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
             f.line_stride_in_bytes = m.w * 2;
         }
         xioctl(fd, VIDIOC_QBUF, &b);
-        if (!ok)
-            continue;
-
-        ndi->send_send_video_async_v2(send, &f);
-        cur ^= 1;
-        frames++;
+        if (ok) {
+            ndi->send_send_video_async_v2(send, &f);
+            cur ^= 1;
+            frames++;
+        }
         uint64_t now = now_ms();
         if (now - t0 >= 2000) {
             int conns = ndi->send_get_no_connections(send, 0);
             char st[64];
             snprintf(st, sizeof st, "sending (%d receiver%s)", conns, conns == 1 ? "" : "s");
-            status(in, st, mode_desc, frames * 1000.0 / (now - t0));
-            frames = 0;
+            double secs = (now - t0) / 1000.0;
+            status(in, st, mode_desc, frames / secs, cam / secs, damaged);
+            log_cam += cam;
+            log_sent += frames;
+            log_damaged += damaged;
+            frames = cam = damaged = 0;
             t0 = now;
+        }
+        if (now - t_log >= 60000) {
+            double secs = (now - t_log) / 1000.0;
+            LOG("input %d: last %.0f s: camera %.1f fps, sent %.1f fps, %d damaged frame%s skipped", in->n, secs,
+                log_cam / secs, log_sent / secs, log_damaged, log_damaged == 1 ? "" : "s");
+            log_cam = log_sent = log_damaged = 0;
+            t_log = now;
         }
     }
     ndi->send_send_video_async_v2(send, NULL); /* NDI is done with our buffers after this */
@@ -401,7 +421,7 @@ out:
     free(planes);
     close(fd);
     if (running)
-        status(in, "device lost, retrying", mode_desc, 0);
+        status(in, "device lost, retrying", mode_desc, 0, 0, 0);
 }
 
 static void *input_thread(void *arg)
@@ -411,7 +431,7 @@ static void *input_thread(void *arg)
     NDIlib_send_instance_t send = ndi->send_create(&sc);
     if (!send) {
         LOG("input %d: cannot create NDI sender \"%s\"", in->n, in->name);
-        status(in, "cannot create NDI sender", NULL, 0);
+        status(in, "cannot create NDI sender", NULL, 0, 0, 0);
         return NULL;
     }
     while (running) {

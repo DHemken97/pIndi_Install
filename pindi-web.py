@@ -482,6 +482,8 @@ def inputs():
         i["state"] = st.get("state", "") if i["enabled"] else "off"
         i["live_mode"] = st.get("mode", "")
         i["fps"] = st.get("fps", "")
+        i["cam_fps"] = st.get("cam_fps", "")
+        i["damaged"] = st.get("damaged", "0")
     return out
 
 
@@ -710,8 +712,15 @@ def dashboard(session):
         if i["mode"] and i["mode"] not in dict(i["modes"]):
             mode_choices.append((i["mode"], i["mode"]))
         state = i["state"] or ("starting" if i["enabled"] else "off")
-        live = (" &middot; %s &middot; %s fps" % (esc(i["live_mode"]), esc(i["fps"]))) \
-            if i["enabled"] and i["live_mode"] else ""
+        live = ""
+        if i["enabled"] and i["live_mode"]:
+            live = " &middot; %s &middot; %s fps sent" % (esc(i["live_mode"]), esc(i["fps"]))
+            if i["cam_fps"]:
+                live += " (camera delivers %s fps" % esc(i["cam_fps"])
+                if i["damaged"] not in ("", "0"):
+                    live += ", %s damaged frame%s skipped in the last 2 s" % (
+                        esc(i["damaged"]), "" if i["damaged"] == "1" else "s")
+                live += ")"
         k = "in%d." % slot
         remove = ('<button class="secondary" name="remove" value="1">Forget this device</button>'
                   if not i["present"] else "")
