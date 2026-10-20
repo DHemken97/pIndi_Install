@@ -6,3 +6,4 @@
 *.conf    text eol=lf
 *.jpg     binary
 *.tar.gz  binary
+VERSION   text eol=lf

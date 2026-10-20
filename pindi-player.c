@@ -35,6 +35,7 @@
 #include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -488,6 +489,7 @@ struct output {
     bool want_realloc, want_splash, on_splash;
     int ready, queued, scanout;
     char splash_msg[192]; /* what the receiver is doing, shown on the splash */
+    bool thumb_reading;   /* the preview thread is reading a buffer: don't free any */
 
     /* Configuration. */
     bool disabled; /* PINDI_OUT<n>_ENABLED=0: no NDI, HDMI signal off (e.g. encoder-only units) */
@@ -852,9 +854,9 @@ static void output_disable(struct output *o)
     pthread_mutex_lock(&o->lock);
     o->usable = false;
     pthread_mutex_unlock(&o->lock);
-    /* Let a receiver finish writing a frame before its buffer goes away. */
+    /* Let a receiver (or the preview) finish with a frame before its buffer goes away. */
     for (int tries = 0; tries < 100; tries++) {
-        bool writing = false;
+        bool writing = o->thumb_reading;
         pthread_mutex_lock(&o->lock);
         for (int b = 0; b < NBUF; b++)
             writing |= o->vstate[b] == B_WRITING;
@@ -1056,7 +1058,7 @@ static void output_service(struct output *o)
     pthread_mutex_lock(&o->lock);
 
     if (o->want_realloc) {
-        bool writing = false;
+        bool writing = o->thumb_reading;
         for (int b = 0; b < NBUF; b++)
             writing |= o->vstate[b] == B_WRITING;
         if (!o->on_splash) {
@@ -1526,6 +1528,134 @@ static void configure_output(struct output *o)
             *o->source_ip ? o->source_ip : "any host");
 }
 
+/* ------------------------------------------------------------------ preview for the web UI */
+
+#define THUMB_W 384
+
+/* Pixel (x, y) of buffer b as 0xRRGGBB. Dumb buffers are write-combined: only sample what we need. */
+static uint32_t buf_pixel(const struct buf *b, int x, int y)
+{
+    const uint8_t *row = b->map + (size_t)y * b->pitch;
+    int Y, U, V;
+    switch (b->fmt) {
+    case DRM_FORMAT_XRGB8888: { const uint8_t *p = row + x * 4; return p[2] << 16 | p[1] << 8 | p[0]; }
+    case DRM_FORMAT_XBGR8888: { const uint8_t *p = row + x * 4; return p[0] << 16 | p[1] << 8 | p[2]; }
+    case DRM_FORMAT_UYVY: { const uint8_t *p = row + (x & ~1) * 2; U = p[0]; V = p[2]; Y = p[1 + (x & 1) * 2]; break; }
+    case DRM_FORMAT_NV16: {
+        const uint8_t *uv = b->map + b->uv_off + (size_t)y * b->pitch + (x & ~1);
+        Y = row[x]; U = uv[0]; V = uv[1]; break;
+    }
+    default: return 0;
+    }
+    /* BT.709 limited range (NDI's HD colour space). */
+    int c = Y - 16, d = U - 128, e = V - 128;
+    int r = (298 * c + 459 * e + 128) >> 8, g = (298 * c - 55 * d - 136 * e + 128) >> 8, bl = (298 * c + 541 * d + 128) >> 8;
+    r = r < 0 ? 0 : r > 255 ? 255 : r;
+    g = g < 0 ? 0 : g > 255 ? 255 : g;
+    bl = bl < 0 ? 0 : bl > 255 ? 255 : bl;
+    return (uint32_t)r << 16 | g << 8 | bl;
+}
+
+/* While the web UI asks for it (touches out<n>.thumbreq), write out<n>.jpg: what is on screen now. */
+static void thumb_publish(struct output *o)
+{
+    char path[64], tmp[72];
+    struct stat st;
+    snprintf(path, sizeof path, RUN_DIR "/out%d.thumbreq", o->n);
+    if (stat(path, &st) || time(NULL) - st.st_mtime > 15)
+        return;
+
+    /* Preview thread: pin the buffers (output_disable / reallocation wait for thumb_reading). A buffer
+     * may get a newer frame written into it while we sample it - harmless for a preview. */
+    pthread_mutex_lock(&o->lock);
+    if (!o->usable) {
+        pthread_mutex_unlock(&o->lock);
+        return;
+    }
+    o->thumb_reading = true;
+    struct buf *b = (!o->on_splash && o->scanout >= 0) ? &o->vid[o->scanout] : NULL;
+    double ar = b ? o->vaspect[o->scanout] : 0;
+    const uint32_t *comp = o->comp;
+    int W = o->W, sw = b ? b->w : o->W, sh = b ? b->h : o->H;
+    pthread_mutex_unlock(&o->lock);
+    if (!ar)
+        ar = (double)sw / sh;
+    int tw = THUMB_W, th = (int)(THUMB_W / ar + 0.5);
+    uint8_t *rgb = th >= 16 && th <= THUMB_W * 2 ? malloc((size_t)tw * th * 3) : NULL;
+    if (!rgb) {
+        pthread_mutex_lock(&o->lock);
+        o->thumb_reading = false;
+        pthread_mutex_unlock(&o->lock);
+        return;
+    }
+    uint64_t t0 = clock_us(CLOCK_MONOTONIC);
+    for (int y = 0; y < th; y++) {
+        int sy = (int)(((long)y * sh + sh / 2) / th);
+        for (int x = 0; x < tw; x++) {
+            int sx = (int)(((long)x * sw + sw / 2) / tw);
+            uint32_t p = b ? buf_pixel(b, sx, sy) : comp[(size_t)sy * W + sx];
+            uint8_t *d = rgb + ((size_t)y * tw + x) * 3;
+            d[0] = p >> 16;
+            d[1] = p >> 8;
+            d[2] = p;
+        }
+    }
+    pthread_mutex_lock(&o->lock);
+    o->thumb_reading = false;
+    pthread_mutex_unlock(&o->lock);
+
+    struct jpeg_compress_struct ci;
+    struct jpeg_error_mgr je;
+    unsigned char *out = NULL;
+    unsigned long out_len = 0;
+    ci.err = jpeg_std_error(&je);
+    jpeg_create_compress(&ci);
+    jpeg_mem_dest(&ci, &out, &out_len);
+    ci.image_width = tw;
+    ci.image_height = th;
+    ci.input_components = 3;
+    ci.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&ci);
+    jpeg_set_quality(&ci, 75, TRUE);
+    jpeg_start_compress(&ci, TRUE);
+    while (ci.next_scanline < ci.image_height) {
+        JSAMPROW row = rgb + (size_t)ci.next_scanline * tw * 3;
+        jpeg_write_scanlines(&ci, &row, 1);
+    }
+    jpeg_finish_compress(&ci);
+    jpeg_destroy_compress(&ci);
+    free(rgb);
+    static bool timed;
+    if (!timed) {
+        LOG("preview: output %d: %dx%d in %.1f ms", o->n, tw, th, (clock_us(CLOCK_MONOTONIC) - t0) / 1000.0);
+        timed = true;
+    }
+
+    snprintf(path, sizeof path, RUN_DIR "/out%d.jpg", o->n);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (f) {
+        fwrite(out, 1, out_len, f);
+        fclose(f);
+        rename(tmp, path);
+    }
+    free(out);
+}
+
+/* Low priority: sampling write-combined buffers is slow and must not delay page flips. */
+static void *thumb_thread(void *arg)
+{
+    (void)arg;
+    setpriority(PRIO_PROCESS, (id_t)gettid(), 15);
+    while (running) {
+        for (int i = 0; i < 20 && running; i++)
+            usleep(100000);
+        for (int i = 0; i < nout && running; i++)
+            thumb_publish(&outs[i]);
+    }
+    return NULL;
+}
+
 /* ------------------------------------------------------------------ main */
 
 static bool load_ndi(void)
@@ -1637,6 +1767,8 @@ int main(void)
         LOG("display: no KMS device found");
     }
 
+    pthread_t thumb_thr;
+    bool thumb_ok = !pthread_create(&thumb_thr, NULL, thumb_thread, NULL);
     bool ndi_ok = load_ndi();
     if (ndi_ok)
         start_receivers();
@@ -1688,6 +1820,8 @@ int main(void)
     for (int i = 0; i < nout; i++)
         if (outs[i].thr_started)
             pthread_join(outs[i].thr, NULL);
+    if (thumb_ok)
+        pthread_join(thumb_thr, NULL);
     if (ndi_ok)
         ndi->destroy();
     for (int i = 0; i < nout; i++)

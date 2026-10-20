@@ -786,6 +786,10 @@ input[type=file]{color:var(--muted);font:inherit;margin:4px 0}button:disabled{op
 pre.log{background:#0d1319;border:1px solid var(--line);border-radius:7px;padding:10px;overflow:auto;
 max-height:70vh;font:12px/1.4 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
 nav.top a{color:var(--accent);margin-right:14px}
+.preview{float:right;margin:0 0 10px 14px;width:240px}.thumb{width:100%;border-radius:6px;border:1px solid var(--line);
+background:#000;display:block;min-height:40px}.thumb.none{visibility:hidden}
+@media(max-width:600px){.preview{float:none;width:100%;margin:0 0 10px}}
+.card:after{content:"";display:table;clear:both}
 @media(max-width:600px){.row{grid-template-columns:1fr}main{padding:12px}}
 """
 
@@ -804,6 +808,9 @@ if(/state$/.test(k))el.className='state'+(v==='playing'||/^sending/.test(v||'')?
 if(k==='power')el.className=v==='OK'?'':'warn';});
 var c=document.getElementById('countdown');if(c&&d.rollback!=null)c.textContent=d.rollback;}).catch(function(){});}
 sync();if(document.querySelector('[data-k]'))setInterval(poll,3000);
+setInterval(function(){document.querySelectorAll('img[data-thumb]').forEach(function(i){
+if(document.hidden)return;var n=new Image();n.onload=function(){i.src=n.src;i.classList.remove('none');};
+n.onerror=function(){i.classList.add('none');};n.src='/thumb/'+i.dataset.thumb+'.jpg?'+Date.now();});},2000);
 document.addEventListener('submit',function(e){var m=e.target.dataset.confirm;if(m&&!confirm(m))e.preventDefault();});
 var rf=document.getElementById('restore-file');if(rf)rf.addEventListener('change',function(){
 var f=rf.files[0],b=document.getElementById('restore-button');b.disabled=true;if(!f)return;
@@ -906,6 +913,8 @@ def dashboard(session):
                                                      esc(link))
         k = "out%d." % n
         status_rows = "" if not o["enabled"] else (
+            '<div class="preview"><img class="thumb" data-thumb="%d" alt="What output %d shows now" '
+            'src="/thumb/%d.jpg"></div>' % (n, n, n) +
             '<dl><dt>State</dt><dd><span data-k="%sstate" class="state%s">%s</span></dd>'
             '<dt>Looking for</dt><dd data-k="%starget">%s</dd>'
             '<dt>Connected to</dt><dd data-k="%ssource">%s</dd>'
@@ -1472,6 +1481,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, dashboard(s))
         if path == "/logs":
             return self.send(200, logs_page(s))
+        m = re.match(r"^/thumb/(\d)\.jpg$", path)
+        if m:
+            # Asking for it keeps the player rendering it (for 15 s); the first request may find none yet.
+            n = int(m.group(1))
+            req = "%s/out%d.thumbreq" % (RUN_DIR, n)
+            try:
+                with open(req, "a"):
+                    os.utime(req)
+                with open("%s/out%d.jpg" % (RUN_DIR, n), "rb") as f:
+                    return self.send(200, f.read(), "image/jpeg")
+            except OSError:
+                return self.send(404, "", "text/plain")
         stamp = time.strftime("%Y%m%d-%H%M")
         if path == "/diagnostics":
             return self.send(200, diagnostics_text(), "text/plain; charset=utf-8", [
