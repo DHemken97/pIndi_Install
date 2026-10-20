@@ -914,7 +914,10 @@ html{scroll-behavior:smooth}section.card,details.card{scroll-margin-top:12px}
 background:#000;display:block;min-height:40px}.thumb.none{visibility:hidden}
 @media(max-width:600px){.preview{float:none;width:100%;margin:0 0 10px}}
 .card:after{content:"";display:table;clear:both}
-@media(max-width:600px){.row{grid-template-columns:1fr}main{padding:12px}}
+.row>div,dd,dt{min-width:0}select,input{max-width:100%}table{table-layout:fixed}td{word-break:break-word}
+td:last-child{width:auto;white-space:nowrap}header{flex-wrap:wrap}
+@media(max-width:600px){.row{grid-template-columns:1fr}main{padding:12px}dl{grid-template-columns:1fr}
+dt{margin-top:6px}dd{margin-bottom:2px}td:nth-child(2){display:none}}
 """
 
 JS = """
