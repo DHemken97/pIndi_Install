@@ -744,6 +744,39 @@ class Sessions:
 
 SESSIONS = Sessions()
 
+WELL_KNOWN_PASSWORDS = {"pindi", "raspberry", "password", "admin", "1234", "12345678", "pi"}
+
+
+class Lockout:
+    """After 5 failed sign-ins within 10 minutes an address must wait 10 minutes."""
+    LIMIT, WINDOW, PENALTY = 5, 600, 600
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.fails = {}  # ip -> [timestamps]
+        self.until = {}  # ip -> locked until
+
+    def blocked(self, ip):
+        with self.lock:
+            return max(0, int(self.until.get(ip, 0) - time.time()))
+
+    def failure(self, ip):
+        now = time.time()
+        with self.lock:
+            recent = [t for t in self.fails.get(ip, []) if now - t < self.WINDOW] + [now]
+            self.fails[ip] = recent
+            if len(recent) >= self.LIMIT:
+                self.until[ip] = now + self.PENALTY
+                self.fails.pop(ip, None)
+                log("login: %s locked out for %d s after %d failures" % (ip, self.PENALTY, self.LIMIT))
+
+    def success(self, ip):
+        with self.lock:
+            self.fails.pop(ip, None)
+
+
+LOCKOUT = Lockout()
+
 
 # ---------------------------------------------------------------- pages
 
@@ -958,6 +991,7 @@ def dashboard(session):
             'directly, so senders on other subnets work. 180&deg; is for ceiling mounting, mirror for rear '
             'projection. The low-bandwidth preview is a small (typically 640&times;360) stream every NDI sender '
             'provides, for slow networks.</p><button>Save output %d</button> '
+            '<button class="secondary" formaction="/identify" name="identify" value="1">Identify</button> '
             '<button class="secondary" name="reset" value="1">Reset to default</button></form></section>' %
             (n, n, esc(o["connector"]), badge, status_rows, hidden, n, " checked" if o["enabled"] else "",
              n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]),
@@ -1104,13 +1138,15 @@ def dashboard(session):
         '<input type="hidden" name="backup" id="restore-data"><p class="hint">Restores outputs, outgoing '
         'streams, device and NDI settings. Network settings are restored too, with the usual automatic '
         'rollback.</p><button class="secondary" id="restore-button" disabled>Restore</button></form>'
-        '<div class="buttons"><form class="inline" method="post" action="/restart">%s'
+        '<div class="buttons"><form class="inline" method="post" action="/identify">%s'
+        '<input type="hidden" name="n" value="0"><button class="secondary">Identify all screens</button></form>'
+        '<form class="inline" method="post" action="/restart">%s'
         '<button class="secondary">Restart video</button></form>'
         '<form class="inline" method="post" action="/reset" data-confirm="Reset all PiNDI settings (outputs, '
         'outgoing streams, device and NDI settings) to the defaults? Network settings and passwords are kept.">'
         '%s<button class="danger">Reset settings</button></form>'
         '<form class="inline" method="post" action="/reboot" data-confirm="Reboot the device now?">%s'
-        '<button class="danger">Reboot</button></form></div></section>' % (hidden, hidden, hidden, hidden))
+        '<button class="danger">Reboot</button></form></div></section>' % (hidden, hidden, hidden, hidden, hidden))
 
     return page("PiNDI", "".join(parts), session["user"], csrf)
 
@@ -1311,6 +1347,23 @@ def act_password(session, form):
         return ("err", "Could not change the password: %s" % r.stderr.strip())
     log("password changed for %s" % session["user"])
     return ("ok", "Password changed. Use the new password for this page and SSH.")
+
+
+def act_identify(form):
+    """Big "Output n / device name / IP" on that screen (0 = all) for 15 s."""
+    try:
+        n = int(form.get("n", "0"))
+    except ValueError:
+        n = 0
+    outs = {o["n"]: o for o in outputs()}
+    if n and n not in outs:
+        return ("err", "Unknown output.")
+    lines = ["Output %d" % n if n else device_name(), device_name() if n else "",
+             "IP %s" % (live_network()["address"] or "-"),
+             "%s · serial %s" % (outs[n]["connector"], SERIAL) if n else "Serial %s" % SERIAL]
+    text = "\n".join(l for l in lines if l)
+    write_atomic(RUN_DIR + "/identify", "%d\n%s\n" % (n, text))
+    return ("ok", "%s shows its name for 15 seconds." % ("Output %d" % n if n else "Every output"))
 
 
 def restart_media():
@@ -1558,12 +1611,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/login":
             user = form.get("user", "").strip()
             password = form.get("password", "")
+            ip = self.client_address[0]
+            wait = LOCKOUT.blocked(ip)
+            if wait:
+                log("login refused: %s is locked out for %d s" % (ip, wait))
+                return self.send(429, login_page("Too many failed sign-ins from this address. Try again in %d "
+                                                 "minute%s." % ((wait + 59) // 60, "" if wait <= 60 else "s")))
             if user and is_admin(user) and check_password(user, password):
+                LOCKOUT.success(ip)
                 token = SESSIONS.create(user)
-                log("login: %s from %s" % (user, self.client_address[0]))
+                if password in WELL_KNOWN_PASSWORDS:
+                    SESSIONS.get(token)["flash"] = ("warn", "You signed in with a well-known default password. "
+                                                    "Please change it below (it is also the SSH password).")
+                log("login: %s from %s" % (user, ip))
                 return self.redirect("/", [("Set-Cookie", "pindi_session=%s; Path=/; HttpOnly; SameSite=Strict"
                                             % token)])
-            log("login failed: %r from %s" % (user, self.client_address[0]))
+            LOCKOUT.failure(ip)
+            log("login failed: %r from %s" % (user, ip))
             time.sleep(2)
             return self.send(401, login_page("Wrong user or password, or the user is not an administrator."))
 
@@ -1594,6 +1658,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             s["flash"] = act_restore(form)
         elif path == "/reset":
             s["flash"] = act_reset()
+        elif path == "/identify":
+            s["flash"] = act_identify(form)
         elif path == "/restart":
             log("video restart requested by %s" % s["user"])
             later(0.5, restart_media)

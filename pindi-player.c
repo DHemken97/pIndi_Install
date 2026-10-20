@@ -326,19 +326,41 @@ static FT_Face face;
 static bool font_ok;
 static bool splash_info = true; /* PINDI_SPLASH_INFO=0: plain splash, no IP/serial/status */
 
+/* Next code point of UTF-8 text (stream and device names can be anything); bad bytes as U+FFFD. */
+static uint32_t utf8_next(const char **ps)
+{
+    const unsigned char *s = (const unsigned char *)*ps;
+    uint32_t c = *s++;
+    int extra = c >= 0xF0 && c < 0xF8 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+    if (c >= 0x80 && !extra) {
+        *ps = (const char *)s;
+        return 0xFFFD;
+    }
+    c &= extra ? 0x3F >> extra : 0x7F;
+    for (int i = 0; i < extra; i++, s++) {
+        if ((*s & 0xC0) != 0x80) {
+            *ps = (const char *)s;
+            return 0xFFFD;
+        }
+        c = c << 6 | (*s & 0x3F);
+    }
+    *ps = (const char *)s;
+    return c;
+}
+
 static int text_width(const char *s)
 {
     int w = 0;
-    for (; *s; s++)
-        if (!FT_Load_Char(face, (unsigned char)*s, FT_LOAD_DEFAULT))
+    while (*s)
+        if (!FT_Load_Char(face, utf8_next(&s), FT_LOAD_DEFAULT))
             w += face->glyph->advance.x >> 6;
     return w;
 }
 
 static void draw_text(uint32_t *px, int W, int H, int x, int base, const char *s, uint32_t rgb)
 {
-    for (; *s; s++) {
-        if (FT_Load_Char(face, (unsigned char)*s, FT_LOAD_RENDER))
+    while (*s) {
+        if (FT_Load_Char(face, utf8_next(&s), FT_LOAD_RENDER))
             continue;
         FT_GlyphSlot g = face->glyph;
         int gx = x + g->bitmap_left, gy = base - g->bitmap_top;
@@ -473,6 +495,9 @@ struct output {
     struct buf splash;
     uint32_t *base, *comp;
     char shown_ip[64], shown_msg[192];
+    bool identify, restore_video; /* web UI "Identify": big text on the splash, video held back */
+    char ident[256];              /* its lines, '\n' separated */
+    int last_video;               /* buffer last on screen, to put back after identifying */
     int pending; /* P_*: a commit is in flight */
     uint64_t rotation;
     bool rot_logged, commit_logged, mode_failed;
@@ -677,7 +702,7 @@ static void discover_outputs(void)
         struct output *o = &outs[i];
         o->n = i + 1;
         pthread_mutex_init(&o->lock, NULL);
-        o->ready = o->queued = o->scanout = -1;
+        o->ready = o->queued = o->scanout = o->last_video = -1;
         for (int b = 0; b < NBUF; b++)
             o->vstate[b] = B_NONE;
         LOG("display: output %d = %s (video as %s)", o->n, o->conn_name,
@@ -813,12 +838,44 @@ static bool pick_mode(struct output *o, drmModeConnector *c, drmModeModeInfo *ou
     return true;
 }
 
+/* Identify: the first line very large, the others large, centred on a darkened band. */
+static void draw_identify(struct output *o)
+{
+    char text[sizeof o->ident], *lines[6];
+    int n = 0;
+    snprintf(text, sizeof text, "%s", o->ident);
+    for (char *p = strtok(text, "\n"); p && n < 6; p = strtok(NULL, "\n"))
+        lines[n++] = p;
+    if (!n)
+        return;
+    int big = o->H / 7, small = o->H / 18, gap = small / 2;
+    int total = big + (n - 1) * (small + gap) + gap * 2;
+    int top = (o->H - total) / 2;
+    for (int y = top - gap; y < top + total + gap && y < o->H; y++)
+        for (int x = 0; y >= 0 && x < o->W; x++) {
+            uint32_t *d = &o->comp[(size_t)y * o->W + x];
+            *d = (*d >> 2) & 0x3F3F3F; /* a quarter of the brightness */
+        }
+    int base = top + gap;
+    for (int i = 0; i < n; i++) {
+        int px = i ? small : big;
+        FT_Set_Pixel_Sizes(face, 0, px);
+        base += i ? small + gap : big;
+        int w = text_width(lines[i]);
+        int x = (o->W - w) / 2;
+        draw_text(o->comp, o->W, o->H, x + px / 24 + 1, base + px / 24 + 1, lines[i], 0x000000);
+        draw_text(o->comp, o->W, o->H, x, base, lines[i], i ? 0xE0E0E0 : 0x2BB3A3);
+    }
+}
+
 static void splash_update_text(struct output *o, const char *ip, bool force)
 {
     char msg[192];
     pthread_mutex_lock(&o->lock);
     snprintf(msg, sizeof msg, "%s", o->splash_msg);
     pthread_mutex_unlock(&o->lock);
+    if (o->identify)
+        snprintf(msg, sizeof msg, "%s", "");
     if (!o->active || (!force && !strcmp(ip, o->shown_ip) && !strcmp(msg, o->shown_msg)))
         return;
     snprintf(o->shown_ip, sizeof o->shown_ip, "%s", ip);
@@ -852,6 +909,8 @@ static void splash_update_text(struct output *o, const char *ip, bool force)
             draw_text(o->comp, o->W, o->H, mx, base - line, msg, 0xD0D0D0);
         }
     }
+    if (font_ok && o->identify)
+        draw_identify(o);
     for (int y = 0; y < o->H; y++)
         memcpy(o->splash.map + (size_t)y * o->splash.pitch, o->comp + (size_t)y * o->W, (size_t)o->W * 4);
 }
@@ -865,7 +924,7 @@ static void pool_free(struct output *o)
     }
     o->pw = o->ph = 0;
     o->pfmt = 0;
-    o->ready = o->queued = o->scanout = -1;
+    o->ready = o->queued = o->scanout = o->last_video = -1;
 }
 
 static void output_disable(struct output *o)
@@ -1054,6 +1113,7 @@ static void on_flip(int fd, unsigned seq, unsigned sec, unsigned usec, unsigned 
             o->vstate[o->scanout] = B_FREE;
         o->scanout = o->queued;
         if (o->scanout >= 0) {
+            o->last_video = o->scanout;
             o->vstate[o->scanout] = B_SCANOUT;
             latency_add(o, o->scanout, (uint64_t)sec * 1000000 + usec);
         }
@@ -1106,6 +1166,29 @@ static void output_service(struct output *o)
             LOG("video: output %d: %dx%d %.4s", o->n, o->pw, o->ph, (const char *)&o->pfmt);
         pthread_mutex_unlock(&o->lock);
         return;
+    }
+
+    if (o->identify) {
+        if (o->ready >= 0) {
+            o->vstate[o->ready] = B_FREE;
+            o->ready = -1;
+        }
+        bool show = !o->on_splash;
+        pthread_mutex_unlock(&o->lock);
+        if (show)
+            commit_buf(o, &o->splash, 0, P_SPLASH);
+        return;
+    }
+
+    /* After identifying: put the last picture back if the source sends nothing new (screen
+     * captures only send on change). Its buffer is untouched while it is still free. */
+    if (o->restore_video) {
+        o->restore_video = false;
+        int idx = o->last_video;
+        if (o->ready < 0 && idx >= 0 && o->vstate[idx] == B_FREE && !o->want_splash) {
+            o->vstate[idx] = B_READY;
+            o->ready = idx;
+        }
     }
 
     if (o->ready >= 0) {
@@ -1896,6 +1979,42 @@ static void thumb_publish(struct output *o)
     free(out);
 }
 
+/* /run/pindi/identify (written by the web UI): first line the output number (0 = all), then the
+ * text to show. Shown for 15 s after the file was written. */
+static void identify_poll(const char *ip)
+{
+    struct stat st;
+    char buf[sizeof outs[0].ident + 16] = "";
+    int which = -1;
+    if (!stat(RUN_DIR "/identify", &st) && time(NULL) - st.st_mtime < 15) {
+        FILE *f = fopen(RUN_DIR "/identify", "r");
+        if (f) {
+            size_t len = fread(buf, 1, sizeof buf - 1, f);
+            buf[len] = 0;
+            fclose(f);
+            which = atoi(buf);
+        }
+    }
+    const char *text = strchr(buf, '\n');
+    for (int i = 0; i < nout; i++) {
+        struct output *o = &outs[i];
+        bool on = which == 0 || which == o->n;
+        char want[sizeof o->ident];
+        snprintf(want, sizeof want, "%s", on && text ? text + 1 : "");
+        if (on == o->identify && !strcmp(want, o->ident))
+            continue;
+        pthread_mutex_lock(&o->lock);
+        o->identify = on;
+        if (!on)
+            o->restore_video = true;
+        pthread_mutex_unlock(&o->lock);
+        snprintf(o->ident, sizeof o->ident, "%s", want);
+        LOG("display: output %d: identify %s", o->n, on ? "on" : "off");
+        splash_update_text(o, ip, true);
+        wake();
+    }
+}
+
 /* Low priority: sampling write-combined buffers is slow and must not delay page flips. */
 static void *thumb_thread(void *arg)
 {
@@ -2065,6 +2184,7 @@ int main(void)
         if (now - last_ip >= 1000) {
             last_ip = now;
             read_ip(ip, sizeof ip);
+            identify_poll(ip);
         }
         for (int i = 0; i < nout; i++)
             splash_update_text(&outs[i], ip, false); /* only redraws on a change */
