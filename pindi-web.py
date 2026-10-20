@@ -1556,9 +1556,16 @@ def api_status():
         outs.append({k: o[k] for k in ("n", "connector", "enabled", "state", "target", "source", "video",
                                         "format", "audio", "latency", "stream", "source_ip", "backup")})
         outs[-1]["display"] = {"link": o["link"], "mode": o["mode"]}
-    ins = [{"slot": i["slot"], "device": i["id"], "label": i["label"], "enabled": i["enabled"],
-            "name": i["name"] or (default_in_stream(i["slot"]) if i["slot"] else ""), "state": i["state"],
-            "mode": i["live_mode"], "fps": i["fps"], "audio": i["audio"]} for i in inputs()]
+    # Configured inputs and their status files only: no device enumeration (control systems poll this).
+    ins = []
+    for slot, conf in sorted(configured_inputs(read_env()).items()):
+        enabled = conf.get("ENABLED") == "1"
+        st = read_kv("%s/in%d.status" % (RUN_DIR, slot)) if enabled else {}
+        ins.append({"slot": slot, "device": conf["DEVICE"], "present": os.path.exists(conf["DEVICE"]),
+                    "enabled": enabled, "name": conf.get("NAME") or default_in_stream(slot),
+                    "state": st.get("state", "starting") if enabled else "off", "mode": st.get("mode", ""),
+                    "fps": st.get("fps", ""), "audio": st.get("audio", ""),
+                    "on_air": "ON AIR" in st.get("state", "")})
     return {"device": {"name": device_name(), "ndi_name": ndi_host_name(), "serial": SERIAL, "model": MODEL,
                        "version": version(), "ip": live_network()["address"], "health": hl, "power": hw,
                        "network": TRAFFIC.text()},
