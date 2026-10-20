@@ -3,9 +3,12 @@
 if grep -q $'\r' "$0"; then sed -i 's/\r$//' "$0"; exec bash "$0" "$@"; fi #
 # PiNDI installer for Raspberry Pi OS Lite (Pi 3, 4 and 5; 32 or 64 bit). See README.md.
 #
-#   cd /home/pindi && bash install.sh [--accept-ndi-license] [--skip-upgrade] [--no-reboot]
+#   cd /home/pindi && bash install.sh [--accept-ndi-license] [--skip-upgrade] [--offline] [--no-reboot]
 #
 # Safe to run again (e.g. after changing Splash.jpg or pindi-player.c).
+# --offline: no apt at all (the packages must already be installed); used by the web
+# interface's software update. Without Install_NDI_SDK_v6_Linux.tar.gz next to this
+# script, the NDI SDK that is already installed is kept.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,11 +20,13 @@ fi
 ACCEPT_NDI=0
 UPGRADE=1
 REBOOT=1
+OFFLINE=0
 for arg in "$@"; do
     case "$arg" in
         --accept-ndi-license) ACCEPT_NDI=1 ;;
         --skip-upgrade) UPGRADE=0 ;;
         --no-reboot) REBOOT=0 ;;
+        --offline) OFFLINE=1 ;;
         *) echo "Unknown option: $arg" >&2; exit 1 ;;
     esac
 done
@@ -48,21 +53,34 @@ if [ "$ACCEPT_NDI" -ne 1 ]; then
 fi
 
 # ---------------------------------------------------------------- packages
-step "Installing packages"
-export DEBIAN_FRONTEND=noninteractive
-APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-apt-get update
-if [ "$UPGRADE" -eq 1 ]; then
-    apt-get "${APT_OPTS[@]}" full-upgrade
+PACKAGES=(gcc libc6-dev pkg-config
+    libdrm-dev libfreetype-dev libjpeg-dev libturbojpeg0-dev libasound2-dev
+    v4l-utils
+    fonts-dejavu-core
+    avahi-daemon libavahi-client3
+    systemd-resolved
+    python3 libpam-runtime)
+if [ "$OFFLINE" -eq 1 ]; then
+    step "Checking packages (offline)"
+    MISSING=()
+    for p in "${PACKAGES[@]}"; do
+        dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || MISSING+=("$p")
+    done
+    if [ "${#MISSING[@]}" -gt 0 ]; then
+        echo "Missing packages: ${MISSING[*]}" >&2
+        echo "This version needs them: run install.sh on the device with internet access." >&2
+        exit 1
+    fi
+else
+    step "Installing packages"
+    export DEBIAN_FRONTEND=noninteractive
+    APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+    apt-get update
+    if [ "$UPGRADE" -eq 1 ]; then
+        apt-get "${APT_OPTS[@]}" full-upgrade
+    fi
+    apt-get "${APT_OPTS[@]}" install --no-install-recommends "${PACKAGES[@]}"
 fi
-apt-get "${APT_OPTS[@]}" install --no-install-recommends \
-    gcc libc6-dev pkg-config \
-    libdrm-dev libfreetype-dev libjpeg-dev libturbojpeg0-dev libasound2-dev \
-    v4l-utils \
-    fonts-dejavu-core \
-    avahi-daemon libavahi-client3 \
-    systemd-resolved \
-    python3 libpam-runtime
 
 # ---------------------------------------------------------------- NDI runtime
 step "Installing NDI SDK runtime"
@@ -81,6 +99,10 @@ esac
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+if [ ! -f "$SRC/Install_NDI_SDK_v6_Linux.tar.gz" ] && [ -e /usr/local/lib/libndi.so ] &&
+   [ -f /usr/local/include/ndi/Processing.NDI.Lib.h ]; then
+    echo "No NDI SDK archive here: keeping the installed one ($(readlink /usr/local/lib/libndi.so))"
+else
 tar xzf "$SRC/Install_NDI_SDK_v6_Linux.tar.gz" -C "$TMP"
 NDI_SH="$TMP/Install_NDI_SDK_v6_Linux.sh"
 # The vendor script is an interactive self-extractor; unpack its payload directly.
@@ -103,6 +125,7 @@ ldconfig
 install -d /usr/local/include/ndi /usr/local/share/doc/ndi
 install -m 644 "$SDK"/include/*.h /usr/local/include/ndi/
 install -m 644 "$SDK/NDI SDK License Agreement.txt" "$SDK"/licenses/* /usr/local/share/doc/ndi/
+fi
 
 # ---------------------------------------------------------------- player
 step "Building pindi-player and pindi-sender"

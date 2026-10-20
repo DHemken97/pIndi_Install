@@ -9,6 +9,7 @@ Small standard-library HTTP server (runs as root, port 80):
   - network: DHCP or static IP, with automatic rollback unless confirmed
   - change the login (SSH) password, reboot
 """
+import base64
 import ctypes
 import ctypes.util
 import grp
@@ -22,7 +23,9 @@ import pwd
 import re
 import secrets
 import socket
+import shutil
 import subprocess
+import tarfile
 import threading
 import time
 import urllib.parse
@@ -932,6 +935,15 @@ setInterval(function(){document.querySelectorAll('img[data-thumb]').forEach(func
 if(document.hidden)return;var n=new Image();n.onload=function(){i.src=n.src;i.classList.remove('none');};
 n.onerror=function(){i.classList.add('none');};n.src='/thumb/'+i.dataset.thumb+'.jpg?'+Date.now();});},2000);
 document.addEventListener('submit',function(e){var m=e.target.dataset.confirm;if(m&&!confirm(m))e.preventDefault();});
+var uf=document.getElementById('update-file');if(uf)uf.addEventListener('change',function(){
+var f=uf.files[0],b=document.getElementById('update-button');b.disabled=true;if(!f)return;
+var r=new FileReader();r.onload=function(){document.getElementById('update-data').value=r.result;b.disabled=false;};
+r.readAsDataURL(f);});
+var ul=document.getElementById('update-log');if(ul)setInterval(function(){fetch('/update/log',{credentials:'same-origin'})
+.then(function(r){return r.ok?r.json():null}).then(function(d){if(!d)return;var end=ul.scrollTop+ul.clientHeight>=ul.scrollHeight-20;
+ul.textContent=d.log;if(end)ul.scrollTop=ul.scrollHeight;var t={running:'Installing\u2026 do not switch the device off.',
+failed:'The update failed; the previous version is still running. See the log.',done:'Installed. The device is rebooting.'};
+var st=document.querySelector('[data-k=update_state]');if(st&&t[d.state])st.textContent=t[d.state];}).catch(function(){});},2000);
 var rf=document.getElementById('restore-file');if(rf)rf.addEventListener('change',function(){
 var f=rf.files[0],b=document.getElementById('restore-button');b.disabled=true;if(!f)return;
 var r=new FileReader();r.onload=function(){document.getElementById('restore-data').value=r.result;b.disabled=false;};
@@ -1254,6 +1266,13 @@ def dashboard(session):
         '<input type="hidden" name="backup" id="restore-data"><p class="hint">Restores outputs, outgoing '
         'streams, device and NDI settings. Network settings are restored too, with the usual automatic '
         'rollback.</p><button class="secondary" id="restore-button" disabled>Restore</button></form>'
+        '<form method="post" action="/update" id="update-form" data-confirm="Install this update? Video '
+        'stops and the device reboots when it is done.">%s<label>Software update (PiNDI %s)</label>'
+        '<input type="file" id="update-file" accept=".tar.gz,.tgz,application/gzip">'
+        '<input type="hidden" name="package" id="update-data"><p class="hint">An update package is made '
+        'with <code>make-update.sh</code>. Settings are kept.</p>'
+        '<button class="secondary" id="update-button" disabled>Install update</button> '
+        '<a href="/update">Last update log</a></form>'
         '<div class="buttons"><form class="inline" method="post" action="/identify">%s'
         '<input type="hidden" name="n" value="0"><button class="secondary">Identify all screens</button></form>'
         '<form class="inline" method="post" action="/restart">%s'
@@ -1262,7 +1281,8 @@ def dashboard(session):
         'outgoing streams, device and NDI settings) to the defaults? Network settings and passwords are kept.">'
         '%s<button class="danger">Reset settings</button></form>'
         '<form class="inline" method="post" action="/reboot" data-confirm="Reboot the device now?">%s'
-        '<button class="danger">Reboot</button></form></div></section>' % (hidden, hidden, hidden, hidden, hidden))
+        '<button class="danger">Reboot</button></form></div></section>' %
+        (hidden, hidden, esc(version()), hidden, hidden, hidden, hidden))
 
     return page("PiNDI", "".join(parts), session["user"], csrf)
 
@@ -1750,6 +1770,91 @@ def diagnostics_text():
     return "\n".join(out)
 
 
+UPDATE_DIR = "/var/lib/pindi/update"
+UPDATE_LOG = "/var/log/pindi-update.log"
+UPDATE_UNIT = "pindi-update"
+UPDATE_MAX = 32 * 1024 * 1024
+UPDATE_NEEDS = ("install.sh", "pindi-player.c", "pindi-sender.c", "pindi-web.py", "VERSION")
+
+
+def update_state():
+    """"running", "failed", "done" (rebooting) or "" (no update since the last boot)."""
+    active = run("systemctl", "show", "-p", "ActiveState", "--value", UPDATE_UNIT + ".service").stdout.strip()
+    if active in ("activating", "active", "reloading", "deactivating"):
+        return "running"
+    try:
+        boot = time.time() - float(read_text("/proc/uptime").split()[0])
+        if os.path.getmtime(UPDATE_LOG) < boot:
+            return ""
+    except (OSError, ValueError, IndexError):
+        return ""
+    text = read_text(UPDATE_LOG)
+    if "PINDI-UPDATE-FAILED" in text:
+        return "failed"
+    return "done" if "Update installed" in text else ""
+
+
+def act_update(form):
+    if update_state() == "running":
+        return ("err", "An update is already running.")
+    data = form.get("package", "")
+    if "," in data[:100]:
+        data = data.split(",", 1)[1]  # data: URL from the browser
+    try:
+        blob = base64.b64decode(data, validate=True)
+    except ValueError:
+        return ("err", "Choose an update package (.tar.gz) first.")
+    if not blob or len(blob) > UPDATE_MAX:
+        return ("err", "Choose an update package (.tar.gz, at most 32 MB).")
+    shutil.rmtree(UPDATE_DIR, ignore_errors=True)
+    os.makedirs(UPDATE_DIR)
+    pkg = UPDATE_DIR + ".tar.gz"
+    with open(pkg, "wb") as f:
+        f.write(blob)
+    try:
+        with tarfile.open(pkg, "r:gz") as t:
+            t.extractall(UPDATE_DIR, filter="data")  # no absolute paths, "..", devices or links outside
+    except (tarfile.TarError, OSError, ValueError) as e:
+        return ("err", "That is not a valid update package: %s" % e)
+    finally:
+        os.remove(pkg)
+    src = UPDATE_DIR
+    entries = os.listdir(src)
+    if len(entries) == 1 and os.path.isdir(os.path.join(src, entries[0])):
+        src = os.path.join(src, entries[0])  # packaged inside one folder
+    missing = [n for n in UPDATE_NEEDS if not os.path.isfile(os.path.join(src, n))]
+    if missing:
+        return ("err", "That is not a PiNDI update package (missing %s)." % ", ".join(missing))
+    new_version = read_text(os.path.join(src, "VERSION")).strip()
+    # A separate unit: it keeps running while this web interface is replaced, and reboots when done.
+    script = ('echo "PiNDI update %s -> %s, $(date)"; if cd "%s" && bash install.sh --accept-ndi-license '
+              '--skip-upgrade --offline --no-reboot; then echo "Update installed, rebooting."; sleep 3; '
+              'systemctl reboot; else echo "PINDI-UPDATE-FAILED"; exit 1; fi' % (version(), new_version, src))
+    run("systemctl", "reset-failed", UPDATE_UNIT + ".service")
+    try:
+        os.remove(UPDATE_LOG)  # file: output doesn't truncate
+    except OSError:
+        pass
+    r = run("systemd-run", "--unit", UPDATE_UNIT, "--collect", "--property", "StandardOutput=file:" + UPDATE_LOG,
+            "--property", "StandardError=file:" + UPDATE_LOG, "/bin/bash", "-c", script)
+    if r.returncode:
+        return ("err", "Could not start the update: %s" % (r.stderr.strip() or r.stdout.strip()))
+    log("software update to %s started" % new_version)
+    return ("ok", "Installing PiNDI %s. The device reboots when it is done (about 2 minutes); the log is "
+                  "below." % new_version)
+
+
+def update_page(session):
+    state = update_state()
+    text = {"running": "Installing&hellip; do not switch the device off.",
+            "failed": "The update failed; the previous version is still running. See the log.",
+            "done": "Installed. The device is rebooting.", "": "No update has run since the last reboot."}
+    body = ('<section class="card"><nav class="top"><a href="/">&larr; Back</a></nav><h2>Software update</h2>'
+            '<p><span data-k="update_state" class="state">%s</span></p><pre class="log" id="update-log">%s</pre>'
+            '</section>' % (text[state], esc(read_text(UPDATE_LOG)[-20000:])))
+    return page("PiNDI - Update", body, session["user"], session["csrf"])
+
+
 def logs_page(session):
     body = ('<section class="card"><nav class="top"><a href="/">&larr; Back</a><a href="/diagnostics">Download '
             'diagnostics</a></nav><h2>Log (last 400 lines)</h2><pre class="log">%s</pre></section>' %
@@ -1799,7 +1904,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def form(self):
         length = int(self.headers.get("Content-Length") or 0)
-        if length > 65536:
+        limit = UPDATE_MAX * 4 // 3 + 65536 if urllib.parse.urlparse(self.path).path == "/update" else 65536
+        if length > limit:
             return {}
         raw = self.rfile.read(length).decode("utf-8", "replace")
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
@@ -1828,6 +1934,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, dashboard(s))
         if path == "/logs":
             return self.send(200, logs_page(s))
+        if path == "/update":
+            return self.send(200, update_page(s))
+        if path == "/update/log":
+            return self.send(200, json.dumps({"state": update_state(), "log": read_text(UPDATE_LOG)[-20000:]}),
+                             "application/json")
         m = re.match(r"^/thumb/(\d)\.jpg$", path)
         if m:
             # Asking for it keeps the player rendering it (for 15 s); the first request may find none yet.
@@ -1942,6 +2053,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             s["flash"] = act_reset()
         elif path == "/identify":
             s["flash"] = act_identify(form)
+        elif path == "/update":
+            s["flash"] = act_update(form)
+            if s["flash"][0] == "ok":
+                return self.redirect("/update")
         elif path == "/api-token":
             s["flash"] = act_api_token()
         elif path == "/restart":

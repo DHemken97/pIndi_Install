@@ -30,11 +30,27 @@ or 5 has two HDMI outputs and Gigabit Ethernet.
    The script asks you to accept the NDI SDK licence; `--accept-ndi-license`
    skips the question. When it's done, the Pi reboots.
 
-`install.sh` is safe to run again; that's also how you update. Options:
+`install.sh` is safe to run again. Options:
 
 - `--skip-upgrade` doesn't run `apt full-upgrade`.
+- `--offline` doesn't use apt at all; the packages must already be installed.
 - `--no-reboot` skips the reboot at the end. Without a reboot, restart the
   services yourself: `sudo systemctl restart pindi pindi-sender pindi-web`.
+
+## Updating
+
+Run `bash make-update.sh` in this folder. It builds
+`pindi-update-<version>.tar.gz`, about 100 KB because the NDI SDK isn't
+included; devices keep the SDK they have.
+
+Install the package on a device under **System → Software update**:
+
+- It installs offline, keeps all settings, shows the log live, and reboots when
+  it's done (about 2 minutes on a Pi 3).
+- If the install fails, the previous version keeps running and the log shows
+  why.
+
+Running `install.sh` again over SSH also works.
 
 ## First steps
 

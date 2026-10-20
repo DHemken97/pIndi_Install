@@ -1,5 +1,6 @@
 # These files run on the Pi: keep Unix line endings even on Windows checkouts.
 *.sh      text eol=lf
+*.md      text eol=lf
 *.c       text eol=lf
 *.py      text eol=lf
 *.service text eol=lf
