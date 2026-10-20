@@ -654,8 +654,15 @@ def outputs():
         bandwidth = out_setting(env, n, "BANDWIDTH", env.get("PINDI_BANDWIDTH") or "highest").lower()
         fmt = ""
         if running and st.get("state", "").startswith("playing"):
-            # Without the HX decoder the SDK can only have negotiated SpeedHQ with the sender.
-            fmt = "Full NDI (SpeedHQ)" if not hx else "Full NDI or NDI|HX (the SDK does not report which)"
+            # Without the HX decoder the SDK can only have negotiated SpeedHQ with the sender. With it,
+            # the player checks the codec once per stream (out<n>.codec).
+            codec = read_kv("%s/out%d.codec" % (RUN_DIR, n))
+            if not hx:
+                fmt = "Full NDI (SpeedHQ)"
+            elif codec.get("source") == st.get("source") and codec.get("codec"):
+                fmt = codec["codec"]
+            else:
+                fmt = "Full NDI or NDI|HX (checking...)"
             if bandwidth == "lowest":
                 fmt += ", low-bandwidth preview"
         out.append({

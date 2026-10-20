@@ -69,6 +69,7 @@
 #define RUN_DIR "/run/pindi"
 
 static const NDIlib_v6 *ndi;
+static bool hx_decode; /* the SDK can decode NDI|HX, so a sender may use either codec */
 static volatile sig_atomic_t running = 1;
 static void on_signal(int sig) { (void)sig; running = 0; }
 
@@ -1727,6 +1728,80 @@ static const NDIlib_source_t *find_primary(struct output *o, const NDIlib_source
     return pick;
 }
 
+/* Which codec a sender uses (SpeedHQ or NDI|HX) is hidden by the decoding receiver. With the
+ * Advanced SDK, a second receiver asking for compressed frames gets them undecoded, and the
+ * FourCC names the codec. It connects once per stream, reads one frame and goes away. */
+struct codec_probe {
+    int n;
+    NDIlib_recv_bandwidth_e bandwidth;
+    char name[256], url[128];
+};
+
+static const char *codec_name(uint32_t cc)
+{
+    cc &= ~0x80808080u; /* protected variants set the top bit of each byte */
+    char c[5] = { (char)toupper(cc & 0xff), (char)toupper(cc >> 8 & 0xff), (char)toupper(cc >> 16 & 0xff),
+                  (char)toupper(cc >> 24 & 0xff), 0 };
+    if (!strcmp(c, "SHQ0")) return "Full NDI (SpeedHQ 4:2:0)";
+    if (!strcmp(c, "SHQ2")) return "Full NDI (SpeedHQ 4:2:2)";
+    if (!strcmp(c, "SHQ7")) return "Full NDI (SpeedHQ 4:2:2:4)";
+    if (!strcmp(c, "H264") || !strcmp(c, "A264")) return "NDI|HX (H.264)";
+    if (!strcmp(c, "HEVC") || !strcmp(c, "AEVC")) return "NDI|HX (HEVC)";
+    return NULL; /* uncompressed video (e.g. from the SDK's own decoder) tells nothing */
+}
+
+static void *codec_probe_thread(void *arg)
+{
+    struct codec_probe *p = arg;
+    NDIlib_source_t src = { .p_ndi_name = p->name, .p_url_address = *p->url ? p->url : NULL };
+    NDIlib_recv_create_v3_t rc = {
+        .source_to_connect_to = src,
+        .color_format = (NDIlib_recv_color_format_e)307, /* NDIlib_recv_color_format_compressed_v5 */
+        .bandwidth = p->bandwidth,
+        .allow_video_fields = false,
+        .p_ndi_recv_name = "PiNDI format check",
+    };
+    NDIlib_recv_instance_t r = ndi->recv_create_v3(&rc);
+    const char *codec = NULL;
+    uint64_t until = now_ms() + 5000;
+    while (r && running && !codec && now_ms() < until) {
+        NDIlib_video_frame_v2_t v;
+        if (ndi->recv_capture_v3(r, &v, NULL, NULL, 500) == NDIlib_frame_type_video) {
+            codec = codec_name((uint32_t)v.FourCC);
+            if (!codec)
+                codec = "";
+            ndi->recv_free_video_v2(r, &v);
+        }
+    }
+    if (r)
+        ndi->recv_destroy(r);
+    if (codec && *codec) {
+        char buf[512], path[64];
+        snprintf(buf, sizeof buf, "source=%s\ncodec=%s\n", p->name, codec);
+        snprintf(path, sizeof path, RUN_DIR "/out%d.codec", p->n);
+        write_file_atomic(path, buf);
+        LOG("ndi: output %d: %s sends %s", p->n, p->name, codec);
+    }
+    free(p);
+    return NULL;
+}
+
+static void codec_probe_start(int n, NDIlib_recv_bandwidth_e bandwidth, const char *name, const char *url)
+{
+    struct codec_probe *p = calloc(1, sizeof *p);
+    pthread_t t;
+    if (!p)
+        return;
+    p->n = n;
+    p->bandwidth = bandwidth;
+    snprintf(p->name, sizeof p->name, "%s", name);
+    snprintf(p->url, sizeof p->url, "%s", url);
+    if (pthread_create(&t, NULL, codec_probe_thread, p) == 0)
+        pthread_detach(t);
+    else
+        free(p);
+}
+
 static void *receiver(void *arg)
 {
     struct output *o = arg;
@@ -1970,9 +2045,12 @@ static void *receiver(void *arg)
         uint64_t recv_us = clock_us(CLOCK_MONOTONIC);
         now = now_ms();
         if (t == NDIlib_frame_type_video) {
-            if (!got_frame)
+            if (!got_frame) {
                 LOG("ndi: output %d: first frame after %llu ms (%dx%d)", o->n,
                     (unsigned long long)(now - recv_start), v.xres, v.yres);
+                if (hx_decode)
+                    codec_probe_start(o->n, bandwidth, cur_src, cur_url);
+            }
             bool shown = post_frame(o, &v, recv_us);
             char vid[64];
             snprintf(vid, sizeof vid, "%dx%d %.2f fps", v.xres, v.yres,
@@ -2288,6 +2366,7 @@ static bool load_ndi(void)
     }
     if (hx)
         dlclose(hx);
+    hx_decode = hx != NULL;
     char buf[256];
     snprintf(buf, sizeof buf, "version=%s\nhx_receive=%d\n", ndi->version ? ndi->version() : "", hx != NULL);
     write_file_atomic(RUN_DIR "/ndi", buf);
