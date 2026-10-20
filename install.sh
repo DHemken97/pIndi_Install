@@ -30,7 +30,10 @@ step() { echo; echo "==> $*"; }
 
 # Files edited on Windows get CRLF line endings; normalise the ones we use.
 sed -i 's/\r$//' "$SRC/pindi-player.c" "$SRC/pindi.service" "$SRC/pindi.conf" \
-    "$SRC/pindi-web.py" "$SRC/pindi-web.service"
+    "$SRC/pindi-web.py" "$SRC/pindi-web.service" "$SRC/pindi-sender.c" "$SRC/pindi-sender.service"
+
+MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)
+echo "Model: $MODEL"
 
 BOOT=/boot/firmware
 [ -f "$BOOT/config.txt" ] || BOOT=/boot
@@ -54,7 +57,8 @@ if [ "$UPGRADE" -eq 1 ]; then
 fi
 apt-get "${APT_OPTS[@]}" install --no-install-recommends \
     gcc libc6-dev pkg-config \
-    libdrm-dev libfreetype-dev libjpeg-dev \
+    libdrm-dev libfreetype-dev libjpeg-dev libturbojpeg0-dev \
+    v4l-utils \
     fonts-dejavu-core \
     avahi-daemon libavahi-client3 \
     systemd-resolved \
@@ -65,8 +69,10 @@ step "Installing NDI SDK runtime"
 case "$(dpkg --print-architecture)" in
     arm64) NDI_ARCH=aarch64-rpi4-linux-gnueabi ;;
     armhf)
-        case "$(uname -m)" in
+        case "$(uname -m)-$MODEL" in
             armv6*) NDI_ARCH=arm-rpi1-linux-gnueabihf ;;
+            *"Pi 4"*|*"Pi 400"*|*"Pi 5"*|*"Pi 500"*|*"Compute Module 4"*|*"Compute Module 5"*)
+                NDI_ARCH=arm-rpi4-linux-gnueabihf ;;
             *) NDI_ARCH=arm-rpi3-linux-gnueabihf ;;
         esac ;;
     amd64) NDI_ARCH=x86_64-linux-gnu ;;
@@ -99,16 +105,19 @@ install -m 644 "$SDK"/include/*.h /usr/local/include/ndi/
 install -m 644 "$SDK/NDI SDK License Agreement.txt" "$SDK"/licenses/* /usr/local/share/doc/ndi/
 
 # ---------------------------------------------------------------- player
-step "Building pindi-player"
+step "Building pindi-player and pindi-sender"
 # 32-bit Raspberry Pi OS targets ARMv6 by default; enable NEON on ARMv7/v8 CPUs.
 CPU_FLAGS=""
-if [ "$NDI_ARCH" = arm-rpi3-linux-gnueabihf ]; then
-    CPU_FLAGS="-march=armv7-a -mfpu=neon-vfpv4"
-fi
-gcc -O2 -Wall $CPU_FLAGS -o "$TMP/pindi-player" "$SRC/pindi-player.c" \
+case "$NDI_ARCH" in
+    arm-rpi3-linux-gnueabihf|arm-rpi4-linux-gnueabihf) CPU_FLAGS="-march=armv7-a -mfpu=neon-vfpv4" ;;
+esac
+gcc -O2 -Wall $CPU_FLAGS -pthread -o "$TMP/pindi-player" "$SRC/pindi-player.c" \
     -I/usr/local/include/ndi $(pkg-config --cflags libdrm freetype2) \
     $(pkg-config --libs libdrm freetype2) -ljpeg -lm -ldl
+gcc -O2 -Wall $CPU_FLAGS -pthread -o "$TMP/pindi-sender" "$SRC/pindi-sender.c" \
+    -I/usr/local/include/ndi -lturbojpeg -lm -ldl
 install -m 755 "$TMP/pindi-player" /usr/local/bin/pindi-player
+install -m 755 "$TMP/pindi-sender" /usr/local/bin/pindi-sender
 
 install -d /usr/share/pindi
 install -m 644 "$SRC/Splash.jpg" /usr/share/pindi/splash.jpg
@@ -135,19 +144,27 @@ cat > /etc/pam.d/pindi-web <<'EOF'
 EOF
 install -m 644 "$SRC/pindi-web.service" /etc/systemd/system/pindi-web.service
 
+# Outgoing NDI streams from capture devices: does nothing until enabled in the web UI.
+install -m 644 "$SRC/pindi-sender.service" /etc/systemd/system/pindi-sender.service
+
 systemctl daemon-reload
-systemctl enable pindi.service pindi-web.service
+systemctl enable pindi.service pindi-web.service pindi-sender.service
 
 # ---------------------------------------------------------------- boot speed
 step "Optimising boot ($BOOT)"
 
-# config.txt: no rainbow, no delays, no Wi-Fi/Bluetooth, no initramfs
-# (ext4 and the SD card driver are built into the Raspberry Pi kernel).
+# config.txt: no rainbow, no delays, no Wi-Fi/Bluetooth (the overlays are named
+# differently on the Pi 5). The initramfs is skipped only when booting from the SD
+# card, whose driver and ext4 are built into the kernel; USB/NVMe boot keeps it.
 CFG="$BOOT/config.txt"
 [ -f "$CFG.pindi-orig" ] || cp "$CFG" "$CFG.pindi-orig"
+INITRAMFS=1
+case "$(findmnt -no SOURCE /)" in
+    /dev/mmcblk*) INITRAMFS=0 ;;
+esac
 sed -i '/^# --- PiNDI begin ---$/,/^# --- PiNDI end ---$/d' "$CFG"
 sed -i -E 's/^(camera_auto_detect|display_auto_detect|auto_initramfs|disable_splash|boot_delay|initial_turbo)=/#&/' "$CFG"
-cat >> "$CFG" <<'EOF'
+cat >> "$CFG" <<EOF
 # --- PiNDI begin ---
 [all]
 disable_splash=1
@@ -155,9 +172,17 @@ boot_delay=0
 initial_turbo=30
 camera_auto_detect=0
 display_auto_detect=0
-auto_initramfs=0
+auto_initramfs=$INITRAMFS
+[pi3]
 dtoverlay=disable-wifi
 dtoverlay=disable-bt
+[pi4]
+dtoverlay=disable-wifi
+dtoverlay=disable-bt
+[pi5]
+dtoverlay=disable-wifi-pi5
+dtoverlay=disable-bt-pi5
+[all]
 # --- PiNDI end ---
 EOF
 
@@ -244,6 +269,16 @@ ClientIdentifier=mac
 EOF
 fi
 systemctl enable systemd-networkd.service systemd-resolved.service
+
+# Clock: the Pi has no RTC. Public NTP servers in addition to any from DHCP or the
+# web UI: timesyncd rotates through all of them, so a DHCP-advertised server that
+# doesn't answer no longer leaves the clock unsynced (latency figures need it).
+install -d /etc/systemd/timesyncd.conf.d
+cat > /etc/systemd/timesyncd.conf.d/pindi.conf <<'EOF'
+[Time]
+NTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org 3.debian.pool.ntp.org
+EOF
+systemctl restart systemd-timesyncd.service || true
 for u in NetworkManager.service NetworkManager-dispatcher.service; do
     if unit_exists "$u"; then
         systemctl disable "$u" >/dev/null 2>&1 || true

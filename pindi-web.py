@@ -3,8 +3,9 @@
 
 Small standard-library HTTP server (runs as root, port 80):
   - login with the Pi's own user accounts (PAM, members of the sudo group)
-  - status of the NDI player
-  - NDI source: stream name (default OUT_<serial>) and source IP (default any)
+  - per display output (detected by the player): enable/disable, NDI stream
+    (default OUT_<serial>[_n]), source IP (default any), rotation, mirror, status
+  - "Configure Outgoing Streams": detected USB capture devices, off until enabled
   - network: DHCP or static IP, with automatic rollback unless confirmed
   - change the login (SSH) password, reboot
 """
@@ -149,7 +150,6 @@ def serial_number():
 
 
 SERIAL = serial_number()
-DEFAULT_STREAM = "OUT_" + SERIAL
 
 
 # ---------------------------------------------------------------- /etc/default/pindi
@@ -211,7 +211,7 @@ def live_network():
 
 
 def read_network_config():
-    cfg = {"dhcp": True, "address": "", "prefix": "", "gateway": "", "dns": []}
+    cfg = {"dhcp": True, "address": "", "prefix": "", "gateway": "", "dns": [], "ntp": []}
     for line in read_text(NETWORK_FILE).splitlines():
         key, _, val = line.strip().partition("=")
         if key == "Address":
@@ -221,11 +221,15 @@ def read_network_config():
             cfg["gateway"] = val
         elif key == "DNS":
             cfg["dns"] += val.split()
+        elif key == "NTP":
+            cfg["ntp"] += val.split()
     return cfg
 
 
-def render_network_config(dhcp, iface=None, gateway="", dns=()):
+def render_network_config(dhcp, iface=None, gateway="", dns=(), ntp=()):
     text = "# Written by the PiNDI web interface.\n[Match]\nType=ether\n\n[Network]\n"
+    for server in ntp:
+        text += "NTP=%s\n" % server
     if dhcp:
         return text + "DHCP=yes\n\n[DHCPv4]\nClientIdentifier=mac\n"
     text += "Address=%s\n" % iface.with_prefixlen
@@ -294,16 +298,272 @@ class NetworkChange:
 NET = NetworkChange()
 
 
-# ---------------------------------------------------------------- player status
+# ---------------------------------------------------------------- outputs (displays)
 
-def player_status():
+def read_kv(path):
     st = {}
-    for line in read_text(RUN_DIR + "/status").splitlines():
+    for line in read_text(path).splitlines():
         k, _, v = line.partition("=")
         st[k] = v
-    if run("systemctl", "is-active", "pindi.service").stdout.strip() != "active":
-        st["state"] = "player not running"
     return st
+
+
+def default_out_stream(n):
+    return "OUT_%s" % SERIAL if n == 1 else "OUT_%s_%d" % (SERIAL, n)
+
+
+def default_in_stream(n):
+    return "IN_%s" % SERIAL if n == 1 else "IN_%s_%d" % (SERIAL, n)
+
+
+def out_setting(env, n, key, default=""):
+    """PINDI_OUT<n>_<KEY>, falling back to the original single-output key for output 1."""
+    v = env.get("PINDI_OUT%d_%s" % (n, key))
+    if v is None and n == 1:
+        v = env.get("PINDI_" + key)
+    return v if v else default
+
+
+_ntp = {"t": 0, "ok": False}
+
+
+def clock_synced():
+    if time.time() - _ntp["t"] > 30:
+        _ntp["ok"] = run("timedatectl", "show", "-p", "NTPSynchronized", "--value").stdout.strip() == "yes"
+        _ntp["t"] = time.time()
+    return _ntp["ok"]
+
+
+def clock_text():
+    out = run("timedatectl", "timesync-status").stdout
+    server = re.search(r"Server: (\S+)", out)
+    offset = re.search(r"Offset: (\S+)", out)
+    if clock_synced():
+        return "synchronised%s%s" % (" with %s" % esc(server.group(1)) if server else "",
+                                    " (offset %s)" % esc(offset.group(1)) if offset else "")
+    return ('<span class="warn">not synchronised</span>%s' %
+            (" &ndash; trying %s" % esc(server.group(1)) if server else ""))
+
+
+class NetTraffic:
+    """Received/sent bit rate of the wired interfaces, sampled in the background."""
+
+    def __init__(self, interval=2.0):
+        self.interval = interval
+        self.rx = self.tx = None
+
+    @staticmethod
+    def _counters():
+        rx = tx = 0
+        for name in ether_interfaces():
+            base = "/sys/class/net/%s/statistics/" % name
+            rx += int(read_text(base + "rx_bytes", "0").strip() or 0)
+            tx += int(read_text(base + "tx_bytes", "0").strip() or 0)
+        return rx, tx, time.monotonic()
+
+    def _loop(self):
+        last = self._counters()
+        while True:
+            time.sleep(self.interval)
+            cur = self._counters()
+            dt = cur[2] - last[2]
+            if dt > 0:
+                self.rx = max(0, cur[0] - last[0]) * 8 / dt
+                self.tx = max(0, cur[1] - last[1]) * 8 / dt
+            last = cur
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def text(self):
+        if self.rx is None:
+            return "measuring..."
+        speeds = [int(read_text("/sys/class/net/%s/speed" % n, "0").strip() or 0) for n in ether_interfaces()]
+        link = max([s for s in speeds if s > 0] or [0])
+        text = "%s in, %s out" % (mbit(self.rx), mbit(self.tx))
+        if link:
+            text += " (%d Mbit/s link)" % link
+            if max(self.rx, self.tx) > 0.8 * link * 1e6:
+                text += " – close to the link limit, expect dropped frames"
+        return text
+
+
+def mbit(bps):
+    return "%.1f Mbit/s" % (bps / 1e6) if bps >= 1e5 else "%.0f kbit/s" % (bps / 1e3)
+
+
+TRAFFIC = NetTraffic()
+
+
+def ndi_info():
+    """What the player found out about the installed NDI SDK (/run/pindi/ndi)."""
+    info = read_kv(RUN_DIR + "/ndi")
+    version = info.get("version", "").split()  # "NDI SDK LINUX 13:10:53 Apr 13 2026 6.3.2.0"
+    return {"version": version[-1] if version else "", "hx_receive": info.get("hx_receive") == "1"}
+
+
+def hx_send_needs():
+    """What sending NDI|HX would take besides the NDI Advanced SDK: a hardware H.264 encoder."""
+    base = "/sys/class/video4linux"
+    try:
+        if any("encode" in read_text(os.path.join(base, d, "name")) for d in os.listdir(base)):
+            return ""
+    except OSError:
+        pass
+    if "Raspberry Pi 5" in read_text("/proc/device-tree/model"):
+        return " and a hardware H.264 encoder (the Pi 5 has none)"
+    return " and the Pi's H.264 encoder driver (bcm2835-codec, not loaded)"
+
+
+def latency_text(n):
+    """Human summary of /run/pindi/out<n>.latency (5 s averages of frames that reached the screen)."""
+    lat = read_kv("%s/out%d.latency" % (RUN_DIR, n))
+    if "pi_avg" not in lat:
+        return ""
+    pi = "%.0f ms on this Pi" % float(lat["pi_avg"])
+    if "total_avg" not in lat:
+        return pi + " (sender gives no timestamp)"
+    total = float(lat["total_avg"])
+    if not -10000 < total < 10000:
+        return pi + " (sender and Pi clocks disagree)"
+    if total < float(lat["pi_avg"]):
+        # Impossible unless the sender's clock runs ahead of this Pi's.
+        return pi + (" – sender → screen not measurable: the sender's clock is at least %.0f ms ahead "
+                     "of this Pi's. Sync the sender's clock (Windows: w32tm /resync)." %
+                     (float(lat["pi_avg"]) - total))
+    text = "%.0f ms sender → screen (%.0f–%.0f), of which %s" % (
+        total, float(lat["total_min"]), float(lat["total_max"]), pi)
+    if not clock_synced():
+        text += " – Pi clock not NTP-synced, sender figure approximate"
+    return text
+
+
+def outputs():
+    """Display outputs as detected by the player, with their settings and live status."""
+    env = read_env()
+    running = run("systemctl", "is-active", "pindi.service").stdout.strip() == "active"
+    hx = ndi_info()["hx_receive"]
+    out = []
+    for line in read_text(RUN_DIR + "/outputs").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue
+        n = int(parts[0])
+        st = read_kv("%s/out%d.status" % (RUN_DIR, n))
+        if not running:
+            st["state"] = "player not running"
+        bandwidth = out_setting(env, n, "BANDWIDTH", env.get("PINDI_BANDWIDTH") or "highest").lower()
+        fmt = ""
+        if running and st.get("state") == "playing":
+            # Without the HX decoder the SDK can only have negotiated SpeedHQ with the sender.
+            fmt = "Full NDI (SpeedHQ)" if not hx else "Full NDI or NDI|HX (the SDK does not report which)"
+            if bandwidth == "lowest":
+                fmt += ", low-bandwidth preview"
+        out.append({
+            "n": n, "connector": parts[1], "link": parts[2], "mode": parts[3] if len(parts) > 3 else "",
+            "enabled": out_setting(env, n, "ENABLED", "1") != "0",
+            "stream": out_setting(env, n, "STREAM"), "source_ip": out_setting(env, n, "SOURCE_IP"),
+            "rotate": out_setting(env, n, "ROTATE", "0"), "mirror": out_setting(env, n, "MIRROR", "none"),
+            "bandwidth": "lowest" if bandwidth == "lowest" else "highest", "format": fmt,
+            "state": st.get("state", "-"), "target": st.get("target", default_out_stream(n)),
+            "source": st.get("source", ""), "video": st.get("video", ""),
+            "latency": latency_text(n) if running and st.get("state") == "playing" else "",
+        })
+    return out
+
+
+# ---------------------------------------------------------------- inputs (capture devices)
+
+def _stable_path(dev):
+    """/dev/v4l/by-id (or by-path) link for /dev/videoN, so the setting survives re-plugging."""
+    for d in ("/dev/v4l/by-id", "/dev/v4l/by-path"):
+        try:
+            for name in sorted(os.listdir(d)):
+                p = os.path.join(d, name)
+                if os.path.realpath(p) == dev:
+                    return p
+        except OSError:
+            pass
+    return dev
+
+
+def capture_modes(dev):
+    """[(value, label)] of capture modes, e.g. ("MJPG 1920x1080@30", "MJPEG 1920x1080 @ 30 fps")."""
+    modes, fourcc, size = [], None, None
+    for line in run("v4l2-ctl", "-d", dev, "--list-formats-ext").stdout.splitlines():
+        m = re.match(r"\s*\[\d+\]: '(\w+)'", line)
+        if m:
+            fourcc, size = m.group(1), None
+            continue
+        m = re.match(r"\s*Size: Discrete (\d+)x(\d+)", line)
+        if m:
+            size = (int(m.group(1)), int(m.group(2)))
+            continue
+        m = re.search(r"\(([\d.]+) fps\)", line)
+        if m and size and fourcc in ("MJPG", "YUYV", "UYVY"):
+            fps = float(m.group(1))
+            modes.append((fourcc, size[0], size[1], fps))
+    modes.sort(key=lambda x: (x[0] != "MJPG", -x[1] * x[2], -x[3]))
+    names = {"MJPG": "MJPEG", "YUYV": "YUYV (raw)", "UYVY": "UYVY (raw)"}
+    return [("%s %dx%d@%g" % m, "%s %dx%d @ %g fps" % (names[m[0]], m[1], m[2], m[3])) for m in modes]
+
+
+def detected_inputs():
+    """USB video capture devices currently plugged in."""
+    found = []
+    base = "/sys/class/video4linux"
+    try:
+        names = sorted(os.listdir(base), key=lambda s: int(re.sub(r"\D", "", s) or 0))
+    except OSError:
+        names = []
+    for name in names:
+        sysdir = os.path.join(base, name)
+        driver = os.path.basename(os.path.realpath(os.path.join(sysdir, "device", "driver")))
+        if driver != "uvcvideo" or read_text(os.path.join(sysdir, "index")).strip() not in ("", "0"):
+            continue  # not a USB capture device, or its metadata node
+        dev = "/dev/" + name
+        modes = capture_modes(dev)
+        if not modes:
+            continue
+        found.append({"dev": dev, "id": _stable_path(dev), "label": read_text(os.path.join(sysdir, "name")).strip(),
+                      "modes": modes})
+    return found
+
+
+def configured_inputs(env):
+    """{slot: settings} from PINDI_IN<n>_* keys."""
+    slots = {}
+    for key, val in env.items():
+        m = re.match(r"^PINDI_IN(\d+)_(DEVICE|ENABLED|NAME|MODE)$", key)
+        if m:
+            slots.setdefault(int(m.group(1)), {})[m.group(2)] = val
+    return {n: s for n, s in slots.items() if s.get("DEVICE")}
+
+
+def inputs():
+    """Detected devices merged with configured ones (configured but unplugged ones are listed too)."""
+    env = read_env()
+    conf = configured_inputs(env)
+    by_dev = {s["DEVICE"]: n for n, s in conf.items()}
+    out = []
+    for d in detected_inputs():
+        slot = by_dev.pop(d["id"], None)
+        s = conf.get(slot, {})
+        out.append(dict(d, slot=slot, present=True, enabled=s.get("ENABLED") == "1",
+                        name=s.get("NAME", ""), mode=s.get("MODE", "")))
+    for dev, slot in by_dev.items():
+        s = conf[slot]
+        out.append({"dev": "", "id": dev, "label": os.path.basename(dev), "modes": [], "slot": slot,
+                    "present": False, "enabled": s.get("ENABLED") == "1", "name": s.get("NAME", ""),
+                    "mode": s.get("MODE", "")})
+    for i in out:
+        st = read_kv("%s/in%d.status" % (RUN_DIR, i["slot"])) if i["slot"] else {}
+        i["state"] = st.get("state", "") if i["enabled"] else "off"
+        i["live_mode"] = st.get("mode", "")
+        i["fps"] = st.get("fps", "")
+        i["cam_fps"] = st.get("cam_fps", "")
+        i["damaged"] = st.get("damaged", "0")
+    return out
 
 
 def visible_sources():
@@ -365,6 +625,7 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:0}dt{c
 label{display:block;margin:10px 0 4px;color:var(--muted);font-size:13px}
 input[type=text],input[type=password],select{width:100%;padding:9px 10px;border-radius:7px;border:1px solid var(--line);
 background:#0d1319;color:var(--text);font:inherit}
+option:disabled{color:var(--muted)}
 input:focus{outline:2px solid var(--accent2);border-color:var(--accent2)}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
 .radio{display:flex;gap:18px;margin:4px 0 4px}.radio label{display:flex;gap:6px;align-items:center;margin:0;color:var(--text);font-size:15px}
@@ -378,6 +639,13 @@ button.small{margin:0;padding:4px 10px;font-size:13px}
 table{width:100%;border-collapse:collapse;font-size:14px}td{padding:6px 4px;border-top:1px solid var(--line)}
 td:last-child{text-align:right}.state{font-weight:600}.state.playing{color:var(--ok)}
 .login{max-width:360px;margin:12vh auto}
+.badge{font-size:12px;font-weight:400;padding:2px 9px;border-radius:10px;background:#2a3644;color:var(--muted);
+margin-left:6px;vertical-align:middle}.badge.on{background:#12261a;color:var(--ok)}
+label.check{display:flex;gap:8px;align-items:center;color:var(--text);font-size:15px;margin:12px 0 0}
+label.check .hint{margin:0}
+.sub{border-top:1px solid var(--line);padding:12px 0 4px}.sub:first-of-type{border-top:0}
+.sub h3{margin:0 0 2px;font-size:15px}.sub p{margin:4px 0}
+.card dl{margin-bottom:6px}.warn{color:var(--warn)}.hint.block{display:block;margin-top:2px}
 form.inline{display:inline}
 @media(max-width:600px){.row{grid-template-columns:1fr}main{padding:12px}}
 """
@@ -387,11 +655,13 @@ function sync(){var s=document.getElementById('mode-static');if(!s)return;
 document.getElementById('static-fields').style.display=s.checked?'block':'none';}
 document.addEventListener('change',function(e){if(e.target.name==='mode')sync();});
 document.addEventListener('click',function(e){var b=e.target.closest('[data-stream]');if(!b)return;
-document.getElementById('stream').value=b.dataset.stream;document.getElementById('source_ip').value=b.dataset.ip;
-document.getElementById('source-form').scrollIntoView({behavior:'smooth'});});
+var n=b.dataset.out;document.getElementById('stream-'+n).value=b.dataset.stream;
+document.getElementById('source_ip-'+n).value=b.dataset.ip;
+document.getElementById('out'+n).scrollIntoView({behavior:'smooth'});});
 function poll(){fetch('/api/status',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null})
 .then(function(d){if(!d)return;document.querySelectorAll('[data-k]').forEach(function(el){
-var v=d[el.dataset.k];el.textContent=v||'-';if(el.dataset.k==='state')el.className='state '+(v==='playing'?'playing':'');});
+var k=el.dataset.k;if(!(k in d))return;var v=d[k];el.textContent=v||'-';
+if(/state$/.test(k))el.className='state'+(v==='playing'||/^sending/.test(v||'')?' playing':'');});
 var c=document.getElementById('countdown');if(c&&d.rollback!=null)c.textContent=d.rollback;}).catch(function(){});}
 sync();if(document.querySelector('[data-k]'))setInterval(poll,3000);
 """
@@ -440,58 +710,144 @@ def dashboard(session):
             '%s<button>Keep these settings</button> <button class="secondary" formaction="/network/revert">'
             'Undo now</button></form></div>' % (NET.seconds_left(), hidden))
 
-    # Status
-    st = player_status()
     net = live_network()
-    env = read_env()
-    rows = [
-        ("Player", '<span data-k="state" class="state %s">%s</span>' %
-         ("playing" if st.get("state") == "playing" else "", esc(st.get("state", "-")))),
-        ("Looking for", '<span data-k="target">%s</span>' % esc(st.get("target", "-"))),
-        ("Connected to", '<span data-k="source">%s</span>' % esc(st.get("source") or "-")),
-        ("Video", '<span data-k="video">%s</span>' % esc(st.get("video") or "-")),
-        ("IP address", '<span data-k="ip">%s</span>' % esc(net["address"] or "-")),
-        ("Serial", esc(SERIAL)),
-        ("Hostname", esc(socket.gethostname())),
-    ]
-    parts.append('<section class="card"><h2>Status</h2><dl>%s</dl></section>' %
-                 "".join("<dt>%s</dt><dd>%s</dd>" % r for r in rows))
-
-    # Source
-    stream = env.get("PINDI_STREAM", "")
-    source_ip = env.get("PINDI_SOURCE_IP", "")
-    srcs = visible_sources()
-    table = ""
-    if srcs:
-        table = ('<label>Sources this device can see</label><table>%s</table>' % "".join(
-            '<tr><td>%s</td><td>%s</td><td><button type="button" class="small secondary" '
-            'data-stream="%s" data-ip="%s">Use</button></td></tr>' %
-            (esc(s["name"]), esc(s["ip"]), esc(s["stream"]), esc(s["ip"])) for s in srcs))
-    parts.append(
-        '<section class="card" id="source-form"><h2>NDI source</h2><form method="post" action="/source">%s'
-        '<div class="row"><div><label>Stream name</label><input type="text" id="stream" name="stream" '
-        'value="%s" placeholder="%s" maxlength="200"></div><div><label>Source IP</label>'
-        '<input type="text" id="source_ip" name="source_ip" value="%s" placeholder="Any" maxlength="15"></div></div>'
-        '<p class="hint">Leave the stream name empty for the default (%s) and the IP empty to accept any host. '
-        'The source IP is also searched directly, so senders on other subnets work.</p>'
-        '<button>Save source</button> <button class="secondary" name="reset" value="1">Reset to default</button>'
-        '</form>%s</section>' %
-        (hidden, esc(stream), esc(DEFAULT_STREAM), esc(source_ip), esc(DEFAULT_STREAM), table))
-
-    # Display
-    rotate = env.get("PINDI_ROTATE", "0")
-    mirror = env.get("PINDI_MIRROR", "none")
+    outs = outputs()
+    ins = inputs()
 
     def options(choices, current):
-        return "".join('<option value="%s"%s>%s</option>' % (v, " selected" if v == current else "", label)
+        return "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == current else "", label)
                        for v, label in choices)
-    parts.append(
-        '<section class="card"><h2>Display</h2><form method="post" action="/display">%s'
-        '<div class="row"><div><label>Rotation</label><select name="rotate">%s</select></div>'
-        '<div><label>Mirror</label><select name="mirror">%s</select></div></div>'
-        '<p class="hint">Applies to the video and the splash screen. 180&deg; is for upside-down (ceiling) '
-        'mounting; mirror is for rear projection.</p><button>Save display</button></form></section>' %
-        (hidden, options(ROTATIONS, rotate), options(MIRRORS, mirror)))
+
+    # Device
+    ndi = ndi_info()
+    ndi_text = "SDK %s &middot; Full NDI (SpeedHQ) receive and send" % esc(ndi["version"] or "?")
+    if ndi["hx_receive"]:
+        ndi_text += " &middot; NDI|HX receive available"
+    else:
+        ndi_text += ('<span class="hint block">NDI|HX: not available &ndash; the standard NDI SDK has no HX '
+                     'decoder or encoder (that needs the NDI Advanced SDK and a vendor licence from NDI). '
+                     'Software HX senders automatically send Full NDI to this device instead; cameras that '
+                     'only send HX will not show a picture.</span>')
+    rows = [
+        ("IP address", '<span data-k="ip">%s</span>' % esc(net["address"] or "-")),
+        ("Network traffic", '<span data-k="net">%s</span><span class="hint block">Everything this device '
+                            'receives and sends on the wired network. Full NDI 1080p needs roughly 100&ndash;150 '
+                            'Mbit/s per stream at 60 fps, about half at 30 fps.</span>' % esc(TRAFFIC.text())),
+        ("NDI", ndi_text),
+        ("Serial", esc(SERIAL)),
+        ("Hostname", esc(socket.gethostname())),
+        ("Clock", clock_text()),
+        ("Outputs", "%d display output%s" % (len(outs), "" if len(outs) == 1 else "s")),
+        ("Inputs", "%d capture device%s" % (len(ins), "" if len(ins) == 1 else "s")),
+    ]
+    parts.append('<section class="card"><h2>Device</h2><dl>%s</dl></section>' %
+                 "".join("<dt>%s</dt><dd>%s</dd>" % r for r in rows))
+
+    # One card per display output
+    if not outs:
+        parts.append('<section class="card"><h2>Outputs</h2><p class="hint">No display outputs reported - '
+                     'is the player running?</p></section>')
+    for o in outs:
+        n = o["n"]
+        link = "disabled" if not o["enabled"] else (o["link"] + (" " + o["mode"] if o["mode"] else ""))
+        badge = '<span class="badge%s">%s</span>' % (" on" if o["link"] == "connected" and o["enabled"] else "",
+                                                     esc(link))
+        k = "out%d." % n
+        status_rows = "" if not o["enabled"] else (
+            '<dl><dt>State</dt><dd><span data-k="%sstate" class="state%s">%s</span></dd>'
+            '<dt>Looking for</dt><dd data-k="%starget">%s</dd>'
+            '<dt>Connected to</dt><dd data-k="%ssource">%s</dd>'
+            '<dt>Video</dt><dd data-k="%svideo">%s</dd>'
+            '<dt>Format</dt><dd data-k="%sformat">%s</dd>'
+            '<dt>Latency</dt><dd><span data-k="%slatency">%s</span>'
+            '<span class="hint block">Measured per frame: from the moment the sender handed '
+            'it to NDI until it was on screen. Not included: the camera/capture before the sender and the '
+            'monitor&#39;s own processing.</span></dd></dl>' %
+            (k, " playing" if o["state"] == "playing" else "", esc(o["state"]), k, esc(o["target"]),
+             k, esc(o["source"] or "-"), k, esc(o["video"] or "-"), k, esc(o["format"] or "-"),
+             k, esc(o["latency"] or "-")))
+        hx_opt = ('<option disabled>NDI|HX (H.264/HEVC) &ndash; %s</option>' %
+                  ("chosen by the sender" if ndi["hx_receive"] else "needs the NDI Advanced SDK"))
+        parts.append(
+            '<section class="card" id="out%d"><h2>Output %d &middot; %s %s</h2>%s'
+            '<form method="post" action="/output">%s<input type="hidden" name="n" value="%d">'
+            '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Enabled '
+            '<span class="hint">(off: no NDI is received and this HDMI port is switched off)</span></label>'
+            '<div class="row"><div><label>Stream name</label><input type="text" id="stream-%d" name="stream" '
+            'value="%s" placeholder="%s" maxlength="200"></div><div><label>Source IP</label>'
+            '<input type="text" id="source_ip-%d" name="source_ip" value="%s" placeholder="Any" maxlength="15">'
+            '</div><div><label>Rotation</label><select name="rotate">%s</select></div>'
+            '<div><label>Mirror</label><select name="mirror">%s</select></div>'
+            '<div><label>Receive quality</label><select name="bandwidth">%s</select></div>'
+            '<div><label>Codec</label><select name="codec"><option selected>Full NDI (SpeedHQ)</option>%s'
+            '</select></div></div>'
+            '<p class="hint">Empty stream name = %s, empty IP = any host. A source IP is also searched '
+            'directly, so senders on other subnets work. 180&deg; is for ceiling mounting, mirror for rear '
+            'projection. The low-bandwidth preview is a small (typically 640&times;360) stream every NDI sender '
+            'provides, for slow networks.</p><button>Save output %d</button> '
+            '<button class="secondary" name="reset" value="1">Reset to default</button></form></section>' %
+            (n, n, esc(o["connector"]), badge, status_rows, hidden, n, " checked" if o["enabled"] else "",
+             n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]),
+             options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]), options(BANDWIDTHS, o["bandwidth"]),
+             hx_opt, esc(default_out_stream(n)), n))
+
+    # NDI sources on the network
+    srcs = visible_sources()
+    enabled_outs = [o["n"] for o in outs if o["enabled"]]
+    if srcs and enabled_outs:
+        def use_buttons(s):
+            return " ".join(
+                '<button type="button" class="small secondary" data-out="%d" data-stream="%s" data-ip="%s">'
+                'Use%s</button>' % (n, esc(s["stream"]), esc(s["ip"]), " for %d" % n if len(outs) > 1 else "")
+                for n in enabled_outs)
+        parts.append('<section class="card"><h2>NDI sources on the network</h2><table>%s</table></section>' %
+                     "".join('<tr><td>%s</td><td>%s</td><td>%s</td></tr>' %
+                             (esc(s["name"]), esc(s["ip"]), use_buttons(s)) for s in srcs))
+
+    # Outgoing streams (capture devices)
+    used = {i["slot"] for i in ins if i["slot"]}
+    free_slots = [n for n in range(1, 9) if n not in used]
+    # Sending HX means encoding H.264 ourselves and passing it through the Advanced SDK.
+    hx_send_opt = '<option disabled>NDI|HX (H.264) &ndash; needs the NDI Advanced SDK%s</option>' % esc(
+        hx_send_needs())
+    cards = []
+    for i in ins:
+        slot = i["slot"] or (free_slots.pop(0) if free_slots else 0)
+        mode_choices = [("", "Automatic (best up to 1080p30)")] + i["modes"]
+        if i["mode"] and i["mode"] not in dict(i["modes"]):
+            mode_choices.append((i["mode"], i["mode"]))
+        state = i["state"] or ("starting" if i["enabled"] else "off")
+        live = ""
+        if i["enabled"] and i["live_mode"]:
+            live = " &middot; %s &middot; %s fps sent" % (esc(i["live_mode"]), esc(i["fps"]))
+            if i["cam_fps"]:
+                live += " (camera delivers %s fps" % esc(i["cam_fps"])
+                if i["damaged"] not in ("", "0"):
+                    live += ", %s damaged frame%s skipped in the last 2 s" % (
+                        esc(i["damaged"]), "" if i["damaged"] == "1" else "s")
+                live += ")"
+        k = "in%d." % slot
+        remove = ('<button class="secondary" name="remove" value="1">Forget this device</button>'
+                  if not i["present"] else "")
+        cards.append(
+            '<div class="sub"><h3>%s <span class="badge%s">%s</span></h3>'
+            '<p class="hint">%s</p><p>Status: <span data-k="%sstate" class="state%s">%s</span>%s</p>'
+            '<form method="post" action="/outgoing">%s<input type="hidden" name="device" value="%s">'
+            '<input type="hidden" name="slot" value="%d">'
+            '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Send this input over NDI</label>'
+            '<div class="row"><div><label>NDI stream name</label><input type="text" name="name" value="%s" '
+            'placeholder="%s" maxlength="100"></div><div><label>Capture mode</label><select name="mode">%s</select>'
+            '</div><div><label>Codec</label><select name="codec"><option selected>Full NDI (SpeedHQ)</option>'
+            '%s</select></div></div><button>Save</button> %s</form></div>' %
+            (esc(i["label"]), " on" if i["present"] else "", "connected" if i["present"] else "not connected",
+             esc(i["id"]), k, " playing" if state.startswith("sending") else "", esc(state), live, hidden,
+             esc(i["id"]), slot, " checked" if i["enabled"] else "", esc(i["name"]), esc(default_in_stream(slot)),
+             options(mode_choices, i["mode"]), hx_send_opt, remove))
+    body = "".join(cards) if cards else (
+        '<p class="hint">No capture devices detected. Plug in a USB HDMI capture card and reload this page.</p>')
+    parts.append('<section class="card" id="outgoing"><h2>Configure Outgoing Streams</h2>'
+                 '<p class="hint">Nothing is sent until you enable it here. The stream appears on the network as '
+                 '"%s (name)".</p>%s</section>' % (esc(socket.gethostname().upper()), body))
 
     # Network
     cfg = read_network_config()
@@ -513,11 +869,16 @@ def dashboard(session):
         '<div><label>Gateway</label><input type="text" name="gateway" value="%s" placeholder="192.168.1.1"></div>'
         '<div><label>DNS servers</label><input type="text" name="dns" value="%s" placeholder="192.168.1.1, 1.1.1.1">'
         '</div></div></div>'
+        '<label>NTP time servers (optional)</label><input type="text" name="ntp" value="%s" '
+        'placeholder="e.g. 192.168.1.1 or time.example.com">'
+        '<p class="hint">The public pool.ntp.org servers are always tried as well; add a local server for sites '
+        'without internet access. An accurate clock is needed for the sender &rarr; screen latency figure.</p>'
         '<p class="hint">After applying, open the device at its new address within %d seconds and press '
         '<b>Keep</b>, otherwise the previous settings come back automatically. The current IP is always '
         'shown on the splash screen.</p><button>Apply network settings</button></form></section>' %
         (hidden, "checked" if cfg["dhcp"] else "", "" if cfg["dhcp"] else "checked",
-         esc(fill["address"]), esc(mask), esc(fill["gateway"]), esc(", ".join(fill["dns"])), ROLLBACK_SECONDS))
+         esc(fill["address"]), esc(mask), esc(fill["gateway"]), esc(", ".join(fill["dns"])),
+         esc(", ".join(cfg["ntp"])), ROLLBACK_SECONDS))
 
     # Password
     parts.append(
@@ -539,47 +900,107 @@ def dashboard(session):
 
 # ---------------------------------------------------------------- actions
 
-def act_source(form):
-    if form.get("reset"):
-        write_env({"PINDI_STREAM": "", "PINDI_SOURCE_IP": ""})
-    else:
+ROTATIONS = [("0", "0&deg; (normal)"), ("180", "180&deg; (upside down)")]
+MIRRORS = [("none", "None"), ("horizontal", "Horizontal (left/right)"), ("vertical", "Vertical (top/bottom)")]
+BANDWIDTHS = [("highest", "Full quality"), ("lowest", "Low-bandwidth preview")]
+LEGACY_OUT1 = ("STREAM", "SOURCE_IP", "ROTATE", "MIRROR")
+
+
+def valid_name(s):
+    return len(s) <= 200 and not any(ord(c) < 32 for c in s)
+
+
+def act_output(form):
+    try:
+        n = int(form.get("n", ""))
+    except ValueError:
+        return ("err", "Unknown output.")
+    if n not in [o["n"] for o in outputs()]:
+        return ("err", "Unknown output.")
+    keys = ("ENABLED", "STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "BANDWIDTH")
+    updates = {"PINDI_OUT%d_%s" % (n, k): "" for k in keys}
+    if n == 1:  # settings from before multi-output support
+        updates.update({"PINDI_" + k: "" for k in LEGACY_OUT1})
+    if not form.get("reset"):
+        enabled = form.get("enabled") == "1"
         stream = form.get("stream", "").strip()
         source_ip = form.get("source_ip", "").strip()
-        if any(ord(c) < 32 for c in stream) or len(stream) > 200:
+        rotate, mirror = form.get("rotate", "0"), form.get("mirror", "none")
+        bandwidth = form.get("bandwidth", "highest")
+        if not valid_name(stream):
             return ("err", "Invalid stream name.")
-        if stream == DEFAULT_STREAM:
-            stream = ""
         if source_ip:
             try:
                 source_ip = str(ipaddress.IPv4Address(source_ip))
             except ValueError:
                 return ("err", "Source IP must be an IPv4 address, or empty for any host.")
-        write_env({"PINDI_STREAM": stream, "PINDI_SOURCE_IP": source_ip})
+        if rotate not in dict(ROTATIONS) or mirror not in dict(MIRRORS) or bandwidth not in dict(BANDWIDTHS):
+            return ("err", "Invalid display setting.")
+        # Explicit per output, so the shared PINDI_BANDWIDTH default of other outputs is left alone.
+        default_bw = (read_env().get("PINDI_BANDWIDTH") or "highest").lower()
+        updates.update({
+            "PINDI_OUT%d_ENABLED" % n: "" if enabled else "0",
+            "PINDI_OUT%d_STREAM" % n: "" if stream == default_out_stream(n) else stream,
+            "PINDI_OUT%d_SOURCE_IP" % n: source_ip,
+            "PINDI_OUT%d_ROTATE" % n: "" if rotate == "0" else rotate,
+            "PINDI_OUT%d_MIRROR" % n: "" if mirror == "none" else mirror,
+            "PINDI_OUT%d_BANDWIDTH" % n: "" if bandwidth == default_bw else bandwidth,
+        })
+    write_env(updates)
     later(0.5, run, "systemctl", "restart", "pindi.service")
-    env = read_env()
-    log("source: stream=%s ip=%s" % (env.get("PINDI_STREAM") or DEFAULT_STREAM, env.get("PINDI_SOURCE_IP") or "any"))
-    return ("ok", "Source saved: %s from %s. The player is restarting." %
-            (env.get("PINDI_STREAM") or DEFAULT_STREAM, env.get("PINDI_SOURCE_IP") or "any host"))
+    o = next(o for o in outputs() if o["n"] == n)
+    if not o["enabled"]:
+        log("output %d: disabled" % n)
+        return ("ok", "Output %d disabled. The player is restarting." % n)
+    log("output %d: stream=%s ip=%s rotate=%s mirror=%s bandwidth=%s" % (
+        n, o["stream"] or default_out_stream(n), o["source_ip"] or "any", o["rotate"], o["mirror"], o["bandwidth"]))
+    return ("ok", "Output %d saved: %s from %s, rotation %s°, mirror %s, %s. The player is restarting." % (
+        n, o["stream"] or default_out_stream(n), o["source_ip"] or "any host", o["rotate"], o["mirror"],
+        dict(BANDWIDTHS)[o["bandwidth"]].lower()))
 
 
-ROTATIONS = [("0", "0&deg; (normal)"), ("180", "180&deg; (upside down)")]
-MIRRORS = [("none", "None"), ("horizontal", "Horizontal (left/right)"), ("vertical", "Vertical (top/bottom)")]
-
-
-def act_display(form):
-    rotate, mirror = form.get("rotate", "0"), form.get("mirror", "none")
-    if rotate not in dict(ROTATIONS) or mirror not in dict(MIRRORS):
-        return ("err", "Invalid display setting.")
-    write_env({"PINDI_ROTATE": "" if rotate == "0" else rotate,
-               "PINDI_MIRROR": "" if mirror == "none" else mirror})
-    later(0.5, run, "systemctl", "restart", "pindi.service")
-    log("display: rotate=%s mirror=%s" % (rotate, mirror))
-    return ("ok", "Display saved: rotation %s°, mirror %s. The player is restarting." % (rotate, mirror))
+def act_outgoing(form):
+    device = form.get("device", "")
+    known = {i["id"]: i for i in inputs()}
+    if device not in known:
+        return ("err", "Unknown capture device.")
+    inp = known[device]
+    try:
+        slot = int(form.get("slot", "0"))
+    except ValueError:
+        slot = 0
+    if inp["slot"]:
+        slot = inp["slot"]
+    elif not 1 <= slot <= 8 or slot in configured_inputs(read_env()):
+        return ("err", "No free slot for another outgoing stream.")
+    keys = ["PINDI_IN%d_%s" % (slot, k) for k in ("ENABLED", "DEVICE", "NAME", "MODE")]
+    if form.get("remove"):
+        write_env({k: "" for k in keys})
+        msg = "Forgot %s." % inp["label"]
+    else:
+        name = form.get("name", "").strip()
+        mode = form.get("mode", "")
+        if not valid_name(name) or len(name) > 100:
+            return ("err", "Invalid NDI stream name.")
+        if mode and mode not in dict(inp["modes"]) and mode != inp["mode"]:
+            return ("err", "That capture mode is not offered by the device.")
+        enabled = form.get("enabled") == "1"
+        write_env(dict(zip(keys, ["1" if enabled else "0", device,
+                                  "" if name == default_in_stream(slot) else name, mode])))
+        msg = ("%s will be sent as \"%s\"." % (inp["label"], name or default_in_stream(slot))) if enabled \
+            else ("%s is not sent." % inp["label"])
+    log("outgoing: slot %d %s" % (slot, msg))
+    later(0.5, run, "systemctl", "restart", "pindi-sender.service")
+    return ("ok", msg)
 
 
 def act_network(form):
+    ntp = [s for s in re.split(r"[\s,;]+", form.get("ntp", "").strip()) if s]
+    for s in ntp:
+        if not re.match(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})$", s):
+            return ("err", "NTP server %s is not a valid host name or IP address." % s)
     if form.get("mode") == "dhcp":
-        text = render_network_config(True)
+        text = render_network_config(True, ntp=ntp)
         target = "DHCP"
     else:
         try:
@@ -607,7 +1028,7 @@ def act_network(form):
                 dns.append(str(ipaddress.IPv4Address(d)))
             except ValueError:
                 return ("err", "DNS server %s is not an IPv4 address." % d)
-        text = render_network_config(False, iface, gateway, dns)
+        text = render_network_config(False, iface, gateway, dns, ntp)
         target = str(iface.ip)
     if text == read_text(NETWORK_FILE) and not NET.pending():
         return ("ok", "Network settings unchanged.")
@@ -699,9 +1120,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/":
             return self.send(200, dashboard(s))
         if path == "/api/status":
-            st = player_status()
-            st["ip"] = live_network()["address"]
-            st["rollback"] = NET.seconds_left() if NET.pending() else None
+            st = {"ip": live_network()["address"], "rollback": NET.seconds_left() if NET.pending() else None,
+                  "net": TRAFFIC.text()}
+            for o in outputs():
+                for k in ("state", "target", "source", "video", "format", "latency"):
+                    st["out%d.%s" % (o["n"], k)] = o[k]
+            # Status files only: cheap enough to poll (no device enumeration).
+            for n, conf in configured_inputs(read_env()).items():
+                if conf.get("ENABLED") == "1":
+                    st["in%d.state" % n] = read_kv("%s/in%d.status" % (RUN_DIR, n)).get("state", "starting")
             return self.send(200, json.dumps(st), "application/json")
         self.send(404, "Not found", "text/plain")
 
@@ -727,10 +1154,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/logout":
             SESSIONS.drop(self.cookie_token())
             return self.redirect("/login", [("Set-Cookie", "pindi_session=; Path=/; Max-Age=0")])
-        if path == "/source":
-            s["flash"] = act_source(form)
-        elif path == "/display":
-            s["flash"] = act_display(form)
+        if path == "/output":
+            s["flash"] = act_output(form)
+        elif path == "/outgoing":
+            s["flash"] = act_outgoing(form)
         elif path == "/network":
             s["flash"] = act_network(form)
         elif path == "/network/confirm":
@@ -757,6 +1184,7 @@ class Server(http.server.ThreadingHTTPServer):
 
 
 def main():
+    TRAFFIC.start()
     srv = Server(("", PORT), Handler)
     log("PiNDI web interface on port %d" % PORT)
     srv.serve_forever()

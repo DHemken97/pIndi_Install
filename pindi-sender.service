@@ -1,0 +1,15 @@
+[Unit]
+Description=PiNDI outgoing NDI streams (capture devices)
+# Exits straight away unless a stream is enabled in the web UI.
+After=network.target avahi-daemon.service pindi.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/pindi
+Environment=HOME=/root
+ExecStart=/usr/local/bin/pindi-sender
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
