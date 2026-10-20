@@ -672,7 +672,10 @@ int main(void)
         return 0;
     }
 
+    /* The NDI Advanced SDK's library is libndi_advanced.so.6 (its soname). */
     void *lib = dlopen(NDILIB_LIBRARY_NAME, RTLD_NOW | RTLD_LOCAL);
+    if (!lib)
+        lib = dlopen("libndi_advanced.so.6", RTLD_NOW | RTLD_LOCAL);
     const NDIlib_v6 *(*load)(void) = lib ? (const NDIlib_v6 *(*)(void))dlsym(lib, "NDIlib_v6_load") : NULL;
     ndi = load ? load() : NULL;
     if (!ndi || !ndi->initialize()) {

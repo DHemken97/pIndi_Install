@@ -99,32 +99,49 @@ esac
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-if [ ! -f "$SRC/Install_NDI_SDK_v6_Linux.tar.gz" ] && [ -e /usr/local/lib/libndi.so ] &&
+# The NDI Advanced SDK (Install_NDI_Advanced_SDK_v6_Linux.tar.gz) is used when present.
+NDI_KIND=""
+for kind in Advanced_SDK SDK; do
+    if [ -f "$SRC/Install_NDI_${kind}_v6_Linux.tar.gz" ]; then NDI_KIND=$kind; break; fi
+done
+if [ -z "$NDI_KIND" ] && [ -e /usr/local/lib/libndi.so ] &&
    [ -f /usr/local/include/ndi/Processing.NDI.Lib.h ]; then
     echo "No NDI SDK archive here: keeping the installed one ($(readlink /usr/local/lib/libndi.so))"
 else
-tar xzf "$SRC/Install_NDI_SDK_v6_Linux.tar.gz" -C "$TMP"
-NDI_SH="$TMP/Install_NDI_SDK_v6_Linux.sh"
-# The vendor script is an interactive self-extractor; unpack its payload directly.
-LINE=$(awk '/^__NDI_ARCHIVE_BEGIN__/ { print NR + 1; exit 0; }' "$NDI_SH")
-tail -n +"$LINE" "$NDI_SH" | tar xz -C "$TMP" \
-    "NDI SDK for Linux/include" \
-    "NDI SDK for Linux/lib/$NDI_ARCH" \
-    "NDI SDK for Linux/NDI SDK License Agreement.txt" \
-    "NDI SDK for Linux/licenses" \
-    "NDI SDK for Linux/Version.txt"
-SDK="$TMP/NDI SDK for Linux"
-echo "$(cat "$SDK/Version.txt") ($NDI_ARCH)"
+[ -n "$NDI_KIND" ] || { echo "Install_NDI_SDK_v6_Linux.tar.gz is missing" >&2; exit 1; }
+NDI_TGZ="$SRC/Install_NDI_${NDI_KIND}_v6_Linux.tar.gz"
+if [ "$NDI_KIND" = Advanced_SDK ]; then
+    NDI_DIR="NDI Advanced SDK for Linux"; NDI_LICENSE="NDI Advanced License Agreement.txt"
+else
+    NDI_DIR="NDI SDK for Linux"; NDI_LICENSE="NDI SDK License Agreement.txt"
+fi
+# The vendor script is an interactive self-extractor; unpack its payload directly. It is
+# streamed from the archive, not written out: /tmp is in RAM and the Advanced one is 350 MB.
+LINE=$( (tar xzOf "$NDI_TGZ" || true) | awk '/^__NDI_ARCHIVE_BEGIN__/ { print NR + 1; exit 0; }')
+tar xzOf "$NDI_TGZ" | tail -n +"$LINE" | tar xz -C "$TMP" \
+    "$NDI_DIR/include" \
+    "$NDI_DIR/lib/$NDI_ARCH" \
+    "$NDI_DIR/$NDI_LICENSE" \
+    "$NDI_DIR/licenses" \
+    "$NDI_DIR/Version.txt"
+SDK="$TMP/$NDI_DIR"
+echo "$(cat "$SDK/Version.txt") ($NDI_ARCH, ${NDI_KIND//_/ })"
 
-LIB=$(cd "$SDK/lib/$NDI_ARCH" && ls libndi.so.*.*.* | head -n 1)
-rm -f /usr/local/lib/libndi.so*
+# libndi.so.6.x.y (standard) or libndi_advanced.so.6.x.y; both names point at it.
+LIB=$(cd "$SDK/lib/$NDI_ARCH" && ls libndi*.so.*.*.* | head -n 1)
+MAJOR=$(echo "$LIB" | sed 's/.*\.so\.\([0-9]*\)\..*/\1/')
+rm -f /usr/local/lib/libndi.so* /usr/local/lib/libndi_advanced.so*
 install -m 644 "$SDK/lib/$NDI_ARCH/$LIB" /usr/local/lib/
-ln -sf "$LIB" "/usr/local/lib/$(echo "$LIB" | cut -d . -f -3)"
-ln -sf "$LIB" /usr/local/lib/libndi.so
+for name in libndi libndi_advanced; do
+    ln -sf "$LIB" "/usr/local/lib/$name.so.$MAJOR"
+    ln -sf "$LIB" "/usr/local/lib/$name.so"
+done
 ldconfig
 install -d /usr/local/include/ndi /usr/local/share/doc/ndi
+rm -rf /usr/local/include/ndi/*.h /usr/local/share/doc/ndi/*
 install -m 644 "$SDK"/include/*.h /usr/local/include/ndi/
-install -m 644 "$SDK/NDI SDK License Agreement.txt" "$SDK"/licenses/* /usr/local/share/doc/ndi/
+install -m 644 "$SDK/$NDI_LICENSE" /usr/local/share/doc/ndi/
+cp -r "$SDK"/licenses/. /usr/local/share/doc/ndi/
 fi
 
 # ---------------------------------------------------------------- player

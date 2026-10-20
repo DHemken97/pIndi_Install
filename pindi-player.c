@@ -2263,7 +2263,10 @@ static void *thumb_thread(void *arg)
 static bool load_ndi(void)
 {
     /* libndi is large; it is loaded only after the splash so it doesn't delay it. */
+    /* The NDI Advanced SDK's library is libndi_advanced.so.6 (its soname). */
     void *lib = dlopen(NDILIB_LIBRARY_NAME, RTLD_NOW | RTLD_LOCAL);
+    if (!lib)
+        lib = dlopen("libndi_advanced.so.6", RTLD_NOW | RTLD_LOCAL);
     const NDIlib_v6 *(*ndi_load)(void) = lib ? (const NDIlib_v6 *(*)(void))dlsym(lib, "NDIlib_v6_load") : NULL;
     ndi = ndi_load ? ndi_load() : NULL;
     if (!ndi) {
