@@ -60,6 +60,10 @@ PACKAGES=(gcc libc6-dev pkg-config
     avahi-daemon libavahi-client3
     systemd-resolved
     python3 libpam-runtime)
+# The NDI Advanced SDK decodes NDI|HX (H.264/HEVC) with FFmpeg 7's libavcodec, loaded at run time.
+if [ -f "$SRC/Install_NDI_Advanced_SDK_v6_Linux.tar.gz" ]; then
+    PACKAGES+=(libavcodec61)
+fi
 if [ "$OFFLINE" -eq 1 ]; then
     step "Checking packages (offline)"
     MISSING=()

@@ -2278,8 +2278,14 @@ static bool load_ndi(void)
         return false;
     }
     /* The standard SDK decodes only Full NDI (SpeedHQ); NDI|HX needs libndihx.so, which it does not
-       ship. Without it, software senders fall back to SpeedHQ and HX-only cameras show no picture. */
+       ship. Without it, software senders fall back to SpeedHQ and HX-only cameras show no picture.
+       The Advanced SDK decodes HX with FFmpeg's libavcodec.so.61 instead. */
     void *hx = dlopen("libndihx.so", RTLD_LAZY | RTLD_LOCAL);
+    void *adv = hx ? NULL : dlopen("libndi_advanced.so.6", RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
+    if (adv) {
+        dlclose(adv);
+        hx = dlopen("libavcodec.so.61", RTLD_LAZY | RTLD_LOCAL);
+    }
     if (hx)
         dlclose(hx);
     char buf[256];
