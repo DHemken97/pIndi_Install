@@ -124,11 +124,22 @@ def run(*cmd, input=None):
 
 
 def write_atomic(path, text, mode=0o644):
+    """Replace path with text, safely even if the power is cut right after (synced to the SD card)."""
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
     os.chmod(tmp, mode)
     os.replace(tmp, path)
+    try:
+        d = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+        try:
+            os.fsync(d)
+        finally:
+            os.close(d)
+    except OSError:
+        pass
 
 
 def read_text(path, default=""):
@@ -638,6 +649,7 @@ def outputs():
             "enabled": out_setting(env, n, "ENABLED", "1") != "0",
             "stream": out_setting(env, n, "STREAM"), "source_ip": out_setting(env, n, "SOURCE_IP"),
             "backup": out_setting(env, n, "BACKUP_STREAM"),
+            "standby": out_setting(env, n, "STANDBY_MIN", "0"),
             "rotate": out_setting(env, n, "ROTATE", "0"), "mirror": out_setting(env, n, "MIRROR", "none"),
             "bandwidth": "lowest" if bandwidth == "lowest" else "highest", "format": fmt,
             "mode_setting": out_setting(env, n, "MODE"),
@@ -1055,8 +1067,10 @@ def dashboard(session):
             '<div><label>Codec</label><select name="codec"><option selected>Full NDI (SpeedHQ)</option>%s'
             '</select></div>'
             '<div><label>Rotation</label><select name="rotate">%s</select></div>'
-            '<div><label>Mirror</label><select name="mirror">%s</select></div></div>'
-            '<p class="hint">180&deg; is for ceiling mounting, mirror for rear projection.</p>'
+            '<div><label>Mirror</label><select name="mirror">%s</select></div>'
+            '<div><label>Display off without video</label><select name="standby">%s</select></div></div>'
+            '<p class="hint">180&deg; is for ceiling mounting, mirror for rear projection. With the display '
+            'switched off the monitor goes to sleep; it comes back on as soon as the stream appears.</p>'
             '<h3 class="group">Sound</h3><div class="row">'
             '<div><label>Audio output</label><select name="audio">%s</select></div>'
             '<div><label>Audio delay (ms)</label><input type="number" name="audio_delay" min="20" max="1000" '
@@ -1070,7 +1084,7 @@ def dashboard(session):
              n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]), esc(o["backup"]),
              options(BANDWIDTHS, o["bandwidth"]), esc(default_out_stream(n)),
              options(mode_choices(o), o["mode_setting"]), hx_opt,
-             options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]),
+             options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]), options(STANDBYS, o["standby"]),
              options(audio_choices(), o["audio_out"]), esc(o["audio_delay"]), n))
 
     # NDI sources on the network
@@ -1247,6 +1261,8 @@ def dashboard(session):
 ROTATIONS = [("0", "0&deg; (normal)"), ("180", "180&deg; (upside down)")]
 MIRRORS = [("none", "None"), ("horizontal", "Horizontal (left/right)"), ("vertical", "Vertical (top/bottom)")]
 BANDWIDTHS = [("highest", "Full quality"), ("lowest", "Low-bandwidth preview")]
+STANDBYS = [("0", "Never (always show the splash)"), ("1", "After 1 minute"), ("5", "After 5 minutes"),
+            ("15", "After 15 minutes"), ("30", "After 30 minutes"), ("60", "After 1 hour")]
 LEGACY_OUT1 = ("STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "MODE")
 
 
@@ -1283,7 +1299,7 @@ def act_output(form):
     if n not in [o["n"] for o in outputs()]:
         return ("err", "Unknown output.")
     keys = ("ENABLED", "STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "BANDWIDTH", "MODE", "AUDIO", "AUDIO_DELAY_MS",
-            "BACKUP_STREAM")
+            "BACKUP_STREAM", "STANDBY_MIN")
     updates = {"PINDI_OUT%d_%s" % (n, k): "" for k in keys}
     if n == 1:  # settings from before multi-output support
         updates.update({"PINDI_" + k: "" for k in LEGACY_OUT1})
@@ -1293,6 +1309,9 @@ def act_output(form):
         source_ip = form.get("source_ip", "").strip()
         rotate, mirror = form.get("rotate", "0"), form.get("mirror", "none")
         bandwidth = form.get("bandwidth", "highest")
+        standby = form.get("standby", "0")
+        if standby not in dict(STANDBYS):
+            return ("err", "Invalid display-off setting.")
         audio = form.get("audio", "hdmi")
         if audio not in dict(audio_choices()):
             return ("err", "Invalid audio output.")
@@ -1326,6 +1345,7 @@ def act_output(form):
             "PINDI_OUT%d_BANDWIDTH" % n: "" if bandwidth == default_bw else bandwidth,
             "PINDI_OUT%d_MODE" % n: mode,
             "PINDI_OUT%d_BACKUP_STREAM" % n: backup,
+            "PINDI_OUT%d_STANDBY_MIN" % n: "" if standby == "0" else standby,
             "PINDI_OUT%d_AUDIO" % n: "" if audio == "hdmi" else audio,
             "PINDI_OUT%d_AUDIO_DELAY_MS" % n: "" if audio_delay == 80 else str(audio_delay),
         })

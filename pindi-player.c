@@ -502,6 +502,8 @@ struct output {
     uint64_t rotation;
     bool rot_logged, commit_logged, mode_failed;
     uint64_t enable_retry_at;
+    uint64_t splash_since; /* splash on screen since (0 = video) */
+    bool standby;          /* display switched off after standby_min without video */
 
     /* Shared with the receiver thread (lock). */
     pthread_mutex_t lock;
@@ -520,6 +522,7 @@ struct output {
     char splash_msg[192]; /* what the receiver is doing, shown on the splash */
     bool thumb_reading;   /* the preview thread is reading a buffer: don't free any */
     bool cant_display;    /* no buffers for the current frame size (pw x ph) */
+    bool wake_request;    /* receiver: our stream is there, turn the display back on */
 
     /* Configuration. */
     bool disabled; /* PINDI_OUT<n>_ENABLED=0: no NDI, HDMI signal off (e.g. encoder-only units) */
@@ -528,6 +531,7 @@ struct output {
     const char *rot_s, *mirror_s;
     const char *audio_s; /* PINDI_OUT<n>_AUDIO: hdmi, analog or off */
     int audio_delay_ms;  /* PINDI_OUT<n>_AUDIO_DELAY_MS: audio buffer = lip-sync delay */
+    int standby_min;     /* PINDI_OUT<n>_STANDBY_MIN: display off after this long without video (0 = never) */
 
     /* Audio playback (receiver thread only). */
     struct {
@@ -1051,6 +1055,7 @@ static bool output_enable(struct output *o)
     o->want_splash = false;
     o->usable = true;
     pthread_mutex_unlock(&o->lock);
+    o->splash_since = now_ms();
     o->pending = P_NONE;
     o->commit_logged = false;
 out:
@@ -1124,7 +1129,10 @@ static void on_flip(int fd, unsigned seq, unsigned sec, unsigned usec, unsigned 
         }
         o->queued = -1;
         o->on_splash = false;
+        o->splash_since = 0;
     } else if (o->pending == P_SPLASH) {
+        if (!o->on_splash)
+            o->splash_since = now_ms();
         if (o->scanout >= 0)
             o->vstate[o->scanout] = B_FREE;
         o->scanout = -1;
@@ -1375,7 +1383,8 @@ static void outputs_publish(void)
         if (o->active)
             snprintf(mode, sizeof mode, "%dx%d@%d", o->W, o->H, o->mode.vrefresh);
         len += snprintf(buf + len, sizeof buf - len, "%d\t%s\t%s\t%s\n", o->n, o->conn_name,
-                        o->disabled ? "disabled" : o->active ? "connected" : "disconnected", mode);
+                        o->disabled ? "disabled" : o->active ? "connected" : o->standby ? "standby" : "disconnected",
+                        mode);
     }
     if (!strcmp(buf, last))
         return;
@@ -1760,6 +1769,33 @@ static void *receiver(void *arg)
         usable = o->usable;
         pthread_mutex_unlock(&o->lock);
 
+        /* Display in standby: keep looking for our stream, and wake the display when it is there. */
+        bool standby;
+        pthread_mutex_lock(&o->lock);
+        standby = !usable && o->standby;
+        pthread_mutex_unlock(&o->lock);
+        if (standby && find) {
+            if (recv) {
+                ndi->recv_destroy(recv);
+                recv = NULL;
+                audio_close(o);
+            }
+            status_set(o, "standby (display off)", "", "", "");
+            uint32_t count = 0;
+            const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+            bool found = find_primary(o, srcs, count, "") != NULL;
+            for (uint32_t i = 0; i < count && !found && *o->backup; i++)
+                found = srcs[i].p_ndi_name && name_matches(srcs[i].p_ndi_name, o->backup, "");
+            if (found) {
+                pthread_mutex_lock(&o->lock);
+                o->wake_request = true;
+                pthread_mutex_unlock(&o->lock);
+                wake();
+            }
+            usleep(500000);
+            continue;
+        }
+
         /* No monitor on this output: don't receive anything. */
         if (!usable) {
             if (recv) {
@@ -2030,6 +2066,7 @@ static void configure_output(struct output *o)
     o->rot_s = ocfg(o->n, "ROTATE", "0");
     o->mirror_s = ocfg(o->n, "MIRROR", "none");
     o->audio_s = ocfg(o->n, "AUDIO", "hdmi");
+    o->standby_min = atoi(ocfg(o->n, "STANDBY_MIN", "0"));
     o->audio_delay_ms = atoi(ocfg(o->n, "AUDIO_DELAY_MS", "80"));
     if (o->audio_delay_ms < 20)
         o->audio_delay_ms = 20;
@@ -2242,6 +2279,35 @@ static void start_receivers(void)
             outs[i].thr_started = true;
 }
 
+/* Display standby: signal off after standby_min minutes of splash; back on when the receiver
+ * sees our stream (wake_request) or for Identify. */
+static void standby_service(struct output *o)
+{
+    pthread_mutex_lock(&o->lock);
+    bool wake_req = o->wake_request || o->identify;
+    o->wake_request = false;
+    pthread_mutex_unlock(&o->lock);
+    if (o->standby) {
+        if (wake_req) {
+            LOG("display: output %d: waking up from standby", o->n);
+            o->standby = false;
+            o->enable_retry_at = 0;
+            if (!output_enable(o))
+                o->enable_retry_at = now_ms() + 5000;
+        }
+        return;
+    }
+    if (o->active && o->standby_min > 0 && o->splash_since && !o->identify && o->pending == P_NONE &&
+        now_ms() - o->splash_since > (uint64_t)o->standby_min * 60000) {
+        LOG("display: output %d: no video for %d min, display off (standby)", o->n, o->standby_min);
+        output_disable(o);
+        o->standby = true;
+        pthread_mutex_lock(&o->lock);
+        o->wake_request = false;
+        pthread_mutex_unlock(&o->lock);
+    }
+}
+
 /* Called about once a second: follows HDMI hotplug on every output. */
 static void hotplug_poll(void)
 {
@@ -2252,14 +2318,17 @@ static void hotplug_poll(void)
         drmModeConnector *c = drmModeGetConnectorCurrent(drm_fd, o->conn_id);
         bool connected = c && c->connection == DRM_MODE_CONNECTED;
         drmModeFreeConnector(c);
-        if (connected && !o->active) {
+        if (connected && !o->active && !o->standby) {
             /* A monitor that can't be set up (bad EDID, unsupported mode): retry every 5 s, not every second. */
             if (now_ms() >= o->enable_retry_at && !output_enable(o))
                 o->enable_retry_at = now_ms() + 5000;
         } else if (!connected && o->active) {
             LOG("display: output %d: monitor disconnected", o->n);
             output_disable(o);
+        } else if (!connected && o->standby) {
+            o->standby = false; /* unplugged while asleep: a new monitor starts normally */
         }
+        standby_service(o);
     }
     outputs_publish();
 }
