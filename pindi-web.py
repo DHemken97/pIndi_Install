@@ -2125,6 +2125,8 @@ class Server(http.server.ThreadingHTTPServer):
 
 def main():
     TRAFFIC.start()
+    if update_state() != "running":
+        shutil.rmtree(UPDATE_DIR, ignore_errors=True)  # an earlier update's unpacked files
     srv = Server(("", PORT), Handler)
     log("PiNDI web interface on port %d" % PORT)
     srv.serve_forever()
