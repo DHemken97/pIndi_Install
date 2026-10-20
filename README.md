@@ -96,6 +96,8 @@ network has a **Use** button for each.
 Capture devices send nothing until you enable them. An enabled device uses no
 encoding CPU while no one is receiving it. If its picture stops (for example
 the HDMI source is unplugged), receivers get black instead of a frozen frame.
+When a switcher (vMix, TriCaster, ...) has the stream on program, the web
+interface shows it **ON AIR** (or "on preview").
 
 ## NDI|HX
 

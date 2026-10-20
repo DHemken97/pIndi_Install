@@ -461,9 +461,13 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
     stats:;
         uint64_t now = now_ms();
         if (now - t0 >= 2000) {
-            char st[64];
+            char st[96];
+            NDIlib_tally_t tally = { 0 };
             if (conns)
-                snprintf(st, sizeof st, "sending (%d receiver%s)", conns, conns == 1 ? "" : "s");
+                ndi->send_get_tally(send, &tally, 0); /* a switcher (vMix, TriCaster...) has it on program/preview */
+            if (conns)
+                snprintf(st, sizeof st, "sending (%d receiver%s)%s", conns, conns == 1 ? "" : "s",
+                         tally.on_program ? " - ON AIR" : tally.on_preview ? " - on preview" : "");
             else
                 snprintf(st, sizeof st, "ready (no receivers)");
             double secs = (now - t0) / 1000.0;

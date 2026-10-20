@@ -885,7 +885,7 @@ button.small{margin:0;padding:4px 10px;font-size:13px}
 .msg.ok{border-color:var(--ok);background:#12261a}.msg.err{border-color:var(--bad);background:#2a1414}
 .msg.warn{border-color:var(--warn);background:#2a2210}
 table{width:100%;border-collapse:collapse;font-size:14px}td{padding:6px 4px;border-top:1px solid var(--line)}
-td:last-child{text-align:right}.state{font-weight:600}.state.playing{color:var(--ok)}
+td:last-child{text-align:right}.state{font-weight:600}.state.playing{color:var(--ok)}.state.onair{color:#fff;background:var(--bad);padding:0 6px;border-radius:4px}
 .login{max-width:360px;margin:12vh auto}
 .badge{font-size:12px;font-weight:400;padding:2px 9px;border-radius:10px;background:#2a3644;color:var(--muted);
 margin-left:6px;vertical-align:middle}.badge.on{background:#12261a;color:var(--ok)}
@@ -937,7 +937,7 @@ document.getElementById('out'+n).scrollIntoView({behavior:'smooth'});});
 function poll(){fetch('/api/status',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null})
 .then(function(d){if(!d)return;document.querySelectorAll('[data-k]').forEach(function(el){
 var k=el.dataset.k;if(!(k in d))return;var v=d[k];el.textContent=v||'-';
-if(/state$/.test(k))el.className='state'+(/^(playing|sending)/.test(v||'')?' playing':'');
+if(/state$/.test(k))el.className='state'+(/ON AIR/.test(v||'')?' onair':/^(playing|sending)/.test(v||'')?' playing':'');
 if(k==='power')el.className=v==='OK'?'':'warn';});
 var c=document.getElementById('countdown');if(c&&d.rollback!=null)c.textContent=d.rollback;}).catch(function(){});}
 sync();if(document.querySelector('[data-k]'))setInterval(poll,3000);
@@ -1184,7 +1184,8 @@ def dashboard(session):
             '%s</select></div><div><label>Audio</label><select name="audio">%s</select></div></div>'
             '<button>Save</button> %s</form></div>' %
             (esc(i["label"]), " on" if i["present"] else "", "connected" if i["present"] else "not connected",
-             esc(i["id"]), k, " playing" if state.startswith("sending") else "", esc(state), live, hidden,
+             esc(i["id"]), k, " onair" if "ON AIR" in state else " playing" if state.startswith("sending") else "",
+             esc(state), live, hidden,
              esc(i["id"]), slot, " checked" if i["enabled"] else "", esc(i["name"]), esc(default_in_stream(slot)),
              options(cap_choices, i["mode"]), hx_send_opt,
              options([("auto", "From the device (USB audio)"), ("off", "Off")], i["audio_setting"]), remove))
