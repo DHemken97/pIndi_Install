@@ -119,8 +119,12 @@ gcc -O2 -Wall $CPU_FLAGS -pthread -o "$TMP/pindi-sender" "$SRC/pindi-sender.c" \
 install -m 755 "$TMP/pindi-player" /usr/local/bin/pindi-player
 install -m 755 "$TMP/pindi-sender" /usr/local/bin/pindi-sender
 
-install -d /usr/share/pindi
+install -d /usr/share/pindi /etc/pindi
 install -m 644 "$SRC/Splash.jpg" /usr/share/pindi/splash.jpg
+# Defaults for "Reset settings" in the web UI, and the version it shows.
+install -m 644 "$SRC/pindi.conf" /usr/share/pindi/pindi.conf
+echo "$(tr -d '\r\n' < "$SRC/VERSION" 2>/dev/null || echo unknown) (installed $(date +%Y-%m-%d))" \
+    > /usr/share/pindi/version
 if [ ! -f /etc/default/pindi ]; then
     install -m 644 "$SRC/pindi.conf" /etc/default/pindi
 fi
@@ -236,6 +240,20 @@ blacklist bcm2835_codec
 blacklist bcm2835_mmal_vchiq
 blacklist vc_sm_cma
 blacklist rpi_hevc_dec
+EOF
+
+# Unattended operation: the hardware watchdog reboots the device if the system hangs,
+# and the journal stays small so it never fills the SD card.
+install -d /etc/systemd/system.conf.d /etc/systemd/journald.conf.d
+cat > /etc/systemd/system.conf.d/pindi-watchdog.conf <<'EOF'
+[Manager]
+RuntimeWatchdogSec=15s
+RebootWatchdogSec=2min
+EOF
+cat > /etc/systemd/journald.conf.d/pindi.conf <<'EOF'
+[Journal]
+SystemMaxUse=64M
+RuntimeMaxUse=32M
 EOF
 
 # cloud-init (Raspberry Pi Imager settings) has already done its job on first boot.

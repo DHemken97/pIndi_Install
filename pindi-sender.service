@@ -6,7 +6,7 @@ After=network.target avahi-daemon.service pindi.service
 [Service]
 Type=simple
 EnvironmentFile=-/etc/default/pindi
-Environment=HOME=/root
+Environment=HOME=/root NDI_CONFIG_DIR=/etc/pindi
 ExecStart=/usr/local/bin/pindi-sender
 Restart=on-failure
 RestartSec=2

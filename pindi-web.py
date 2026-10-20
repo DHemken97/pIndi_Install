@@ -29,6 +29,9 @@ import urllib.parse
 
 PORT = int(os.environ.get("PINDI_WEB_PORT", "80"))
 ENV_FILE = "/etc/default/pindi"
+ENV_DEFAULTS = "/usr/share/pindi/pindi.conf"
+VERSION_FILE = "/usr/share/pindi/version"
+NDI_CONFIG = "/etc/pindi/ndi-config.v1.json"  # NDI_CONFIG_DIR=/etc/pindi in the player/sender units
 NETWORK_FILE = "/etc/systemd/network/20-pindi-wired.network"
 RUN_DIR = "/run/pindi"
 ADMIN_GROUP = "sudo"
@@ -150,6 +153,7 @@ def serial_number():
 
 
 SERIAL = serial_number()
+MODEL = read_text("/proc/device-tree/model").strip("\x00\r\n ") or "unknown"
 
 
 # ---------------------------------------------------------------- /etc/default/pindi
@@ -415,6 +419,130 @@ def hx_send_needs():
     return " and the Pi's H.264 encoder driver (bcm2835-codec, not loaded)"
 
 
+def version():
+    return read_text(VERSION_FILE).strip() or "unknown"
+
+
+# ---------------------------------------------------------------- health
+
+_THROTTLE = [(0, "under-voltage"), (1, "CPU frequency capped"), (2, "throttled"), (3, "soft temperature limit")]
+_throttle_cache = {"t": 0, "v": 0}
+
+
+def throttled():
+    """vcgencmd get_throttled bits (Pi firmware). Cached: it is a subprocess."""
+    if time.time() - _throttle_cache["t"] > 10:
+        m = re.search(r"0x([0-9a-fA-F]+)", run("vcgencmd", "get_throttled").stdout if os.path.exists(
+            "/usr/bin/vcgencmd") else "")
+        _throttle_cache["v"] = int(m.group(1), 16) if m else 0
+        _throttle_cache["t"] = time.time()
+    return _throttle_cache["v"]
+
+
+def health():
+    """(summary, power/thermal warning) for the Device card."""
+    parts = []
+    temp = read_text("/sys/class/thermal/thermal_zone0/temp").strip()
+    if temp.isdigit():
+        parts.append("CPU %.0f °C" % (int(temp) / 1000))
+    load = os.getloadavg()[0]
+    parts.append("load %.1f (%d cores)" % (load, os.cpu_count() or 1))
+    mem = {}
+    for line in read_text("/proc/meminfo").splitlines():
+        k, _, v = line.partition(":")
+        mem[k] = int(v.split()[0]) if v.split() else 0
+    if mem.get("MemTotal"):
+        parts.append("memory %.0f%% used" % (100 - 100.0 * mem.get("MemAvailable", 0) / mem["MemTotal"]))
+    st = os.statvfs("/")
+    parts.append("storage %.0f%% used" % (100 - 100.0 * st.f_bavail / st.f_blocks))
+    up = float((read_text("/proc/uptime").split() or ["0"])[0])
+    parts.append("up %s" % duration(up))
+    t = throttled()
+    now = [name for bit, name in _THROTTLE if t & (1 << bit)]
+    past = [name for bit, name in _THROTTLE if t & (1 << (bit + 16)) and not t & (1 << bit)]
+    warn = ""
+    if now:
+        warn = "Now: %s." % ", ".join(now)
+    if past:
+        warn += (" " if warn else "") + "Since boot: %s." % ", ".join(past)
+    if t & 0x10001:
+        warn += " Use a proper 5 V power supply (Pi 3: 2.5 A, Pi 4: 3 A, Pi 5: 5 A) and a short cable."
+    elif t & 0xE000E:
+        warn += " Improve cooling (heatsink/fan, ventilated case)."
+    return " · ".join(parts), warn.strip() or "OK"
+
+
+def duration(sec):
+    sec = int(sec)
+    d, h, m = sec // 86400, sec // 3600 % 24, sec // 60 % 60
+    return ("%d d %d h" % (d, h)) if d else ("%d h %d min" % (h, m)) if h else "%d min" % m
+
+
+# ---------------------------------------------------------------- device name, NDI network settings
+
+def read_ndi_config():
+    try:
+        cfg = json.loads(read_text(NDI_CONFIG) or "{}")
+        return cfg if isinstance(cfg, dict) else {}
+    except ValueError:
+        return {}
+
+
+def ndi_settings():
+    ndi = read_ndi_config().get("ndi", {})
+    nets, groups = ndi.get("networks", {}), ndi.get("groups", {})
+    return {"discovery": nets.get("discovery", "") or "", "send_groups": groups.get("send", "") or "",
+            "recv_groups": groups.get("recv", "") or "", "machinename": ndi.get("machinename", "") or ""}
+
+
+def write_ndi_settings(discovery, send_groups, recv_groups, machinename):
+    """Update our keys in ndi-config.v1.json, keeping anything else that is in there."""
+    cfg = read_ndi_config()
+    ndi = cfg.setdefault("ndi", {})
+    for section, key, val in (("networks", "discovery", discovery), ("groups", "send", send_groups),
+                              ("groups", "recv", recv_groups)):
+        sec = ndi.setdefault(section, {})
+        if val:
+            sec[key] = val
+        else:
+            sec.pop(key, None)
+        if not sec:
+            ndi.pop(section)
+    if machinename:
+        ndi["machinename"] = machinename
+    else:
+        ndi.pop("machinename", None)
+    if not ndi:
+        cfg.pop("ndi")
+    os.makedirs(os.path.dirname(NDI_CONFIG), exist_ok=True)
+    write_atomic(NDI_CONFIG, json.dumps(cfg, indent=2) + "\n")
+
+
+def device_name():
+    return ndi_settings()["machinename"] or socket.gethostname()
+
+
+def ndi_host_name():
+    """How NDI shows this device in source names: "NAME (stream)"."""
+    return ndi_settings()["machinename"] or socket.gethostname().upper()
+
+
+_HOSTNAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def set_hostname(name):
+    old = socket.gethostname()
+    if name == old:
+        return False
+    r = run("hostnamectl", "set-hostname", name)
+    if r.returncode:
+        raise RuntimeError(r.stderr.strip() or "hostnamectl failed")
+    lines = [l for l in read_text("/etc/hosts").splitlines() if not l.startswith("127.0.1.1")]
+    lines.append("127.0.1.1\t%s" % name)
+    write_atomic("/etc/hosts", "\n".join(lines) + "\n")
+    return True
+
+
 def latency_text(n):
     """Human summary of /run/pindi/out<n>.latency (5 s averages of frames that reached the screen)."""
     lat = read_kv("%s/out%d.latency" % (RUN_DIR, n))
@@ -452,6 +580,7 @@ def outputs():
         st = read_kv("%s/out%d.status" % (RUN_DIR, n))
         if not running:
             st["state"] = "player not running"
+        modes = [m for m in read_text("%s/out%d.modes" % (RUN_DIR, n)).split() if re.match(r"^\d+x\d+@\d+\*?$", m)]
         bandwidth = out_setting(env, n, "BANDWIDTH", env.get("PINDI_BANDWIDTH") or "highest").lower()
         fmt = ""
         if running and st.get("state") == "playing":
@@ -465,6 +594,9 @@ def outputs():
             "stream": out_setting(env, n, "STREAM"), "source_ip": out_setting(env, n, "SOURCE_IP"),
             "rotate": out_setting(env, n, "ROTATE", "0"), "mirror": out_setting(env, n, "MIRROR", "none"),
             "bandwidth": "lowest" if bandwidth == "lowest" else "highest", "format": fmt,
+            "mode_setting": out_setting(env, n, "MODE"),
+            "modes": [m.rstrip("*") for m in modes],
+            "preferred_mode": next((m.rstrip("*") for m in modes if m.endswith("*")), ""),
             "state": st.get("state", "-"), "target": st.get("target", default_out_stream(n)),
             "source": st.get("source", ""), "video": st.get("video", ""),
             "latency": latency_text(n) if running and st.get("state") == "playing" else "",
@@ -647,6 +779,13 @@ label.check .hint{margin:0}
 .sub h3{margin:0 0 2px;font-size:15px}.sub p{margin:4px 0}
 .card dl{margin-bottom:6px}.warn{color:var(--warn)}.hint.block{display:block;margin-top:2px}
 form.inline{display:inline}
+.buttons{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0}.buttons button,.buttons .button{margin:0}
+a.button{display:inline-block;padding:9px 16px;border-radius:7px;background:var(--accent2);color:#fff;
+text-decoration:none}a.button.secondary{background:#2a3644}a.button:hover{filter:brightness(1.15)}
+input[type=file]{color:var(--muted);font:inherit;margin:4px 0}button:disabled{opacity:.5;cursor:default}
+pre.log{background:#0d1319;border:1px solid var(--line);border-radius:7px;padding:10px;overflow:auto;
+max-height:70vh;font:12px/1.4 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
+nav.top a{color:var(--accent);margin-right:14px}
 @media(max-width:600px){.row{grid-template-columns:1fr}main{padding:12px}}
 """
 
@@ -661,9 +800,15 @@ document.getElementById('out'+n).scrollIntoView({behavior:'smooth'});});
 function poll(){fetch('/api/status',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null})
 .then(function(d){if(!d)return;document.querySelectorAll('[data-k]').forEach(function(el){
 var k=el.dataset.k;if(!(k in d))return;var v=d[k];el.textContent=v||'-';
-if(/state$/.test(k))el.className='state'+(v==='playing'||/^sending/.test(v||'')?' playing':'');});
+if(/state$/.test(k))el.className='state'+(v==='playing'||/^sending/.test(v||'')?' playing':'');
+if(k==='power')el.className=v==='OK'?'':'warn';});
 var c=document.getElementById('countdown');if(c&&d.rollback!=null)c.textContent=d.rollback;}).catch(function(){});}
 sync();if(document.querySelector('[data-k]'))setInterval(poll,3000);
+document.addEventListener('submit',function(e){var m=e.target.dataset.confirm;if(m&&!confirm(m))e.preventDefault();});
+var rf=document.getElementById('restore-file');if(rf)rf.addEventListener('change',function(){
+var f=rf.files[0],b=document.getElementById('restore-button');b.disabled=true;if(!f)return;
+var r=new FileReader();r.onload=function(){document.getElementById('restore-data').value=r.result;b.disabled=false;};
+r.readAsText(f);});
 """
 
 
@@ -719,6 +864,7 @@ def dashboard(session):
                        for v, label in choices)
 
     # Device
+    hl, hw = health()
     ndi = ndi_info()
     ndi_text = "SDK %s &middot; Full NDI (SpeedHQ) receive and send" % esc(ndi["version"] or "?")
     if ndi["hx_receive"]:
@@ -731,11 +877,17 @@ def dashboard(session):
     rows = [
         ("IP address", '<span data-k="ip">%s</span>' % esc(net["address"] or "-")),
         ("Network traffic", '<span data-k="net">%s</span><span class="hint block">Everything this device '
-                            'receives and sends on the wired network. Full NDI 1080p needs roughly 100&ndash;150 '
-                            'Mbit/s per stream at 60 fps, about half at 30 fps.</span>' % esc(TRAFFIC.text())),
+                            'receives and sends on the wired network. A Full NDI 1080p60 stream takes up to about '
+                            '130 Mbit/s, depending on the picture (still images far less).</span>' %
+                            esc(TRAFFIC.text())),
+        ("Health", '<span data-k="health">%s</span>' % esc(hl)),
+        ("Power / cooling", '<span data-k="power" class="%s">%s</span>' % ("" if hw == "OK" else "warn", esc(hw))),
         ("NDI", ndi_text),
+        ("Device name", "%s <span class=\"hint\">(NDI sources from this device: %s (&hellip;))</span>" %
+         (esc(device_name()), esc(ndi_host_name()))),
         ("Serial", esc(SERIAL)),
-        ("Hostname", esc(socket.gethostname())),
+        ("Model", esc(MODEL)),
+        ("Software", "PiNDI %s" % esc(version())),
         ("Clock", clock_text()),
         ("Outputs", "%d display output%s" % (len(outs), "" if len(outs) == 1 else "s")),
         ("Inputs", "%d capture device%s" % (len(ins), "" if len(ins) == 1 else "s")),
@@ -779,6 +931,7 @@ def dashboard(session):
             '</div><div><label>Rotation</label><select name="rotate">%s</select></div>'
             '<div><label>Mirror</label><select name="mirror">%s</select></div>'
             '<div><label>Receive quality</label><select name="bandwidth">%s</select></div>'
+            '<div><label>Display mode</label><select name="display_mode">%s</select></div>'
             '<div><label>Codec</label><select name="codec"><option selected>Full NDI (SpeedHQ)</option>%s'
             '</select></div></div>'
             '<p class="hint">Empty stream name = %s, empty IP = any host. A source IP is also searched '
@@ -789,7 +942,7 @@ def dashboard(session):
             (n, n, esc(o["connector"]), badge, status_rows, hidden, n, " checked" if o["enabled"] else "",
              n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]),
              options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]), options(BANDWIDTHS, o["bandwidth"]),
-             hx_opt, esc(default_out_stream(n)), n))
+             options(mode_choices(o), o["mode_setting"]), hx_opt, esc(default_out_stream(n)), n))
 
     # NDI sources on the network
     srcs = visible_sources()
@@ -813,9 +966,9 @@ def dashboard(session):
     cards = []
     for i in ins:
         slot = i["slot"] or (free_slots.pop(0) if free_slots else 0)
-        mode_choices = [("", "Automatic (best up to 1080p30)")] + i["modes"]
+        cap_choices = [("", "Automatic (best up to 1080p30)")] + i["modes"]
         if i["mode"] and i["mode"] not in dict(i["modes"]):
-            mode_choices.append((i["mode"], i["mode"]))
+            cap_choices.append((i["mode"], i["mode"]))
         state = i["state"] or ("starting" if i["enabled"] else "off")
         live = ""
         if i["enabled"] and i["live_mode"]:
@@ -842,12 +995,37 @@ def dashboard(session):
             (esc(i["label"]), " on" if i["present"] else "", "connected" if i["present"] else "not connected",
              esc(i["id"]), k, " playing" if state.startswith("sending") else "", esc(state), live, hidden,
              esc(i["id"]), slot, " checked" if i["enabled"] else "", esc(i["name"]), esc(default_in_stream(slot)),
-             options(mode_choices, i["mode"]), hx_send_opt, remove))
+             options(cap_choices, i["mode"]), hx_send_opt, remove))
     body = "".join(cards) if cards else (
         '<p class="hint">No capture devices detected. Plug in a USB HDMI capture card and reload this page.</p>')
     parts.append('<section class="card" id="outgoing"><h2>Configure Outgoing Streams</h2>'
                  '<p class="hint">Nothing is sent until you enable it here. The stream appears on the network as '
-                 '"%s (name)".</p>%s</section>' % (esc(socket.gethostname().upper()), body))
+                 '"%s (name)".</p>%s</section>' % (esc(ndi_host_name()), body))
+
+    # Device settings
+    env = read_env()
+    ns = ndi_settings()
+    parts.append(
+        '<section class="card" id="settings"><h2>Device settings</h2><form method="post" action="/device">%s'
+        '<div class="row"><div><label>Device name</label><input type="text" name="name" value="%s" maxlength="63" '
+        'required><span class="hint block">Shown in NDI source names and used as the network host name '
+        '(%s.local).</span></div>'
+        '<div><label>NDI Discovery Server (optional)</label><input type="text" name="discovery" value="%s" '
+        'placeholder="e.g. 192.168.1.10" maxlength="200"><span class="hint block">Find and announce sources '
+        'through a Discovery Server instead of mDNS. Several: comma separated.</span></div>'
+        '<div><label>NDI groups to receive from</label><input type="text" name="recv_groups" value="%s" '
+        'placeholder="Public" maxlength="200"></div>'
+        '<div><label>NDI groups to send to</label><input type="text" name="send_groups" value="%s" '
+        'placeholder="Public" maxlength="200"></div></div>'
+        '<label class="check"><input type="checkbox" name="splash_info" value="1"%s> Show IP address, serial '
+        'and status on the splash screen</label>'
+        '<label class="check"><input type="checkbox" name="frame_timeout" value="1"%s> Show the splash when a '
+        'connected source stops sending video for 10 s <span class="hint">(off: keep the last picture, '
+        'e.g. for screen captures that only send on change)</span></label>'
+        '<button>Save device settings</button></form></section>' %
+        (hidden, esc(device_name()), esc(socket.gethostname()), esc(ns["discovery"]), esc(ns["recv_groups"]),
+         esc(ns["send_groups"]), "" if env.get("PINDI_SPLASH_INFO") == "0" else " checked",
+         " checked" if (env.get("PINDI_FRAME_TIMEOUT_MS") or "0") not in ("", "0") else ""))
 
     # Network
     cfg = read_network_config()
@@ -892,8 +1070,22 @@ def dashboard(session):
 
     # System
     parts.append(
-        '<section class="card"><h2>System</h2><form method="post" action="/reboot">%s'
-        '<button class="danger">Reboot</button></form></section>' % hidden)
+        '<section class="card" id="system"><h2>System</h2>'
+        '<div class="buttons"><a class="button secondary" href="/logs">View logs</a>'
+        '<a class="button secondary" href="/diagnostics">Download diagnostics</a>'
+        '<a class="button secondary" href="/backup">Download settings backup</a></div>'
+        '<form method="post" action="/restore" id="restore-form">%s<label>Restore settings from a backup file'
+        '</label><input type="file" id="restore-file" accept=".json,application/json">'
+        '<input type="hidden" name="backup" id="restore-data"><p class="hint">Restores outputs, outgoing '
+        'streams, device and NDI settings. Network settings are restored too, with the usual automatic '
+        'rollback.</p><button class="secondary" id="restore-button" disabled>Restore</button></form>'
+        '<div class="buttons"><form class="inline" method="post" action="/restart">%s'
+        '<button class="secondary">Restart video</button></form>'
+        '<form class="inline" method="post" action="/reset" data-confirm="Reset all PiNDI settings (outputs, '
+        'outgoing streams, device and NDI settings) to the defaults? Network settings and passwords are kept.">'
+        '%s<button class="danger">Reset settings</button></form>'
+        '<form class="inline" method="post" action="/reboot" data-confirm="Reboot the device now?">%s'
+        '<button class="danger">Reboot</button></form></div></section>' % (hidden, hidden, hidden, hidden))
 
     return page("PiNDI", "".join(parts), session["user"], csrf)
 
@@ -903,7 +1095,21 @@ def dashboard(session):
 ROTATIONS = [("0", "0&deg; (normal)"), ("180", "180&deg; (upside down)")]
 MIRRORS = [("none", "None"), ("horizontal", "Horizontal (left/right)"), ("vertical", "Vertical (top/bottom)")]
 BANDWIDTHS = [("highest", "Full quality"), ("lowest", "Low-bandwidth preview")]
-LEGACY_OUT1 = ("STREAM", "SOURCE_IP", "ROTATE", "MIRROR")
+LEGACY_OUT1 = ("STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "MODE")
+
+
+def mode_choices(o):
+    """[(value, label)] for an output's display mode: automatic plus what the monitor offers."""
+    choices = [("", "Automatic (monitor's preferred, up to 1080p)")]
+    for m in o["modes"]:
+        w, h, r = map(int, re.split(r"[x@]", m))
+        note = " (monitor's preferred)" if m == o["preferred_mode"] else ""
+        if w * h > 1920 * 1200 and "Raspberry Pi 3" in MODEL:
+            note += " (too big for a Pi 3)"
+        choices.append((m, "%d&times;%d @ %d Hz%s" % (w, h, r, note)))
+    if o["mode_setting"] and o["mode_setting"] not in o["modes"]:
+        choices.append((o["mode_setting"], esc(o["mode_setting"]) + " (not offered by this monitor)"))
+    return choices
 
 
 def valid_name(s):
@@ -917,7 +1123,7 @@ def act_output(form):
         return ("err", "Unknown output.")
     if n not in [o["n"] for o in outputs()]:
         return ("err", "Unknown output.")
-    keys = ("ENABLED", "STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "BANDWIDTH")
+    keys = ("ENABLED", "STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "BANDWIDTH", "MODE")
     updates = {"PINDI_OUT%d_%s" % (n, k): "" for k in keys}
     if n == 1:  # settings from before multi-output support
         updates.update({"PINDI_" + k: "" for k in LEGACY_OUT1})
@@ -927,6 +1133,9 @@ def act_output(form):
         source_ip = form.get("source_ip", "").strip()
         rotate, mirror = form.get("rotate", "0"), form.get("mirror", "none")
         bandwidth = form.get("bandwidth", "highest")
+        mode = form.get("display_mode", "")
+        if mode and not re.match(r"^\d{3,4}x\d{3,4}@\d{2,3}$", mode):
+            return ("err", "Invalid display mode.")
         if not valid_name(stream):
             return ("err", "Invalid stream name.")
         if source_ip:
@@ -945,6 +1154,7 @@ def act_output(form):
             "PINDI_OUT%d_ROTATE" % n: "" if rotate == "0" else rotate,
             "PINDI_OUT%d_MIRROR" % n: "" if mirror == "none" else mirror,
             "PINDI_OUT%d_BANDWIDTH" % n: "" if bandwidth == default_bw else bandwidth,
+            "PINDI_OUT%d_MODE" % n: mode,
         })
     write_env(updates)
     later(0.5, run, "systemctl", "restart", "pindi.service")
@@ -1056,6 +1266,147 @@ def act_password(session, form):
     return ("ok", "Password changed. Use the new password for this page and SSH.")
 
 
+def restart_media():
+    run("systemctl", "restart", "pindi.service", "pindi-sender.service")
+
+
+def hostname_for(name):
+    """A valid host name from a free-form device name ("Lobby left" -> "Lobby-left")."""
+    h = re.sub(r"[^A-Za-z0-9-]+", "-", name).strip("-")[:63].strip("-")
+    return h or "PiNDI"
+
+
+def act_device(form):
+    name = form.get("name", "").strip()
+    if not name or len(name) > 63 or not valid_name(name) or any(c in name for c in "()\\\""):
+        return ("err", "Enter a device name of up to 63 characters, without brackets or quotes.")
+    lists = {}
+    for key in ("discovery", "recv_groups", "send_groups"):
+        items = [s for s in re.split(r"[\s,;]+", form.get(key, "").strip()) if s]
+        for s in items:
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$", s):
+                return ("err", "%s is not a valid %s." % (s, "server address" if key == "discovery" else "group name"))
+        lists[key] = ",".join(items)
+    host = hostname_for(name)
+    try:
+        renamed = set_hostname(host)
+    except RuntimeError as e:
+        return ("err", "Could not set the host name: %s" % e)
+    # A name that is a valid host name is used as is (NDI shows it in capitals, as usual); anything
+    # else ("Lobby left") also becomes the NDI machine name, so sources show it exactly as typed.
+    write_ndi_settings(lists["discovery"], lists["send_groups"], lists["recv_groups"],
+                       "" if name == host else name)
+    write_env({"PINDI_SPLASH_INFO": "" if form.get("splash_info") == "1" else "0",
+               "PINDI_FRAME_TIMEOUT_MS": "10000" if form.get("frame_timeout") == "1" else ""})
+    log("device settings: name=%s host=%s discovery=%s recv=%s send=%s" % (
+        name, host, lists["discovery"] or "-", lists["recv_groups"] or "-", lists["send_groups"] or "-"))
+
+    def apply():
+        if renamed:
+            run("systemctl", "restart", "avahi-daemon.service")
+        restart_media()
+    later(0.5, apply)
+    return ("ok", "Device settings saved. Video and outgoing streams are restarting.")
+
+
+BACKUP_FORMAT = "pindi-backup-1"
+
+
+def backup_json():
+    return json.dumps({"format": BACKUP_FORMAT, "version": version(), "serial": SERIAL,
+                       "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "device_name": device_name(),
+                       "settings": {k: v for k, v in read_env().items() if k.startswith("PINDI_")},
+                       "ndi": read_ndi_config(), "network": read_text(NETWORK_FILE)}, indent=2) + "\n"
+
+
+def act_restore(form):
+    try:
+        data = json.loads(form.get("backup", ""))
+        assert isinstance(data, dict) and data.get("format") == BACKUP_FORMAT
+        settings, ndi, network = data["settings"], data.get("ndi", {}), data.get("network", "")
+        assert isinstance(settings, dict) and isinstance(ndi, dict) and isinstance(network, str)
+    except (ValueError, KeyError, AssertionError):
+        return ("err", "That is not a PiNDI settings backup.")
+    for k, v in settings.items():
+        if not re.match(r"^PINDI_[A-Z0-9_]+$", str(k)) or not isinstance(v, str) or not valid_name(v):
+            return ("err", "The backup contains an invalid setting (%s)." % k)
+    if network and not network.startswith("# Written by the PiNDI web interface."):
+        return ("err", "The backup contains network settings that were not written by PiNDI.")
+    # Replace every PINDI_ setting with the backup's.
+    current = {k: "" for k in read_env() if k.startswith("PINDI_")}
+    current.update(settings)
+    write_env(current)
+    os.makedirs(os.path.dirname(NDI_CONFIG), exist_ok=True)
+    write_atomic(NDI_CONFIG, json.dumps(ndi, indent=2) + "\n")
+    name = str(data.get("device_name", "")).strip()
+    if name and valid_name(name):
+        try:
+            if set_hostname(hostname_for(name)):
+                later(0.3, run, "systemctl", "restart", "avahi-daemon.service")
+        except RuntimeError:
+            pass
+    later(0.5, restart_media)
+    log("settings restored from backup of %s (%s)" % (data.get("serial", "?"), data.get("created", "?")))
+    if network and network != read_text(NETWORK_FILE):
+        NET.apply(network, "restored settings")
+        return ("warn", "Settings restored. The network settings changed as well: open the device at its "
+                        "(new) address within %d seconds and press Keep." % ROLLBACK_SECONDS)
+    return ("ok", "Settings restored. Video and outgoing streams are restarting.")
+
+
+def act_reset():
+    defaults = read_text(ENV_DEFAULTS)
+    if not defaults:
+        return ("err", "The default settings file %s is missing - run install.sh again." % ENV_DEFAULTS)
+    write_atomic(ENV_FILE, defaults)
+    try:
+        os.remove(NDI_CONFIG)
+    except OSError:
+        pass
+    log("settings reset to defaults")
+    later(0.5, restart_media)
+    return ("ok", "All PiNDI settings are back to the defaults (network settings and passwords kept).")
+
+
+def journal(lines, units=("pindi", "pindi-sender", "pindi-web")):
+    cmd = ["journalctl", "--no-pager", "-o", "short-iso", "-n", str(lines)]
+    for u in units:
+        cmd += ["-u", u]
+    return run(*cmd).stdout
+
+
+def diagnostics_text():
+    out = ["PiNDI diagnostics", "=" * 60]
+    hl, hw = health()
+    out += ["Created: %s" % time.strftime("%Y-%m-%d %H:%M:%S %z"), "Version: %s" % version(),
+            "Model: %s" % MODEL, "Serial: %s" % SERIAL, "Device name: %s" % device_name(),
+            "Kernel: %s" % " ".join(os.uname()), "NDI: %s" % (read_text(RUN_DIR + "/ndi").replace("\n", " ")),
+            "Health: %s" % hl, "Power/cooling: %s" % hw, "Throttled: 0x%x" % throttled(),
+            "Network traffic: %s" % TRAFFIC.text(), ""]
+    for title, path in (("Settings (%s)" % ENV_FILE, ENV_FILE), ("NDI config", NDI_CONFIG),
+                        ("Network", NETWORK_FILE), ("Outputs", RUN_DIR + "/outputs"),
+                        ("Visible NDI sources", RUN_DIR + "/sources")):
+        out += ["---- " + title, read_text(path).rstrip() or "(empty)", ""]
+    try:
+        for name in sorted(os.listdir(RUN_DIR)):
+            if name.endswith((".status", ".latency", ".modes")):
+                out += ["---- " + name, read_text(os.path.join(RUN_DIR, name)).rstrip(), ""]
+    except OSError:
+        pass
+    out += ["---- ip addr", run("ip", "addr").stdout, "---- services",
+            run("systemctl", "status", "--no-pager", "-n", "0", "pindi", "pindi-sender", "pindi-web").stdout,
+            "---- log (last 2000 lines)", journal(2000), "---- kernel (last 200 lines)",
+            run("journalctl", "-k", "-b", "--no-pager", "-n", "200", "-o", "short-iso").stdout]
+    return "\n".join(out)
+
+
+def logs_page(session):
+    body = ('<section class="card"><nav class="top"><a href="/">&larr; Back</a><a href="/diagnostics">Download '
+            'diagnostics</a></nav><h2>Log (last 400 lines)</h2><pre class="log">%s</pre></section>' %
+            esc(journal(400)))
+    return page("PiNDI - Log", body, session["user"], session["csrf"])
+
+
 # ---------------------------------------------------------------- HTTP
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -1119,9 +1470,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.redirect("/login") if path == "/" else self.send(401, "Unauthorized", "text/plain")
         if path == "/":
             return self.send(200, dashboard(s))
+        if path == "/logs":
+            return self.send(200, logs_page(s))
+        stamp = time.strftime("%Y%m%d-%H%M")
+        if path == "/diagnostics":
+            return self.send(200, diagnostics_text(), "text/plain; charset=utf-8", [
+                ("Content-Disposition", 'attachment; filename="pindi-%s-diagnostics-%s.txt"' % (SERIAL, stamp))])
+        if path == "/backup":
+            return self.send(200, backup_json(), "application/json", [
+                ("Content-Disposition", 'attachment; filename="pindi-%s-settings-%s.json"' % (SERIAL, stamp))])
         if path == "/api/status":
             st = {"ip": live_network()["address"], "rollback": NET.seconds_left() if NET.pending() else None,
                   "net": TRAFFIC.text()}
+            st["health"], st["power"] = health()
             for o in outputs():
                 for k in ("state", "target", "source", "video", "format", "latency"):
                     st["out%d.%s" % (o["n"], k)] = o[k]
@@ -1168,6 +1529,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             s["flash"] = ("ok", "Previous network settings restored.")
         elif path == "/password":
             s["flash"] = act_password(s, form)
+        elif path == "/device":
+            s["flash"] = act_device(form)
+        elif path == "/restore":
+            s["flash"] = act_restore(form)
+        elif path == "/reset":
+            s["flash"] = act_reset()
+        elif path == "/restart":
+            log("video restart requested by %s" % s["user"])
+            later(0.5, restart_media)
+            s["flash"] = ("ok", "Video and outgoing streams are restarting.")
         elif path == "/reboot":
             log("reboot requested by %s" % s["user"])
             later(1, run, "systemctl", "reboot")

@@ -320,6 +320,7 @@ static void render_fit(uint32_t *dst, int W, int H, const struct image *im)
 static FT_Library ft;
 static FT_Face face;
 static bool font_ok;
+static bool splash_info = true; /* PINDI_SPLASH_INFO=0: plain splash, no IP/serial/status */
 
 static int text_width(const char *s)
 {
@@ -467,10 +468,10 @@ struct output {
     int W, H;
     struct buf splash;
     uint32_t *base, *comp;
-    char shown_ip[64];
+    char shown_ip[64], shown_msg[192];
     int pending; /* P_*: a commit is in flight */
     uint64_t rotation;
-    bool rot_logged, commit_logged;
+    bool rot_logged, commit_logged, mode_failed;
 
     /* Shared with the receiver thread (lock). */
     pthread_mutex_t lock;
@@ -486,6 +487,7 @@ struct output {
     uint32_t wfmt; /* format the receiver needs */
     bool want_realloc, want_splash, on_splash;
     int ready, queued, scanout;
+    char splash_msg[192]; /* what the receiver is doing, shown on the splash */
 
     /* Configuration. */
     bool disabled; /* PINDI_OUT<n>_ENABLED=0: no NDI, HDMI signal off (e.g. encoder-only units) */
@@ -730,10 +732,29 @@ static bool commit_buf(struct output *o, struct buf *b, double ar, int kind)
     return false;
 }
 
+/* The monitor's modes for the web UI, one "WxH@R" per line (preferred first, marked "*"), no duplicates. */
+static void modes_publish(struct output *o, drmModeConnector *c)
+{
+    char buf[4096] = "\n", m[32], ms[32], path[64]; /* leading newline: entries are "\n...\n" for lookups */
+    size_t len = 1;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < c->count_modes; i++) {
+            drmModeModeInfo *mi = &c->modes[i];
+            if ((mi->flags & DRM_MODE_FLAG_INTERLACE) || (!(mi->type & DRM_MODE_TYPE_PREFERRED)) != pass)
+                continue;
+            snprintf(m, sizeof m, "\n%dx%d@%d\n", mi->hdisplay, mi->vdisplay, mi->vrefresh);
+            snprintf(ms, sizeof ms, "\n%dx%d@%d*\n", mi->hdisplay, mi->vdisplay, mi->vrefresh);
+            if (!strstr(buf, m) && !strstr(buf, ms) && len + strlen(ms) < sizeof buf)
+                len += snprintf(buf + len, sizeof buf - len, "%s", (pass ? m : ms) + 1);
+        }
+    snprintf(path, sizeof path, RUN_DIR "/out%d.modes", o->n);
+    write_file_atomic(path, buf + 1);
+}
+
 static bool pick_mode(struct output *o, drmModeConnector *c, drmModeModeInfo *out)
 {
     int w = 0, h = 0, r = 0;
-    const char *want = ocfg(o->n, "MODE", "");
+    const char *want = o->mode_failed ? "" : ocfg(o->n, "MODE", "");
     if (*want && sscanf(want, "%dx%d@%d", &w, &h, &r) >= 2) {
         for (int i = 0; i < c->count_modes; i++) {
             drmModeModeInfo *m = &c->modes[i];
@@ -773,12 +794,17 @@ static bool pick_mode(struct output *o, drmModeConnector *c, drmModeModeInfo *ou
 
 static void splash_update_text(struct output *o, const char *ip, bool force)
 {
-    if (!o->active || (!force && !strcmp(ip, o->shown_ip)))
+    char msg[192];
+    pthread_mutex_lock(&o->lock);
+    snprintf(msg, sizeof msg, "%s", o->splash_msg);
+    pthread_mutex_unlock(&o->lock);
+    if (!o->active || (!force && !strcmp(ip, o->shown_ip) && !strcmp(msg, o->shown_msg)))
         return;
     snprintf(o->shown_ip, sizeof o->shown_ip, "%s", ip);
+    snprintf(o->shown_msg, sizeof o->shown_msg, "%s", msg);
     memcpy(o->comp, o->base, (size_t)o->W * o->H * 4);
 
-    if (font_ok) {
+    if (font_ok && splash_info) {
         /* Font size: the smaller of 2% of the screen height and 16pt. */
         int px = (int)lround(o->H * 0.02);
         if (px > FONT_PT_PX) px = FONT_PT_PX;
@@ -795,6 +821,15 @@ static void splash_update_text(struct output *o, const char *ip, bool force)
         draw_text(o->comp, o->W, o->H, rx + shadow, base + shadow, right, 0x000000);
         draw_text(o->comp, o->W, o->H, margin, base, left, 0xD0D0D0);
         draw_text(o->comp, o->W, o->H, rx, base, right, 0xD0D0D0);
+        if (*msg) {
+            /* Status centred one line above, so it never runs into the IP or serial. */
+            int line = (int)(face->size->metrics.height >> 6);
+            int mx = (o->W - text_width(msg)) / 2;
+            if (mx < margin)
+                mx = margin;
+            draw_text(o->comp, o->W, o->H, mx + shadow, base - line + shadow, msg, 0x000000);
+            draw_text(o->comp, o->W, o->H, mx, base - line, msg, 0xD0D0D0);
+        }
     }
     for (int y = 0; y < o->H; y++)
         memcpy(o->splash.map + (size_t)y * o->splash.pitch, o->comp + (size_t)y * o->W, (size_t)o->W * 4);
@@ -872,7 +907,10 @@ static bool output_enable(struct output *o)
 {
     drmModeConnector *c = drmModeGetConnector(drm_fd, o->conn_id); /* probes EDID */
     bool ok = false;
-    if (!c || c->connection != DRM_MODE_CONNECTED || !pick_mode(o, c, &o->mode))
+    if (!c || c->connection != DRM_MODE_CONNECTED)
+        goto out;
+    modes_publish(o, c);
+    if (!pick_mode(o, c, &o->mode))
         goto out;
     o->W = o->mode.hdisplay;
     o->H = o->mode.vdisplay;
@@ -906,7 +944,11 @@ static bool output_enable(struct output *o)
         }
     }
     if (!ok) {
-        LOG("display: output %d: mode set failed: %s", o->n, strerror(errno));
+        LOG("display: output %d: mode set %dx%d@%d failed: %s", o->n, o->W, o->H, o->mode.vrefresh, strerror(errno));
+        if (!o->mode_failed && *ocfg(o->n, "MODE", "")) {
+            LOG("display: output %d: falling back to the automatic mode", o->n);
+            o->mode_failed = true; /* the next hotplug poll (1 s) retries without it */
+        }
         o->active = false;
         buf_destroy(&o->splash);
         free(o->base);
@@ -1173,6 +1215,25 @@ static void status_set(struct output *o, const char *state, const char *source, 
              o->st.state, o->target, o->st.source, o->st.url, o->st.video);
     snprintf(path, sizeof path, RUN_DIR "/out%d.status", o->n);
     write_file_atomic(path, buf);
+
+    /* The same, short, on the splash (also shown right after a stream is lost). */
+    char msg[sizeof o->splash_msg], from[80] = "";
+    if (*o->source_ip)
+        snprintf(from, sizeof from, " from %s", o->source_ip);
+    if (!strcmp(state, "waiting for network"))
+        snprintf(msg, sizeof msg, "Waiting for the network");
+    else if (!strcmp(state, "connecting"))
+        snprintf(msg, sizeof msg, "Connecting to %s", source);
+    else if (!strcmp(state, "connected, no frames"))
+        snprintf(msg, sizeof msg, "%s: connected, no video", source);
+    else if (!strcmp(state, "searching") || !strcmp(state, "playing"))
+        snprintf(msg, sizeof msg, "Waiting for NDI stream %s%s", o->target, from);
+    else
+        msg[0] = 0;
+    pthread_mutex_lock(&o->lock);
+    snprintf(o->splash_msg, sizeof o->splash_msg, "%s", msg);
+    pthread_mutex_unlock(&o->lock);
+    wake();
 }
 
 static void outputs_publish(void)
@@ -1546,6 +1607,7 @@ int main(void)
     }
     if (load_jpeg(cfg("PINDI_SPLASH", "/usr/share/pindi/splash.jpg"), &splash_img))
         trim_edges(&splash_img, image_bg(&splash_img));
+    splash_info = strcmp(cfg("PINDI_SPLASH_INFO", "1"), "0") != 0;
     font_ok = !FT_Init_FreeType(&ft) &&
               !FT_New_Face(ft, cfg("PINDI_FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"), 0, &face);
     if (!font_ok)
@@ -1617,9 +1679,9 @@ int main(void)
         if (now - last_ip >= 1000) {
             last_ip = now;
             read_ip(ip, sizeof ip);
-            for (int i = 0; i < nout; i++)
-                splash_update_text(&outs[i], ip, false);
         }
+        for (int i = 0; i < nout; i++)
+            splash_update_text(&outs[i], ip, false); /* only redraws on a change */
     }
 
     LOG("shutting down");
