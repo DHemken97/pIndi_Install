@@ -662,7 +662,11 @@ def detected_inputs():
         modes = capture_modes(dev)
         if not modes:
             continue
-        found.append({"dev": dev, "id": _stable_path(dev), "label": read_text(os.path.join(sysdir, "name")).strip(),
+        label = read_text(os.path.join(sysdir, "name")).strip()
+        a, sep, b = label.partition(": ")
+        if sep and a.strip() == b.strip():
+            label = a.strip()  # UVC names are often "NAME: NAME"
+        found.append({"dev": dev, "id": _stable_path(dev), "label": label,
                       "modes": modes})
     return found
 
@@ -825,6 +829,13 @@ input[type=file]{color:var(--muted);font:inherit;margin:4px 0}button:disabled{op
 pre.log{background:#0d1319;border:1px solid var(--line);border-radius:7px;padding:10px;overflow:auto;
 max-height:70vh;font:12px/1.4 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
 nav.top a{color:var(--accent);margin-right:14px}
+nav.sections{display:flex;flex-wrap:wrap;gap:6px 16px;margin:0 0 14px;font-size:14px}
+nav.sections a{color:var(--accent);text-decoration:none}nav.sections a:hover{text-decoration:underline}
+h3.group{margin:18px 0 0;font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:var(--accent)}
+details.card>summary{cursor:pointer;list-style:none}details.card>summary::-webkit-details-marker{display:none}
+details.card>summary h2{display:inline;margin:0}details.card>summary:before{content:"\\25B8  ";color:var(--muted)}
+details.card[open]>summary:before{content:"\\25BE  "}details.card[open]>summary{margin-bottom:12px}
+html{scroll-behavior:smooth}section.card,details.card{scroll-margin-top:12px}
 .preview{float:right;margin:0 0 10px 14px;width:240px}.thumb{width:100%;border-radius:6px;border:1px solid var(--line);
 background:#000;display:block;min-height:40px}.thumb.none{visibility:hidden}
 @media(max-width:600px){.preview{float:none;width:100%;margin:0 0 10px}}
@@ -909,6 +920,12 @@ def dashboard(session):
         return "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == current else "", label)
                        for v, label in choices)
 
+    # Section menu
+    links = [("#out%d" % o["n"], "Output %d" % o["n"]) for o in outs] + [
+        ("#sources", "Sources"), ("#outgoing", "Outgoing"), ("#settings", "Settings"), ("#network", "Network"),
+        ("#system", "System")]
+    parts.append('<nav class="sections">%s</nav>' % "".join('<a href="%s">%s</a>' % l for l in links))
+
     # Device
     hl, hw = health()
     ndi = ndi_info()
@@ -975,34 +992,39 @@ def dashboard(session):
             '<form method="post" action="/output">%s<input type="hidden" name="n" value="%d">'
             '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Enabled '
             '<span class="hint">(off: no NDI is received and this HDMI port is switched off)</span></label>'
-            '<div class="row"><div><label>Stream name</label><input type="text" id="stream-%d" name="stream" '
+            '<h3 class="group">Source</h3><div class="row">'
+            '<div><label>Stream name</label><input type="text" id="stream-%d" name="stream" '
             'value="%s" placeholder="%s" maxlength="200"></div><div><label>Source IP</label>'
             '<input type="text" id="source_ip-%d" name="source_ip" value="%s" placeholder="Any" maxlength="15">'
             '</div><div><label>Backup stream (optional)</label><input type="text" name="backup" value="%s" '
-            'placeholder="None" maxlength="200"><span class="hint block">Played while the main stream is '
-            'unavailable; it switches back automatically.</span></div>'
-            '<div><label>Rotation</label><select name="rotate">%s</select></div>'
-            '<div><label>Mirror</label><select name="mirror">%s</select></div>'
-            '<div><label>Receive quality</label><select name="bandwidth">%s</select></div>'
+            'placeholder="None" maxlength="200"></div>'
+            '<div><label>Receive quality</label><select name="bandwidth">%s</select></div></div>'
+            '<p class="hint">Empty stream name = %s, empty IP = any host (a source IP is also searched '
+            'directly, so senders on other subnets work). The backup plays while the main stream is '
+            'unavailable. The low-bandwidth preview is a small (typically 640&times;360) stream every sender '
+            'provides, for slow networks.</p>'
+            '<h3 class="group">Picture</h3><div class="row">'
             '<div><label>Display mode</label><select name="display_mode">%s</select></div>'
+            '<div><label>Codec</label><select name="codec"><option selected>Full NDI (SpeedHQ)</option>%s'
+            '</select></div>'
+            '<div><label>Rotation</label><select name="rotate">%s</select></div>'
+            '<div><label>Mirror</label><select name="mirror">%s</select></div></div>'
+            '<p class="hint">180&deg; is for ceiling mounting, mirror for rear projection.</p>'
+            '<h3 class="group">Sound</h3><div class="row">'
             '<div><label>Audio output</label><select name="audio">%s</select></div>'
             '<div><label>Audio delay (ms)</label><input type="number" name="audio_delay" min="20" max="1000" '
-            'step="10" value="%s"><span class="hint block">The least delay used; it is raised automatically '
-            'when a sender&#39;s audio arrives unevenly. The picture appears about 25 ms after it arrives.'
-            '</span></div>'
-            '<div><label>Codec</label><select name="codec"><option selected>Full NDI (SpeedHQ)</option>%s'
-            '</select></div></div>'
-            '<p class="hint">Empty stream name = %s, empty IP = any host. A source IP is also searched '
-            'directly, so senders on other subnets work. 180&deg; is for ceiling mounting, mirror for rear '
-            'projection. The low-bandwidth preview is a small (typically 640&times;360) stream every NDI sender '
-            'provides, for slow networks.</p><button>Save output %d</button> '
+            'step="10" value="%s"></div></div>'
+            '<p class="hint">The delay is the least used; it is raised automatically when a sender&#39;s audio '
+            'arrives unevenly. The picture appears about 25 ms after it arrives.</p>'
+            '<button>Save output %d</button> '
             '<button class="secondary" formaction="/identify" name="identify" value="1">Identify</button> '
             '<button class="secondary" name="reset" value="1">Reset to default</button></form></section>' %
             (n, n, esc(o["connector"]), badge, status_rows, hidden, n, " checked" if o["enabled"] else "",
              n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]), esc(o["backup"]),
-             options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]), options(BANDWIDTHS, o["bandwidth"]),
-             options(mode_choices(o), o["mode_setting"]), options(audio_choices(), o["audio_out"]),
-             esc(o["audio_delay"]), hx_opt, esc(default_out_stream(n)), n))
+             options(BANDWIDTHS, o["bandwidth"]), esc(default_out_stream(n)),
+             options(mode_choices(o), o["mode_setting"]), hx_opt,
+             options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]),
+             options(audio_choices(), o["audio_out"]), esc(o["audio_delay"]), n))
 
     # NDI sources on the network
     srcs = visible_sources()
@@ -1013,9 +1035,10 @@ def dashboard(session):
                 '<button type="button" class="small secondary" data-out="%d" data-stream="%s" data-ip="%s">'
                 'Use%s</button>' % (n, esc(s["stream"]), esc(s["ip"]), " for %d" % n if len(outs) > 1 else "")
                 for n in enabled_outs)
-        parts.append('<section class="card"><h2>NDI sources on the network</h2><table>%s</table></section>' %
-                     "".join('<tr><td>%s</td><td>%s</td><td>%s</td></tr>' %
-                             (esc(s["name"]), esc(s["ip"]), use_buttons(s)) for s in srcs))
+        parts.append('<details class="card" id="sources"><summary><h2>NDI sources on the network '
+                     '<span class="badge">%d</span></h2></summary><table>%s</table></details>' %
+                     (len(srcs), "".join('<tr><td>%s</td><td>%s</td><td>%s</td></tr>' %
+                                         (esc(s["name"]), esc(s["ip"]), use_buttons(s)) for s in srcs)))
 
     # Outgoing streams (capture devices)
     used = {i["slot"] for i in ins if i["slot"]}
@@ -1031,7 +1054,9 @@ def dashboard(session):
             cap_choices.append((i["mode"], i["mode"]))
         state = i["state"] or ("starting" if i["enabled"] else "off")
         live = ""
-        if i["enabled"] and i["live_mode"]:
+        if i["enabled"] and i["live_mode"] and state.startswith("ready"):
+            live = " &middot; %s &middot; camera delivers %s fps" % (esc(i["live_mode"]), esc(i["cam_fps"] or "0"))
+        elif i["enabled"] and i["live_mode"]:
             live = " &middot; %s &middot; %s fps sent" % (esc(i["live_mode"]), esc(i["fps"]))
             if i["cam_fps"]:
                 live += " (camera delivers %s fps" % esc(i["cam_fps"])
@@ -1102,7 +1127,7 @@ def dashboard(session):
         except ValueError:
             pass
     parts.append(
-        '<section class="card"><h2>Network</h2><form method="post" action="/network">%s'
+        '<section class="card" id="network"><h2>Network</h2><form method="post" action="/network">%s'
         '<div class="radio"><label><input type="radio" name="mode" value="dhcp" %s> Automatic (DHCP)</label>'
         '<label><input type="radio" name="mode" value="static" id="mode-static" %s> Static IP</label></div>'
         '<div id="static-fields"><div class="row"><div><label>IP address</label>'
