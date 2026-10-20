@@ -549,7 +549,7 @@ struct output {
     /* Receiver thread. */
     pthread_t thr;
     bool thr_started;
-    struct { char state[32], source[256], url[128], video[64]; } st;
+    struct { char state[32], source[256], url[128], video[64], target[160]; } st;
 };
 
 static struct output outs[MAX_OUT];
@@ -1312,8 +1312,9 @@ static void status_set(struct output *o, const char *state, const char *source, 
 {
     char buf[1024], path[64];
     if (!strcmp(o->st.state, state) && !strcmp(o->st.source, source) && !strcmp(o->st.url, url) &&
-        !strcmp(o->st.video, video))
+        !strcmp(o->st.video, video) && !strcmp(o->st.target, o->target))
         return;
+    snprintf(o->st.target, sizeof o->st.target, "%s", o->target);
     snprintf(o->st.state, sizeof o->st.state, "%s", state);
     snprintf(o->st.source, sizeof o->st.source, "%s", source);
     snprintf(o->st.url, sizeof o->st.url, "%s", url);
@@ -1641,6 +1642,45 @@ static bool url_has_ip(const char *url, const char *ip)
 }
 
 static uint64_t start_ms;
+static void set_target(struct output *o, const char *stream, const char *source_ip, const char *backup);
+
+/* Live source switching (web UI / API): out<n>.source holds "stream=", "source_ip=", "backup=" lines.
+ * Returns 1 if the target changed, 2 if the source IP changed too (discovery must restart). */
+static int switch_poll(struct output *o, uint64_t *seen)
+{
+    char path[64], buf[1024], stream[160] = "", ip[64] = "", backup[160] = "";
+    struct stat st;
+    snprintf(path, sizeof path, RUN_DIR "/out%d.source", o->n);
+    if (stat(path, &st))
+        return 0;
+    uint64_t stamp = (uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec;
+    if (stamp == *seen)
+        return 0;
+    *seen = stamp;
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    while (fgets(buf, sizeof buf, f)) {
+        buf[strcspn(buf, "\r\n")] = 0;
+        if (!strncmp(buf, "stream=", 7))
+            snprintf(stream, sizeof stream, "%.159s", buf + 7);
+        else if (!strncmp(buf, "source_ip=", 10))
+            snprintf(ip, sizeof ip, "%.63s", buf + 10);
+        else if (!strncmp(buf, "backup=", 7))
+            snprintf(backup, sizeof backup, "%.159s", buf + 7);
+    }
+    fclose(f);
+    char old_target[160], old_ip[64], old_backup[160];
+    snprintf(old_target, sizeof old_target, "%s", o->target);
+    snprintf(old_ip, sizeof old_ip, "%s", o->source_ip);
+    snprintf(old_backup, sizeof old_backup, "%s", o->backup);
+    set_target(o, stream, ip, backup);
+    if (!strcmp(old_target, o->target) && !strcmp(old_ip, o->source_ip) && !strcmp(old_backup, o->backup))
+        return 0;
+    LOG("ndi: output %d: switching to %s from %s%s%s", o->n, o->target, *o->source_ip ? o->source_ip : "any host",
+        *o->backup ? ", backup " : "", o->backup);
+    return strcmp(old_ip, o->source_ip) ? 2 : 1;
+}
 
 /* The output's main stream among the visible sources (preferring one that has not just failed). */
 static const NDIlib_source_t *find_primary(struct output *o, const NDIlib_source_t *srcs, uint32_t count,
@@ -1675,6 +1715,8 @@ static void *receiver(void *arg)
     char extra_ips[512];
     const char *extra = cfg("PINDI_EXTRA_IPS", "");
     snprintf(extra_ips, sizeof extra_ips, "%s%s%s", extra, *o->source_ip && *extra ? "," : "", o->source_ip);
+    uint64_t switch_seen = 0;
+    uint64_t switch_check = 0;
     char recv_name[128];
     snprintf(recv_name, sizeof recv_name, nout > 1 ? "PiNDI %s output %d" : "PiNDI %s", serial, o->n);
     /* The plane decides the pixel format: YUV straight through if it can, else RGB from the SDK. */
@@ -1712,6 +1754,33 @@ static void *receiver(void *arg)
             status_set(o, "no monitor", "", "", "");
             usleep(300000);
             continue;
+        }
+
+        /* Live switch to another stream: keep the picture until the new one's first frame (max 6 s). */
+        if (now - switch_check >= 300) {
+            switch_check = now;
+            int sw = switch_poll(o, &switch_seen);
+            if (sw) {
+                if (recv) {
+                    ndi->recv_destroy(recv);
+                    recv = NULL;
+                    audio_close(o);
+                    if (got_frame)
+                        splash_at = now + 6000;
+                    else
+                        request_splash(o);
+                }
+                on_backup = false;
+                search_since = now;
+                failed_src[0] = 0;
+                status_set(o, "searching", "", "", "");
+                if (sw == 2 && find) {
+                    snprintf(extra_ips, sizeof extra_ips, "%s%s%s", extra, *o->source_ip && *extra ? "," : "",
+                             o->source_ip);
+                    ndi->find_destroy(find);
+                    find = NULL;
+                }
+            }
         }
 
         /* Discovery needs avahi; give it up to 20 s to appear after boot. */
@@ -1906,14 +1975,15 @@ static void *receiver(void *arg)
     return NULL;
 }
 
-static void configure_output(struct output *o)
+/* Main stream (empty = OUT_<serial>[_n]), source IP and backup of an output. */
+static void set_target(struct output *o, const char *stream, const char *source_ip, const char *backup)
 {
     char def[160];
     if (o->n == 1)
         snprintf(def, sizeof def, "OUT_%s", serial);
     else
         snprintf(def, sizeof def, "OUT_%s_%d", serial, o->n);
-    snprintf(o->target, sizeof o->target, "%s", ocfg(o->n, "STREAM", def));
+    snprintf(o->target, sizeof o->target, "%s", *stream ? stream : def);
     o->alt[0] = 0;
     if (!strcmp(o->target, def)) {
         /* Also accept the serial without leading zeros. */
@@ -1927,8 +1997,16 @@ static void configure_output(struct output *o)
                 snprintf(o->alt, sizeof o->alt, "OUT_%s_%d", s, o->n);
         }
     }
-    snprintf(o->source_ip, sizeof o->source_ip, "%s", ocfg(o->n, "SOURCE_IP", ""));
-    snprintf(o->backup, sizeof o->backup, "%s", ocfg(o->n, "BACKUP_STREAM", ""));
+    snprintf(o->source_ip, sizeof o->source_ip, "%s", source_ip);
+    snprintf(o->backup, sizeof o->backup, "%s", backup);
+}
+
+static void configure_output(struct output *o)
+{
+    set_target(o, ocfg(o->n, "STREAM", ""), ocfg(o->n, "SOURCE_IP", ""), ocfg(o->n, "BACKUP_STREAM", ""));
+    char path[64];
+    snprintf(path, sizeof path, RUN_DIR "/out%d.source", o->n);
+    unlink(path); /* a live switch from before a restart: the saved settings win */
     o->rot_s = ocfg(o->n, "ROTATE", "0");
     o->mirror_s = ocfg(o->n, "MIRROR", "none");
     o->audio_s = ocfg(o->n, "AUDIO", "hdmi");

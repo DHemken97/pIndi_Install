@@ -829,6 +829,8 @@ input[type=file]{color:var(--muted);font:inherit;margin:4px 0}button:disabled{op
 pre.log{background:#0d1319;border:1px solid var(--line);border-radius:7px;padding:10px;overflow:auto;
 max-height:70vh;font:12px/1.4 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
 nav.top a{color:var(--accent);margin-right:14px}
+code{font:13px ui-monospace,Consolas,monospace;background:#0d1319;padding:1px 5px;border-radius:4px;
+word-break:break-all}
 nav.sections{display:flex;flex-wrap:wrap;gap:6px 16px;margin:0 0 14px;font-size:14px}
 nav.sections a{color:var(--accent);text-decoration:none}nav.sections a:hover{text-decoration:underline}
 h3.group{margin:18px 0 0;font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:var(--accent)}
@@ -1111,10 +1113,19 @@ def dashboard(session):
         '<label class="check"><input type="checkbox" name="frame_timeout" value="1"%s> Show the splash when a '
         'connected source stops sending video for 10 s <span class="hint">(off: keep the last picture, '
         'e.g. for screen captures that only send on change)</span></label>'
-        '<button>Save device settings</button></form></section>' %
+        '<button>Save device settings</button></form>'
+        '<h3 class="group">HTTP API</h3><p class="hint">For control systems (e.g. Bitfocus Companion, Crestron) '
+        'and scripts. Send the token as <code>Authorization: Bearer &lt;token&gt;</code>.</p>'
+        '<dl><dt>Token</dt><dd><code>%s</code></dd><dt>Status</dt><dd><code>GET /api/v1/status</code></dd>'
+        '<dt>Switch</dt><dd><code>POST /api/v1/outputs/1/source</code> with <code>{"stream": "CAM 2", '
+        '"source_ip": ""}</code></dd><dt>Identify</dt><dd><code>POST /api/v1/identify</code> with '
+        '<code>{"output": 1}</code> (0 = all)</dd><dt>Restart</dt><dd><code>POST /api/v1/restart</code></dd>'
+        '</dl><form method="post" action="/api-token" data-confirm="Generate a new API token? The current one '
+        'stops working.">%s<button class="secondary">New token</button></form></section>' %
         (hidden, esc(device_name()), esc(socket.gethostname()), esc(ns["discovery"]), esc(ns["recv_groups"]),
          esc(ns["send_groups"]), "" if env.get("PINDI_SPLASH_INFO") == "0" else " checked",
-         " checked" if (env.get("PINDI_FRAME_TIMEOUT_MS") or "0") not in ("", "0") else ""))
+         " checked" if (env.get("PINDI_FRAME_TIMEOUT_MS") or "0") not in ("", "0") else "",
+         esc(api_token()), hidden))
 
     # Network
     cfg = read_network_config()
@@ -1268,9 +1279,23 @@ def act_output(form):
             "PINDI_OUT%d_AUDIO" % n: "" if audio == "hdmi" else audio,
             "PINDI_OUT%d_AUDIO_DELAY_MS" % n: "" if audio_delay == 80 else str(audio_delay),
         })
+    before = read_env()
     write_env(updates)
-    later(0.5, run, "systemctl", "restart", "pindi.service")
+    after = read_env()
+    source_keys = {"PINDI_OUT%d_%s" % (n, k) for k in ("STREAM", "SOURCE_IP", "BACKUP_STREAM")}
+    if n == 1:
+        source_keys |= {"PINDI_STREAM", "PINDI_SOURCE_IP"}
+    changed = {k for k in set(before) | set(after) if before.get(k) != after.get(k)}
     o = next(o for o in outputs() if o["n"] == n)
+    if changed and changed <= source_keys and o["enabled"] and o["state"] != "player not running":
+        # Only the source changed: switch live, without restarting the player.
+        write_switch(n, o["stream"], o["source_ip"], o["backup"])
+        log("output %d: switching to %s from %s" % (n, o["stream"] or default_out_stream(n), o["source_ip"] or "any"))
+        return ("ok", "Output %d is switching to %s%s." % (
+            n, o["stream"] or default_out_stream(n), " from " + o["source_ip"] if o["source_ip"] else ""))
+    if not changed:
+        return ("ok", "Output %d: nothing changed." % n)
+    later(0.5, run, "systemctl", "restart", "pindi.service")
     if not o["enabled"]:
         log("output %d: disabled" % n)
         return ("ok", "Output %d disabled. The player is restarting." % n)
@@ -1380,6 +1405,91 @@ def act_password(session, form):
         return ("err", "Could not change the password: %s" % r.stderr.strip())
     log("password changed for %s" % session["user"])
     return ("ok", "Password changed. Use the new password for this page and SSH.")
+
+
+def write_switch(n, stream, source_ip, backup):
+    """Tell the running player to switch output n to another stream (see switch_poll in the player)."""
+    write_atomic("%s/out%d.source" % (RUN_DIR, n),
+                 "stream=%s\nsource_ip=%s\nbackup=%s\n" % (stream, source_ip, backup))
+
+
+API_TOKEN_FILE = "/etc/pindi/api-token"
+
+
+def api_token(create=True):
+    token = read_text(API_TOKEN_FILE).strip()
+    if not token and create:
+        token = secrets.token_urlsafe(24)
+        os.makedirs(os.path.dirname(API_TOKEN_FILE), exist_ok=True)
+        write_atomic(API_TOKEN_FILE, token + "\n", 0o600)
+    return token
+
+
+def api_status():
+    """Machine-readable state, for control systems."""
+    hl, hw = health()
+    outs = []
+    for o in outputs():
+        outs.append({k: o[k] for k in ("n", "connector", "enabled", "state", "target", "source", "video",
+                                        "format", "audio", "latency", "stream", "source_ip", "backup")})
+        outs[-1]["display"] = {"link": o["link"], "mode": o["mode"]}
+    ins = [{"slot": i["slot"], "device": i["id"], "label": i["label"], "enabled": i["enabled"],
+            "name": i["name"] or (default_in_stream(i["slot"]) if i["slot"] else ""), "state": i["state"],
+            "mode": i["live_mode"], "fps": i["fps"], "audio": i["audio"]} for i in inputs()]
+    return {"device": {"name": device_name(), "ndi_name": ndi_host_name(), "serial": SERIAL, "model": MODEL,
+                       "version": version(), "ip": live_network()["address"], "health": hl, "power": hw,
+                       "network": TRAFFIC.text()},
+            "outputs": outs, "inputs": ins, "sources": visible_sources()}
+
+
+def api_post(path, data):
+    """(code, result) for POST /api/v1/..."""
+    m = re.match(r"^/api/v1/outputs/(\d+)/source$", path)
+    if m:
+        n = int(m.group(1))
+        o = next((o for o in outputs() if o["n"] == n), None)
+        if not o:
+            return 404, {"error": "unknown output"}
+        stream = str(data.get("stream", o["stream"])).strip()
+        source_ip = str(data.get("source_ip", o["source_ip"])).strip()
+        backup = str(data.get("backup", o["backup"])).strip()
+        if not valid_name(stream) or not valid_name(backup):
+            return 400, {"error": "invalid stream name"}
+        if source_ip:
+            try:
+                source_ip = str(ipaddress.IPv4Address(source_ip))
+            except ValueError:
+                return 400, {"error": "source_ip must be an IPv4 address or empty"}
+        keys = {"PINDI_OUT%d_STREAM" % n: "" if stream == default_out_stream(n) else stream,
+                "PINDI_OUT%d_SOURCE_IP" % n: source_ip, "PINDI_OUT%d_BACKUP_STREAM" % n: backup}
+        if n == 1:
+            keys.update({"PINDI_STREAM": "", "PINDI_SOURCE_IP": ""})
+        write_env(keys)
+        write_switch(n, keys["PINDI_OUT%d_STREAM" % n], source_ip, backup)
+        log("api: output %d -> %s from %s" % (n, stream or default_out_stream(n), source_ip or "any"))
+        return 200, {"ok": True, "output": n, "stream": stream or default_out_stream(n), "source_ip": source_ip,
+                     "backup": backup}
+    if path == "/api/v1/identify":
+        try:
+            n = int(data.get("output", 0))
+        except (TypeError, ValueError):
+            return 400, {"error": "output must be a number (0 = all)"}
+        kind, msg = act_identify({"n": str(n)})
+        return (200 if kind == "ok" else 404), {"ok": kind == "ok", "message": msg}
+    if path == "/api/v1/restart":
+        later(0.5, restart_media)
+        return 200, {"ok": True}
+    return 404, {"error": "unknown endpoint"}
+
+
+def act_api_token():
+    try:
+        os.remove(API_TOKEN_FILE)
+    except OSError:
+        pass
+    api_token()
+    log("api: new token generated")
+    return ("ok", "A new API token was generated; the old one no longer works.")
 
 
 def act_identify(form):
@@ -1596,6 +1706,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, JS, "application/javascript")
         if path == "/favicon.ico":
             return self.send(404, "")
+        if path.startswith("/api/v1/"):
+            if not self.api_authorised():
+                return self.send(401, json.dumps({"error": "missing or wrong API token"}), "application/json")
+            if path == "/api/v1/status":
+                return self.send(200, json.dumps(api_status(), indent=1), "application/json")
+            return self.send(404, json.dumps({"error": "unknown endpoint"}), "application/json")
         s = self.session()
         if path == "/login":
             return self.redirect("/") if s else self.send(200, login_page())
@@ -1638,8 +1754,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, json.dumps(st), "application/json")
         self.send(404, "Not found", "text/plain")
 
+    def api_authorised(self):
+        """API token as "Authorization: Bearer <token>", "X-API-Key: <token>" or ?token=<token>."""
+        token = api_token()
+        given = self.headers.get("X-API-Key", "")
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            given = auth[7:].strip()
+        if not given:
+            given = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("token", [""])[0]
+        ok = bool(given) and secrets.compare_digest(given, token)
+        if not ok:
+            LOCKOUT.failure(self.client_address[0])
+        return ok and not LOCKOUT.blocked(self.client_address[0])
+
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/api/v1/"):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode("utf-8", "replace") if 0 < length <= 65536 else ""
+            if not self.api_authorised():
+                return self.send(401, json.dumps({"error": "missing or wrong API token"}), "application/json")
+            try:
+                data = json.loads(raw) if raw.strip().startswith("{") else {
+                    k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
+            except ValueError:
+                return self.send(400, json.dumps({"error": "body must be JSON or form data"}), "application/json")
+            code, result = api_post(path, data if isinstance(data, dict) else {})
+            return self.send(code, json.dumps(result), "application/json")
         form = self.form()
         if path == "/login":
             user = form.get("user", "").strip()
@@ -1693,6 +1835,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             s["flash"] = act_reset()
         elif path == "/identify":
             s["flash"] = act_identify(form)
+        elif path == "/api-token":
+            s["flash"] = act_api_token()
         elif path == "/restart":
             log("video restart requested by %s" % s["user"])
             later(0.5, restart_media)
