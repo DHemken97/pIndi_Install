@@ -864,7 +864,8 @@ CSS = """
 font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 20px;
 border-bottom:1px solid var(--line)}header h1{margin:0;font-size:20px;letter-spacing:.5px}
-header h1 span{color:var(--accent)}header .who{color:var(--muted);font-size:13px}
+header h1 span{color:var(--accent)}header h1 small.device{font-size:14px;font-weight:400;
+color:var(--muted);margin-left:8px;letter-spacing:0}header .who{color:var(--muted);font-size:13px}
 main{max-width:860px;margin:0 auto;padding:16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:0 0 16px}
 .card h2{margin:0 0 12px;font-size:16px}
@@ -920,6 +921,11 @@ td:last-child{width:auto;white-space:nowrap}header{flex-wrap:wrap}
 dt{margin-top:6px}dd{margin-bottom:2px}td:nth-child(2){display:none}}
 """
 
+FAVICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" '
+           'fill="#141b23"/><rect x="5" y="8" width="22" height="14" rx="2" fill="none" stroke="#2bb3a3" '
+           'stroke-width="2.5"/><path d="M12 26h8" stroke="#2bb3a3" stroke-width="2.5" stroke-linecap="round"/>'
+           '<path d="M14 12l5 3-5 3z" fill="#2bb3a3"/></svg>')
+
 JS = """
 function sync(){var s=document.getElementById('mode-static');if(!s)return;
 document.getElementById('static-fields').style.display=s.checked?'block':'none';}
@@ -961,11 +967,17 @@ def page(title, body, user=None, csrf=None):
         who = ('<div class="who">%s &middot; <form class="inline" method="post" action="/logout">'
                '<input type="hidden" name="csrf" value="%s"><button class="small secondary">Log out</button>'
                '</form></div>' % (html.escape(user), csrf))
+    # The device name in the tab title and header: with many units open, tabs are told apart.
+    name = device_name()
     return ("<!doctype html><html lang=en><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>%s</title><link rel=stylesheet href=/style.css></head><body>"
-            "<header><h1>Pi<span>NDI</span></h1>%s</header><main>%s</main>"
-            "<script src=/app.js></script></body></html>") % (html.escape(title), who, body)
+            "<title>%s</title><link rel=icon href=/favicon.svg type='image/svg+xml'>"
+            "<link rel=stylesheet href=/style.css></head><body>"
+            "<header><h1>Pi<span>NDI</span> <small class=device>%s</small></h1>%s</header><main>%s</main>"
+            "<script src=/app.js></script></body></html>") % (
+        html.escape("PiNDI · %s" % title if name.lower() == "pindi" else
+                    "%s · %s" % (name, title) if title != "PiNDI" else "%s · PiNDI" % name),
+        "" if name.lower() == "pindi" else html.escape(name), who, body)
 
 
 def esc(v):
@@ -977,8 +989,9 @@ def login_page(error=""):
     body = ('<div class="login card"><h2>Sign in</h2>%s<form method="post" action="/login">'
             '<label>User</label><input type="text" name="user" autocomplete="username" autofocus required>'
             '<label>Password</label><input type="password" name="password" autocomplete="current-password" required>'
-            '<button>Sign in</button><p class="hint">Use the same login as SSH.</p></form></div>' % err)
-    return page("PiNDI - Sign in", body)
+            '<button>Sign in</button><p class="hint">Use the same login as SSH.</p></form>'
+            '<p class="hint">%s &middot; serial %s</p></div>' % (err, esc(device_name()), esc(SERIAL)))
+    return page("Sign in", body)
 
 
 def dashboard(session):
@@ -1875,14 +1888,14 @@ def update_page(session):
     body = ('<section class="card"><nav class="top"><a href="/">&larr; Back</a></nav><h2>Software update</h2>'
             '<p><span data-k="update_state" class="state">%s</span></p><pre class="log" id="update-log">%s</pre>'
             '</section>' % (text[state], esc(read_text(UPDATE_LOG)[-20000:])))
-    return page("PiNDI - Update", body, session["user"], session["csrf"])
+    return page("Update", body, session["user"], session["csrf"])
 
 
 def logs_page(session):
     body = ('<section class="card"><nav class="top"><a href="/">&larr; Back</a><a href="/diagnostics">Download '
             'diagnostics</a></nav><h2>Log (last 400 lines)</h2><pre class="log">%s</pre></section>' %
             esc(journal(400)))
-    return page("PiNDI - Log", body, session["user"], session["csrf"])
+    return page("Log", body, session["user"], session["csrf"])
 
 
 # ---------------------------------------------------------------- HTTP
@@ -1940,8 +1953,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, CSS, "text/css")
         if path == "/app.js":
             return self.send(200, JS, "application/javascript")
-        if path == "/favicon.ico":
-            return self.send(404, "")
+        if path in ("/favicon.svg", "/favicon.ico"):
+            return self.send(200, FAVICON, "image/svg+xml")
         if path.startswith("/api/v1/"):
             if not self.api_authorised():
                 return self.send(401, json.dumps({"error": "missing or wrong API token"}), "application/json")
