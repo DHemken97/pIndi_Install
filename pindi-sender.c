@@ -298,8 +298,9 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
     status(in, "starting", mode_desc, 0, 0, 0);
 
     int cur = 0, timeouts = 0, frames = 0, cam = 0, damaged = 0;
-    int log_cam = 0, log_sent = 0, log_damaged = 0;
-    uint64_t t0 = now_ms(), t_log = t0;
+    int log_cam = 0, log_sent = 0, log_damaged = 0, conns = 0;
+    bool idle = false;
+    uint64_t t0 = now_ms(), t_log = t0, conns_checked = 0;
     /* Share of recent frames the decoder warned about. Warnings usually mean a truncated
      * frame (grey/garbage band = visible flicker), so those are dropped - unless the camera
      * warns on nearly every frame, in which case the warning is a harmless quirk. */
@@ -323,6 +324,21 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
         }
         timeouts = 0;
         cam++;
+        /* The SDK encodes (full and preview stream) even with nobody connected: with no receivers,
+         * skip decoding and sending altogether. That's most of the CPU (and heat) on a Pi 3. */
+        uint64_t tnow = now_ms();
+        if (tnow - conns_checked >= 250) {
+            conns = ndi->send_get_no_connections(send, 0);
+            conns_checked = tnow;
+        }
+        if (!conns) {
+            xioctl(fd, VIDIOC_QBUF, &b);
+            idle = true;
+            goto stats;
+        }
+        if (idle)
+            LOG("input %d: receiver connected, sending", in->n);
+        idle = false;
         const uint8_t *src = cap[b.index].start;
         NDIlib_video_frame_v2_t f = {
             .xres = m.w, .yres = m.h,
@@ -387,11 +403,14 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
             cur ^= 1;
             frames++;
         }
+    stats:;
         uint64_t now = now_ms();
         if (now - t0 >= 2000) {
-            int conns = ndi->send_get_no_connections(send, 0);
             char st[64];
-            snprintf(st, sizeof st, "sending (%d receiver%s)", conns, conns == 1 ? "" : "s");
+            if (conns)
+                snprintf(st, sizeof st, "sending (%d receiver%s)", conns, conns == 1 ? "" : "s");
+            else
+                snprintf(st, sizeof st, "ready (no receivers)");
             double secs = (now - t0) / 1000.0;
             status(in, st, mode_desc, frames / secs, cam / secs, damaged);
             log_cam += cam;
