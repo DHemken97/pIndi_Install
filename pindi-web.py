@@ -583,7 +583,7 @@ def outputs():
         modes = [m for m in read_text("%s/out%d.modes" % (RUN_DIR, n)).split() if re.match(r"^\d+x\d+@\d+\*?$", m)]
         bandwidth = out_setting(env, n, "BANDWIDTH", env.get("PINDI_BANDWIDTH") or "highest").lower()
         fmt = ""
-        if running and st.get("state") == "playing":
+        if running and st.get("state", "").startswith("playing"):
             # Without the HX decoder the SDK can only have negotiated SpeedHQ with the sender.
             fmt = "Full NDI (SpeedHQ)" if not hx else "Full NDI or NDI|HX (the SDK does not report which)"
             if bandwidth == "lowest":
@@ -592,18 +592,19 @@ def outputs():
             "n": n, "connector": parts[1], "link": parts[2], "mode": parts[3] if len(parts) > 3 else "",
             "enabled": out_setting(env, n, "ENABLED", "1") != "0",
             "stream": out_setting(env, n, "STREAM"), "source_ip": out_setting(env, n, "SOURCE_IP"),
+            "backup": out_setting(env, n, "BACKUP_STREAM"),
             "rotate": out_setting(env, n, "ROTATE", "0"), "mirror": out_setting(env, n, "MIRROR", "none"),
             "bandwidth": "lowest" if bandwidth == "lowest" else "highest", "format": fmt,
             "mode_setting": out_setting(env, n, "MODE"),
             "audio_out": out_setting(env, n, "AUDIO", "hdmi").lower(),
             "audio_delay": out_setting(env, n, "AUDIO_DELAY_MS", "80"),
-            "audio": read_text("%s/out%d.audio" % (RUN_DIR, n)).strip() if running and st.get("state") == "playing"
-            else "",
+            "audio": read_text("%s/out%d.audio" % (RUN_DIR, n)).strip()
+            if running and st.get("state", "").startswith("playing") else "",
             "modes": [m.rstrip("*") for m in modes],
             "preferred_mode": next((m.rstrip("*") for m in modes if m.endswith("*")), ""),
             "state": st.get("state", "-"), "target": st.get("target", default_out_stream(n)),
             "source": st.get("source", ""), "video": st.get("video", ""),
-            "latency": latency_text(n) if running and st.get("state") == "playing" else "",
+            "latency": latency_text(n) if running and st.get("state", "").startswith("playing") else "",
         })
     return out
 
@@ -842,7 +843,7 @@ document.getElementById('out'+n).scrollIntoView({behavior:'smooth'});});
 function poll(){fetch('/api/status',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null})
 .then(function(d){if(!d)return;document.querySelectorAll('[data-k]').forEach(function(el){
 var k=el.dataset.k;if(!(k in d))return;var v=d[k];el.textContent=v||'-';
-if(/state$/.test(k))el.className='state'+(v==='playing'||/^sending/.test(v||'')?' playing':'');
+if(/state$/.test(k))el.className='state'+(/^(playing|sending)/.test(v||'')?' playing':'');
 if(k==='power')el.className=v==='OK'?'':'warn';});
 var c=document.getElementById('countdown');if(c&&d.rollback!=null)c.textContent=d.rollback;}).catch(function(){});}
 sync();if(document.querySelector('[data-k]'))setInterval(poll,3000);
@@ -963,7 +964,7 @@ def dashboard(session):
             '<span class="hint block">Measured per frame: from the moment the sender handed '
             'it to NDI until it was on screen. Not included: the camera/capture before the sender and the '
             'monitor&#39;s own processing.</span></dd></dl>' %
-            (k, " playing" if o["state"] == "playing" else "", esc(o["state"]), k, esc(o["target"]),
+            (k, " playing" if o["state"].startswith("playing") else "", esc(o["state"]), k, esc(o["target"]),
              k, esc(o["source"] or "-"), k, esc(o["video"] or "-"), k, esc(o["format"] or "-"),
              k, esc(o["audio"] or "-"),
              k, esc(o["latency"] or "-")))
@@ -977,7 +978,10 @@ def dashboard(session):
             '<div class="row"><div><label>Stream name</label><input type="text" id="stream-%d" name="stream" '
             'value="%s" placeholder="%s" maxlength="200"></div><div><label>Source IP</label>'
             '<input type="text" id="source_ip-%d" name="source_ip" value="%s" placeholder="Any" maxlength="15">'
-            '</div><div><label>Rotation</label><select name="rotate">%s</select></div>'
+            '</div><div><label>Backup stream (optional)</label><input type="text" name="backup" value="%s" '
+            'placeholder="None" maxlength="200"><span class="hint block">Played while the main stream is '
+            'unavailable; it switches back automatically.</span></div>'
+            '<div><label>Rotation</label><select name="rotate">%s</select></div>'
             '<div><label>Mirror</label><select name="mirror">%s</select></div>'
             '<div><label>Receive quality</label><select name="bandwidth">%s</select></div>'
             '<div><label>Display mode</label><select name="display_mode">%s</select></div>'
@@ -995,7 +999,7 @@ def dashboard(session):
             '<button class="secondary" formaction="/identify" name="identify" value="1">Identify</button> '
             '<button class="secondary" name="reset" value="1">Reset to default</button></form></section>' %
             (n, n, esc(o["connector"]), badge, status_rows, hidden, n, " checked" if o["enabled"] else "",
-             n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]),
+             n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]), esc(o["backup"]),
              options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]), options(BANDWIDTHS, o["bandwidth"]),
              options(mode_choices(o), o["mode_setting"]), options(audio_choices(), o["audio_out"]),
              esc(o["audio_delay"]), hx_opt, esc(default_out_stream(n)), n))
@@ -1192,7 +1196,8 @@ def act_output(form):
         return ("err", "Unknown output.")
     if n not in [o["n"] for o in outputs()]:
         return ("err", "Unknown output.")
-    keys = ("ENABLED", "STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "BANDWIDTH", "MODE", "AUDIO", "AUDIO_DELAY_MS")
+    keys = ("ENABLED", "STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "BANDWIDTH", "MODE", "AUDIO", "AUDIO_DELAY_MS",
+            "BACKUP_STREAM")
     updates = {"PINDI_OUT%d_%s" % (n, k): "" for k in keys}
     if n == 1:  # settings from before multi-output support
         updates.update({"PINDI_" + k: "" for k in LEGACY_OUT1})
@@ -1214,7 +1219,8 @@ def act_output(form):
         mode = form.get("display_mode", "")
         if mode and not re.match(r"^\d{3,4}x\d{3,4}@\d{2,3}$", mode):
             return ("err", "Invalid display mode.")
-        if not valid_name(stream):
+        backup = form.get("backup", "").strip()
+        if not valid_name(stream) or not valid_name(backup):
             return ("err", "Invalid stream name.")
         if source_ip:
             try:
@@ -1233,6 +1239,7 @@ def act_output(form):
             "PINDI_OUT%d_MIRROR" % n: "" if mirror == "none" else mirror,
             "PINDI_OUT%d_BANDWIDTH" % n: "" if bandwidth == default_bw else bandwidth,
             "PINDI_OUT%d_MODE" % n: mode,
+            "PINDI_OUT%d_BACKUP_STREAM" % n: backup,
             "PINDI_OUT%d_AUDIO" % n: "" if audio == "hdmi" else audio,
             "PINDI_OUT%d_AUDIO_DELAY_MS" % n: "" if audio_delay == 80 else str(audio_delay),
         })

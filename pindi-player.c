@@ -522,6 +522,7 @@ struct output {
     /* Configuration. */
     bool disabled; /* PINDI_OUT<n>_ENABLED=0: no NDI, HDMI signal off (e.g. encoder-only units) */
     char target[160], alt[160], source_ip[64];
+    char backup[160]; /* PINDI_OUT<n>_BACKUP_STREAM: played while the main stream is unavailable */
     const char *rot_s, *mirror_s;
     const char *audio_s; /* PINDI_OUT<n>_AUDIO: hdmi, analog or off */
     int audio_delay_ms;  /* PINDI_OUT<n>_AUDIO_DELAY_MS: audio buffer = lip-sync delay */
@@ -1332,7 +1333,7 @@ static void status_set(struct output *o, const char *state, const char *source, 
         snprintf(msg, sizeof msg, "Connecting to %s", source);
     else if (!strcmp(state, "connected, no frames"))
         snprintf(msg, sizeof msg, "%s: connected, no video", source);
-    else if (!strcmp(state, "searching") || !strcmp(state, "playing"))
+    else if (!strcmp(state, "searching") || !strncmp(state, "playing", 7))
         snprintf(msg, sizeof msg, "Waiting for NDI stream %s%s", o->target, from);
     else
         msg[0] = 0;
@@ -1641,6 +1642,22 @@ static bool url_has_ip(const char *url, const char *ip)
 
 static uint64_t start_ms;
 
+/* The output's main stream among the visible sources (preferring one that has not just failed). */
+static const NDIlib_source_t *find_primary(struct output *o, const NDIlib_source_t *srcs, uint32_t count,
+                                           const char *failed_src)
+{
+    const NDIlib_source_t *pick = NULL;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!srcs[i].p_ndi_name || !name_matches(srcs[i].p_ndi_name, o->target, o->alt))
+            continue;
+        if (*o->source_ip && !url_has_ip(srcs[i].p_url_address, o->source_ip))
+            continue;
+        if (!pick || !strcmp(pick->p_ndi_name, failed_src))
+            pick = &srcs[i];
+    }
+    return pick;
+}
+
 static void *receiver(void *arg)
 {
     struct output *o = arg;
@@ -1672,7 +1689,8 @@ static void *receiver(void *arg)
     uint64_t last_stats = 0, last_sources = 0;
     uint32_t last_count = UINT32_MAX;
     char cur_src[256] = "", cur_url[128] = "", failed_src[256] = "", last_src[256] = "";
-    bool got_frame = false;
+    bool got_frame = false, on_backup = false;
+    uint64_t search_since = 0, primary_check = 0, splash_at = 0;
 
     while (running) {
         uint64_t now = now_ms();
@@ -1724,6 +1742,13 @@ static void *receiver(void *arg)
         }
 
         if (!recv) {
+            if (!search_since)
+                search_since = now;
+            /* With a backup, the last picture stays up while it takes over (at most 6 s). */
+            if (splash_at && now >= splash_at) {
+                request_splash(o);
+                splash_at = 0;
+            }
             status_set(o, "searching", "", "", "");
             ndi->find_wait_for_sources(find, 250);
             uint32_t count = 0;
@@ -1737,15 +1762,15 @@ static void *receiver(void *arg)
                     LOG("ndi:   ... and %u more", count - 20);
             }
             last_count = count;
-            const NDIlib_source_t *pick = NULL;
-            for (uint32_t i = 0; i < count; i++) {
-                if (!srcs[i].p_ndi_name || !name_matches(srcs[i].p_ndi_name, o->target, o->alt))
-                    continue;
-                if (*o->source_ip && !url_has_ip(srcs[i].p_url_address, o->source_ip))
-                    continue;
-                /* Prefer a match that has not just failed (e.g. stale entry on another host). */
-                if (!pick || !strcmp(pick->p_ndi_name, failed_src))
-                    pick = &srcs[i];
+            const NDIlib_source_t *pick = find_primary(o, srcs, count, failed_src);
+            bool backup = false;
+            /* The main stream gets 3 s to appear before the backup is used. */
+            if (!pick && *o->backup && now - search_since >= 3000) {
+                for (uint32_t i = 0; i < count && !pick; i++)
+                    if (srcs[i].p_ndi_name && name_matches(srcs[i].p_ndi_name, o->backup, "") &&
+                        strcmp(srcs[i].p_ndi_name, failed_src))
+                        pick = &srcs[i];
+                backup = pick != NULL;
             }
             if (pick) {
                 NDIlib_recv_create_v3_t rc = {
@@ -1759,7 +1784,11 @@ static void *receiver(void *arg)
                 snprintf(cur_url, sizeof cur_url, "%s", pick->p_url_address ? pick->p_url_address : "");
                 recv = ndi->recv_create_v3(&rc);
                 if (recv) {
-                    LOG("ndi: output %d: connecting to %s (%s)", o->n, cur_src, cur_url);
+                    LOG("ndi: output %d: connecting to %s (%s)%s", o->n, cur_src, cur_url,
+                        backup ? " - main stream unavailable, using the backup" : "");
+                    on_backup = backup;
+                    search_since = 0;
+                    primary_check = now;
                     if (strcmp(cur_src, last_src))
                         o->au.extra_ms = o->au.logged_rate = 0; /* another sender: start afresh */
                     snprintf(last_src, sizeof last_src, "%s", cur_src);
@@ -1781,6 +1810,23 @@ static void *receiver(void *arg)
             continue;
         }
 
+        /* On the backup: switch back as soon as the main stream is there again. The backup's last
+         * picture stays up until the main stream's first frame. */
+        if (on_backup && now - primary_check >= 2000) {
+            primary_check = now;
+            uint32_t count = 0;
+            const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+            if (find_primary(o, srcs, count, "")) {
+                LOG("ndi: output %d: main stream %s is back, leaving the backup", o->n, o->target);
+                ndi->recv_destroy(recv);
+                recv = NULL;
+                audio_close(o);
+                on_backup = false;
+                splash_at = now + 6000;
+                continue;
+            }
+        }
+
         NDIlib_video_frame_v2_t v;
         NDIlib_audio_frame_v3_t a;
         NDIlib_frame_type_e t = ndi->recv_capture_v3(recv, &v, audio_on ? &a : NULL, NULL, 100);
@@ -1794,7 +1840,8 @@ static void *receiver(void *arg)
             char vid[64];
             snprintf(vid, sizeof vid, "%dx%d %.2f fps", v.xres, v.yres,
                      v.frame_rate_D ? (double)v.frame_rate_N / v.frame_rate_D : 0.0);
-            status_set(o, "playing", cur_src, cur_url, vid);
+            status_set(o, on_backup ? "playing (backup)" : "playing", cur_src, cur_url, vid);
+            splash_at = 0;
             ndi->recv_free_video_v2(recv, &v);
             got_frame = true;
             last_frame = last_alive = now;
@@ -1838,7 +1885,14 @@ static void *receiver(void *arg)
                 snprintf(failed_src, sizeof failed_src, "%s", cur_src);
             ndi->recv_destroy(recv);
             recv = NULL;
-            request_splash(o);
+            if (*o->backup && got_frame) {
+                splash_at = now + 6000; /* hold the picture while the other stream takes over */
+                if (!on_backup)
+                    search_since = now - 3000; /* the main stream just went: no grace period */
+            } else {
+                request_splash(o);
+            }
+            on_backup = false;
             audio_close(o);
             if (audio_on)
                 audio_info(o, "");
@@ -1874,6 +1928,7 @@ static void configure_output(struct output *o)
         }
     }
     snprintf(o->source_ip, sizeof o->source_ip, "%s", ocfg(o->n, "SOURCE_IP", ""));
+    snprintf(o->backup, sizeof o->backup, "%s", ocfg(o->n, "BACKUP_STREAM", ""));
     o->rot_s = ocfg(o->n, "ROTATE", "0");
     o->mirror_s = ocfg(o->n, "MIRROR", "none");
     o->audio_s = ocfg(o->n, "AUDIO", "hdmi");
@@ -1886,8 +1941,8 @@ static void configure_output(struct output *o)
     if (o->disabled)
         LOG("output %d: disabled", o->n);
     else
-        LOG("output %d: looking for NDI stream %s from %s", o->n, o->target,
-            *o->source_ip ? o->source_ip : "any host");
+        LOG("output %d: looking for NDI stream %s from %s%s%s", o->n, o->target,
+            *o->source_ip ? o->source_ip : "any host", *o->backup ? ", backup " : "", o->backup);
 }
 
 /* ------------------------------------------------------------------ preview for the web UI */
