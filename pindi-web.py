@@ -1265,7 +1265,8 @@ def dashboard(session):
         '</label><input type="file" id="restore-file" accept=".json,application/json">'
         '<input type="hidden" name="backup" id="restore-data"><p class="hint">Restores outputs, outgoing '
         'streams, device and NDI settings. Network settings are restored too, with the usual automatic '
-        'rollback.</p><button class="secondary" id="restore-button" disabled>Restore</button></form>'
+        'rollback. A backup from another device is used as a template: this device keeps its own name and '
+        'network settings.</p><button class="secondary" id="restore-button" disabled>Restore</button></form>'
         '<form method="post" action="/update" id="update-form" data-confirm="Install this update? Video '
         'stops and the device reboots when it is done.">%s<label>Software update (PiNDI %s)</label>'
         '<input type="file" id="update-file" accept=".tar.gz,.tgz,application/gzip">'
@@ -1696,13 +1697,25 @@ def act_restore(form):
             return ("err", "The backup contains an invalid setting (%s)." % k)
     if network and not network.startswith("# Written by the PiNDI web interface."):
         return ("err", "The backup contains network settings that were not written by PiNDI.")
+    # A backup from another unit is a template: its name and network settings would clash with that
+    # unit (same IP, same NDI names), so this device keeps its own.
+    other = str(data.get("serial", "")) != SERIAL
+    if other:
+        network = ""
+        ndi = json.loads(json.dumps(ndi))  # copy
+        mine = ndi_settings()["machinename"]
+        sec = ndi.setdefault("ndi", {})
+        if mine:
+            sec["machinename"] = mine
+        else:
+            sec.pop("machinename", None)
     # Replace every PINDI_ setting with the backup's.
     current = {k: "" for k in read_env() if k.startswith("PINDI_")}
     current.update(settings)
     write_env(current)
     os.makedirs(os.path.dirname(NDI_CONFIG), exist_ok=True)
     write_atomic(NDI_CONFIG, json.dumps(ndi, indent=2) + "\n")
-    name = str(data.get("device_name", "")).strip()
+    name = "" if other else str(data.get("device_name", "")).strip()
     if name and valid_name(name):
         try:
             if set_hostname(hostname_for(name)):
@@ -1721,6 +1734,9 @@ def act_restore(form):
         NET.apply(network, "restored settings")
         return ("warn", "Settings restored. The network settings changed as well: open the device at its "
                         "(new) address within %d seconds and press Keep." % ROLLBACK_SECONDS)
+    if other:
+        return ("ok", "Settings from device %s applied. This device kept its own name and network settings. "
+                      "Video and outgoing streams are restarting." % data.get("serial", "?"))
     return ("ok", "Settings restored. Video and outgoing streams are restarting.")
 
 

@@ -1774,7 +1774,17 @@ static void *receiver(void *arg)
         pthread_mutex_lock(&o->lock);
         standby = !usable && o->standby;
         pthread_mutex_unlock(&o->lock);
-        if (standby && find) {
+        if (standby) {
+            if (!find) { /* discovery may have been restarted just before the display went off */
+                NDIlib_find_create_t fc = { .show_local_sources = true, .p_groups = NULL,
+                                            .p_extra_ips = *extra_ips ? extra_ips : NULL };
+                find = ndi->find_create_v2(&fc);
+                find_created = last_match = now;
+                if (!find) {
+                    usleep(1000000);
+                    continue;
+                }
+            }
             if (recv) {
                 ndi->recv_destroy(recv);
                 recv = NULL;
@@ -1783,6 +1793,8 @@ static void *receiver(void *arg)
             status_set(o, "standby (display off)", "", "", "");
             uint32_t count = 0;
             const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+            if (o->n == 1)
+                sources_publish(srcs, count);
             bool found = find_primary(o, srcs, count, "") != NULL;
             for (uint32_t i = 0; i < count && !found && *o->backup; i++)
                 found = srcs[i].p_ndi_name && name_matches(srcs[i].p_ndi_name, o->backup, "");
