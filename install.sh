@@ -1,7 +1,7 @@
 #!/bin/bash
 # Self-heal Windows (CRLF) line endings; this line works even with CRLF. Run as: bash install.sh
 if grep -q $'\r' "$0"; then sed -i 's/\r$//' "$0"; exec bash "$0" "$@"; fi #
-# PiNDI installer for Raspberry Pi OS Lite (Pi 3B, 32 or 64 bit).
+# PiNDI installer for Raspberry Pi OS Lite (Pi 3, 4 and 5; 32 or 64 bit). See README.md.
 #
 #   cd /home/pindi && bash install.sh [--accept-ndi-license] [--skip-upgrade] [--no-reboot]
 #
