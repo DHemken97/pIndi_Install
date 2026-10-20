@@ -859,7 +859,8 @@ LOCKOUT = Lockout()
 
 CSS = """
 :root{--bg:#0b0f14;--card:#141b23;--line:#253140;--text:#e6edf3;--muted:#8b98a5;--accent:#2bb3a3;
---accent2:#1d6f8f;--bad:#e5534b;--ok:#3fb950;--warn:#d29922}
+--accent2:#1d6f8f;--bad:#e5534b;--ok:#3fb950;--warn:#d29922;color-scheme:dark}
+a{color:var(--accent)}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);
 font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 20px;
