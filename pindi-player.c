@@ -537,6 +537,8 @@ struct output {
         char info[160];
         uint64_t in, dropped, xruns, frames; /* samples received / not played, underruns, NDI frames */
         uint64_t max_gap, win_start;            /* longest wait between NDI audio frames (ms) */
+        int extra_ms;                           /* added after underruns (jittery sender), kept per source */
+        int logged_rate;
         snd_pcm_uframes_t win_min, pending_drop; /* lowest queue level in this 2 s window */
     } au;
 
@@ -1463,7 +1465,7 @@ static bool audio_open(struct output *o, int rate)
         /* Keep the level just before each write between target and target + slack (see audio_play). */
         snd_pcm_sw_params_t *sw;
         snd_pcm_sw_params_alloca(&sw);
-        o->au.target = (snd_pcm_uframes_t)rate * target_ms / 1000;
+        o->au.target = (snd_pcm_uframes_t)rate * (target_ms + o->au.extra_ms) / 1000;
         o->au.slack = (snd_pcm_uframes_t)rate * 25 / 1000;
         if (o->au.target + o->au.slack > buffer)
             o->au.target = buffer > o->au.slack ? buffer - o->au.slack : buffer / 2;
@@ -1484,8 +1486,23 @@ static bool audio_open(struct output *o, int rate)
     o->au.pcm = pcm;
     o->au.rate = rate;
     audio_prefill(o);
-    LOG("audio: output %d: %d Hz on %s (%s), %d ms delay", o->n, rate, where, dev, target_ms);
+    if (rate != o->au.logged_rate) /* senders that pause their audio reopen often: log once */
+        LOG("audio: output %d: %d Hz on %s (%s), %d ms delay", o->n, rate, where, dev, target_ms + o->au.extra_ms);
+    o->au.logged_rate = rate;
     return true;
+}
+
+/* An underrun: the sender's audio arrives with more jitter than the delay covers. Add 20 ms
+ * (up to 300 ms extra) for this source; the web UI shows the delay actually used. */
+static void audio_grow(struct output *o)
+{
+    if (o->au.extra_ms >= 300)
+        return;
+    o->au.extra_ms += 20;
+    snd_pcm_uframes_t add = (snd_pcm_uframes_t)o->au.rate * 20 / 1000, buffer, period;
+    if (!snd_pcm_get_params(o->au.pcm, &buffer, &period) && o->au.target + add + o->au.slack <= buffer)
+        o->au.target += add;
+    LOG("audio: output %d: underrun, delay now %d ms", o->n, o->audio_delay_ms + o->au.extra_ms);
 }
 
 /* Play an NDI audio frame (planar float, any channel count) as 16 bit stereo. */
@@ -1505,9 +1522,9 @@ static void audio_play(struct output *o, const NDIlib_audio_frame_v3_t *a)
         audio_close(o);
     if (!o->au.pcm && (now_ms() < o->au.retry_at || !audio_open(o, a->sample_rate)))
         return;
-    audio_info(o, "%g kHz, %d channel%s%s → %s, %d ms delay", a->sample_rate / 1000.0, a->no_channels,
+    audio_info(o, "%g kHz, %d channel%s%s → %s, %d ms delay%s", a->sample_rate / 1000.0, a->no_channels,
                a->no_channels == 1 ? "" : "s", a->no_channels > 2 ? " (first 2 played)" : "", where,
-               o->audio_delay_ms);
+               o->audio_delay_ms + o->au.extra_ms, o->au.extra_ms ? " (raised: the audio arrives unevenly)" : "");
 
     size_t n = (size_t)a->no_samples;
     if (o->au.cap < n * 2) {
@@ -1535,6 +1552,7 @@ static void audio_play(struct output *o, const NDIlib_audio_frame_v3_t *a)
     snd_pcm_uframes_t buffer, period;
     if (avail == -EPIPE || avail == -ESTRPIPE) {
         o->au.xruns++;
+        audio_grow(o);
         snd_pcm_prepare(o->au.pcm);
         audio_prefill(o);
         avail = snd_pcm_avail_update(o->au.pcm);
@@ -1573,8 +1591,10 @@ static void audio_play(struct output *o, const NDIlib_audio_frame_v3_t *a)
             break;
         }
         if (w < 0) {
-            if (w == -EPIPE)
+            if (w == -EPIPE) {
                 o->au.xruns++;
+                audio_grow(o);
+            }
             if (snd_pcm_recover(o->au.pcm, (int)w, 1) < 0) {
                 LOG("audio: output %d: %s, reopening", o->n, snd_strerror((int)w));
                 audio_close(o);
@@ -1651,7 +1671,7 @@ static void *receiver(void *arg)
     uint64_t find_created = 0, last_match = 0, recv_start = 0, last_alive = 0, last_frame = 0;
     uint64_t last_stats = 0, last_sources = 0;
     uint32_t last_count = UINT32_MAX;
-    char cur_src[256] = "", cur_url[128] = "", failed_src[256] = "";
+    char cur_src[256] = "", cur_url[128] = "", failed_src[256] = "", last_src[256] = "";
     bool got_frame = false;
 
     while (running) {
@@ -1711,8 +1731,10 @@ static void *receiver(void *arg)
             sources_publish(srcs, count);
             if (count != last_count && o->n == 1) {
                 LOG("ndi: %u source(s) visible", count);
-                for (uint32_t i = 0; i < count; i++)
+                for (uint32_t i = 0; i < count && i < 20; i++)
                     LOG("ndi:   %s", srcs[i].p_ndi_name);
+                if (count > 20)
+                    LOG("ndi:   ... and %u more", count - 20);
             }
             last_count = count;
             const NDIlib_source_t *pick = NULL;
@@ -1738,6 +1760,9 @@ static void *receiver(void *arg)
                 recv = ndi->recv_create_v3(&rc);
                 if (recv) {
                     LOG("ndi: output %d: connecting to %s (%s)", o->n, cur_src, cur_url);
+                    if (strcmp(cur_src, last_src))
+                        o->au.extra_ms = o->au.logged_rate = 0; /* another sender: start afresh */
+                    snprintf(last_src, sizeof last_src, "%s", cur_src);
                     status_set(o, "connecting", cur_src, cur_url, "");
                     recv_start = now;
                     last_alive = now + 5000; /* grace period for the first connection */
