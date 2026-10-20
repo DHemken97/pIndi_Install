@@ -85,7 +85,8 @@ network has a **Use** button for each.
   output switches back as soon as the main stream returns.
 - **Display standby** switches the HDMI signal off after the chosen time
   without video, so the monitor sleeps. It comes back on when the stream
-  appears.
+  appears. With **HDMI-CEC** ticked, a TV is also sent Standby and Image View
+  On.
 - **Audio:** the first two channels play at the delay you set (80 ms by
   default). If a sender's audio arrives unevenly, the delay grows automatically
   so the sound doesn't drop out.

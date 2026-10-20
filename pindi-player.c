@@ -532,6 +532,7 @@ struct output {
     const char *audio_s; /* PINDI_OUT<n>_AUDIO: hdmi, analog or off */
     int audio_delay_ms;  /* PINDI_OUT<n>_AUDIO_DELAY_MS: audio buffer = lip-sync delay */
     int standby_min;     /* PINDI_OUT<n>_STANDBY_MIN: display off after this long without video (0 = never) */
+    bool cec;            /* PINDI_OUT<n>_CEC=1: also put the TV in standby / wake it over HDMI-CEC */
 
     /* Audio playback (receiver thread only). */
     struct {
@@ -2079,6 +2080,7 @@ static void configure_output(struct output *o)
     o->mirror_s = ocfg(o->n, "MIRROR", "none");
     o->audio_s = ocfg(o->n, "AUDIO", "hdmi");
     o->standby_min = atoi(ocfg(o->n, "STANDBY_MIN", "0"));
+    o->cec = !strcmp(ocfg(o->n, "CEC", "0"), "1");
     o->audio_delay_ms = atoi(ocfg(o->n, "AUDIO_DELAY_MS", "80"));
     if (o->audio_delay_ms < 20)
         o->audio_delay_ms = 20;
@@ -2291,6 +2293,29 @@ static void start_receivers(void)
             outs[i].thr_started = true;
 }
 
+/* HDMI-CEC to the TV on this output's port (cec0 = HDMI-A-1, cec1 = HDMI-A-2), in the background:
+ * cec-ctl first claims a playback-device address, then sends the command. */
+static void cec_send(struct output *o, const char *cmd)
+{
+    if (!o->cec)
+        return;
+    int port = 1;
+    sscanf(o->conn_name, "HDMI-A-%d", &port);
+    char dev[32], line[256];
+    snprintf(dev, sizeof dev, "/dev/cec%d", port > 0 ? port - 1 : 0);
+    if (access(dev, F_OK)) {
+        LOG("cec: output %d: %s not present", o->n, dev);
+        return;
+    }
+    snprintf(line, sizeof line, "cec-ctl -d %s --playback -o PiNDI >/dev/null 2>&1; cec-ctl -d %s --to 0 %s "
+             ">/dev/null 2>&1", dev, dev, cmd);
+    LOG("cec: output %d: %s", o->n, cmd);
+    if (fork() == 0) {
+        execl("/bin/sh", "sh", "-c", line, (char *)NULL);
+        _exit(1);
+    }
+}
+
 /* Display standby: signal off after standby_min minutes of splash; back on when the receiver
  * sees our stream (wake_request) or for Identify. */
 static void standby_service(struct output *o)
@@ -2302,6 +2327,7 @@ static void standby_service(struct output *o)
     if (o->standby) {
         if (wake_req) {
             LOG("display: output %d: waking up from standby", o->n);
+            cec_send(o, "--image-view-on");
             o->standby = false;
             o->enable_retry_at = 0;
             if (!output_enable(o))
@@ -2312,6 +2338,7 @@ static void standby_service(struct output *o)
     if (o->active && o->standby_min > 0 && o->splash_since && !o->identify && o->pending == P_NONE &&
         now_ms() - o->splash_since > (uint64_t)o->standby_min * 60000) {
         LOG("display: output %d: no video for %d min, display off (standby)", o->n, o->standby_min);
+        cec_send(o, "--standby");
         output_disable(o);
         o->standby = true;
         pthread_mutex_lock(&o->lock);

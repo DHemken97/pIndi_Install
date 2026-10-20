@@ -664,6 +664,7 @@ def outputs():
             "stream": out_setting(env, n, "STREAM"), "source_ip": out_setting(env, n, "SOURCE_IP"),
             "backup": out_setting(env, n, "BACKUP_STREAM"),
             "standby": out_setting(env, n, "STANDBY_MIN", "0"),
+            "cec": out_setting(env, n, "CEC", "0") == "1",
             "rotate": out_setting(env, n, "ROTATE", "0"), "mirror": out_setting(env, n, "MIRROR", "none"),
             "bandwidth": "lowest" if bandwidth == "lowest" else "highest", "format": fmt,
             "mode_setting": out_setting(env, n, "MODE"),
@@ -1091,7 +1092,9 @@ def dashboard(session):
             '</select></div>'
             '<div><label>Rotation</label><select name="rotate">%s</select></div>'
             '<div><label>Mirror</label><select name="mirror">%s</select></div>'
-            '<div><label>Display off without video</label><select name="standby">%s</select></div></div>'
+            '<div><label>Display off without video</label><select name="standby">%s</select>'
+            '<label class="check"><input type="checkbox" name="cec" value="1"%s> Also switch the TV off '
+            'and on (HDMI-CEC)</label></div></div>'
             '<p class="hint">180&deg; is for ceiling mounting, mirror for rear projection. With the display '
             'switched off the monitor goes to sleep; it comes back on as soon as the stream appears.</p>'
             '<h3 class="group">Sound</h3><div class="row">'
@@ -1107,7 +1110,7 @@ def dashboard(session):
              n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]), esc(o["backup"]),
              options(BANDWIDTHS, o["bandwidth"]), esc(default_out_stream(n)),
              options(mode_choices(o), o["mode_setting"]), hx_opt,
-             options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]), options(STANDBYS, o["standby"]),
+             options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]), options(STANDBYS, o["standby"]), " checked" if o["cec"] else "",
              options(audio_choices(), o["audio_out"]), esc(o["audio_delay"]), n))
 
     # NDI sources on the network
@@ -1331,7 +1334,7 @@ def act_output(form):
     if n not in [o["n"] for o in outputs()]:
         return ("err", "Unknown output.")
     keys = ("ENABLED", "STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "BANDWIDTH", "MODE", "AUDIO", "AUDIO_DELAY_MS",
-            "BACKUP_STREAM", "STANDBY_MIN")
+            "BACKUP_STREAM", "STANDBY_MIN", "CEC")
     updates = {"PINDI_OUT%d_%s" % (n, k): "" for k in keys}
     if n == 1:  # settings from before multi-output support
         updates.update({"PINDI_" + k: "" for k in LEGACY_OUT1})
@@ -1378,6 +1381,7 @@ def act_output(form):
             "PINDI_OUT%d_MODE" % n: mode,
             "PINDI_OUT%d_BACKUP_STREAM" % n: backup,
             "PINDI_OUT%d_STANDBY_MIN" % n: "" if standby == "0" else standby,
+            "PINDI_OUT%d_CEC" % n: "1" if form.get("cec") == "1" else "",
             "PINDI_OUT%d_AUDIO" % n: "" if audio == "hdmi" else audio,
             "PINDI_OUT%d_AUDIO_DELAY_MS" % n: "" if audio_delay == 80 else str(audio_delay),
         })
