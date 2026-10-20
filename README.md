@@ -20,8 +20,11 @@ or 5 has two HDMI outputs and Gigabit Ethernet.
 
 1. Write Raspberry Pi OS Lite to an SD card with Raspberry Pi Imager. Set a
    user name and password and enable SSH.
-2. Copy this folder to the Pi, for example to `/home/<user>/pindi`.
-3. On the Pi, run:
+2. Download the NDI SDK for Linux from https://ndi.video/sdk/ (it can't be
+   included here) and put `Install_NDI_SDK_v6_Linux.tar.gz` in this folder, or
+   `Install_NDI_Advanced_SDK_v6_Linux.tar.gz` for NDI|HX receive.
+3. Copy this folder to the Pi, for example to `/home/<user>/pindi`.
+4. On the Pi, run:
 
    ```sh
    cd ~/pindi && bash install.sh
@@ -101,11 +104,16 @@ interface shows it **ON AIR** (or "on preview").
 
 ## NDI|HX
 
-The standard NDI SDK used here sends and receives **Full NDI (SpeedHQ)** only.
+The standard NDI SDK sends and receives **Full NDI (SpeedHQ)** only.
 Senders that can do both (e.g. NDI Screen Capture HX) automatically send Full
-NDI to PiNDI. Cameras that only send HX will not show a picture. HX needs the
-NDI Advanced SDK and a vendor licence from NDI; the web interface shows the
-HX options greyed out for that reason.
+NDI to PiNDI. Cameras that only send HX will not show a picture.
+
+To receive HX, put `Install_NDI_Advanced_SDK_v6_Linux.tar.gz` next to
+`install.sh` instead; the installer then also installs FFmpeg's libavcodec,
+which that SDK uses to decode H.264/HEVC. The sender chooses the codec; the
+web interface shows which one a stream uses and how many frames per second
+actually reach the screen. HX is decoded in software: a Pi 3B manages only a
+few frames per second at 1080p60. PiNDI always sends Full NDI.
 
 ## HTTP API
 

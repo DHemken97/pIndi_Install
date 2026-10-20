@@ -1110,6 +1110,9 @@ static void latency_publish(struct output *o, uint64_t now)
                  o->lat.tot_sum / o->lat.tot_n, o->lat.tot_min, o->lat.tot_max);
     if (o->lat.n)
         snprintf(buf + strlen(buf), sizeof buf - strlen(buf), "frames=%d\n", o->lat.n);
+    if (o->lat.n && o->lat.since) /* new video frames that reached the screen per second */
+        snprintf(buf + strlen(buf), sizeof buf - strlen(buf), "fps=%.2f\n",
+                 o->lat.n * 1000.0 / (double)(now - o->lat.since));
     write_file_atomic(path, buf);
     memset(&o->lat, 0, sizeof o->lat);
     o->lat.since = now;

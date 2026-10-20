@@ -420,19 +420,6 @@ def ndi_info():
     return {"version": version[-1] if version else "", "hx_receive": info.get("hx_receive") == "1"}
 
 
-def hx_send_needs():
-    """What sending NDI|HX would take besides the NDI Advanced SDK: a hardware H.264 encoder."""
-    base = "/sys/class/video4linux"
-    try:
-        if any("encode" in read_text(os.path.join(base, d, "name")) for d in os.listdir(base)):
-            return ""
-    except OSError:
-        pass
-    if "Raspberry Pi 5" in read_text("/proc/device-tree/model"):
-        return " and a hardware H.264 encoder (the Pi 5 has none)"
-    return " and the Pi's H.264 encoder driver (bcm2835-codec, not loaded)"
-
-
 def version():
     return read_text(VERSION_FILE).strip() or "unknown"
 
@@ -602,6 +589,12 @@ def set_hostname(name):
     return True
 
 
+def shown_text(n):
+    """Frames per second that actually reached the screen (5 s average, from out<n>.latency)."""
+    fps = read_kv("%s/out%d.latency" % (RUN_DIR, n)).get("fps")
+    return "%.2f fps on screen" % float(fps) if fps else ""
+
+
 def latency_text(n):
     """Human summary of /run/pindi/out<n>.latency (5 s averages of frames that reached the screen)."""
     lat = read_kv("%s/out%d.latency" % (RUN_DIR, n))
@@ -684,6 +677,7 @@ def outputs():
             "state": st.get("state", "-"), "target": st.get("target", default_out_stream(n)),
             "source": st.get("source", ""), "video": st.get("video", ""),
             "latency": latency_text(n) if running and st.get("state", "").startswith("playing") else "",
+            "shown": shown_text(n) if running and st.get("state", "").startswith("playing") else "",
         })
     return out
 
@@ -1081,7 +1075,8 @@ def dashboard(session):
             '<dl><dt>State</dt><dd><span data-k="%sstate" class="state%s">%s</span></dd>'
             '<dt>Looking for</dt><dd data-k="%starget">%s</dd>'
             '<dt>Connected to</dt><dd data-k="%ssource">%s</dd>'
-            '<dt>Video</dt><dd data-k="%svideo">%s</dd>'
+            '<dt>Source</dt><dd data-k="%svideo">%s</dd>'
+            '<dt>Output</dt><dd data-k="%sshown">%s</dd>'
             '<dt>Format</dt><dd data-k="%sformat">%s</dd>'
             '<dt>Audio</dt><dd data-k="%saudio">%s</dd>'
             '<dt>Latency</dt><dd><span data-k="%slatency">%s</span>'
@@ -1089,11 +1084,10 @@ def dashboard(session):
             'it to NDI until it was on screen. Not included: the camera/capture before the sender and the '
             'monitor&#39;s own processing.</span></dd></dl>' %
             (k, " playing" if o["state"].startswith("playing") else "", esc(o["state"]), k, esc(o["target"]),
-             k, esc(o["source"] or "-"), k, esc(o["video"] or "-"), k, esc(o["format"] or "-"),
+             k, esc(o["source"] or "-"), k, esc(o["video"] or "-"), k, esc(o["shown"] or "-"),
+             k, esc(o["format"] or "-"),
              k, esc(o["audio"] or "-"),
              k, esc(o["latency"] or "-")))
-        hx_opt = ('<option disabled>NDI|HX (H.264/HEVC) &ndash; %s</option>' %
-                  ("chosen by the sender" if ndi["hx_receive"] else "needs the NDI Advanced SDK"))
         parts.append(
             '<section class="card" id="out%d"><h2>Output %d &middot; %s %s</h2>%s'
             '<form method="post" action="/output">%s<input type="hidden" name="n" value="%d">'
@@ -1112,8 +1106,6 @@ def dashboard(session):
             'provides, for slow networks.</p>'
             '<h3 class="group">Picture</h3><div class="row">'
             '<div><label>Display mode</label><select name="display_mode">%s</select></div>'
-            '<div><label>Codec</label><select name="codec"><option selected>Full NDI (SpeedHQ)</option>%s'
-            '</select></div>'
             '<div><label>Rotation</label><select name="rotate">%s</select></div>'
             '<div><label>Mirror</label><select name="mirror">%s</select></div>'
             '<div><label>Display off without video</label><select name="standby">%s</select>'
@@ -1133,7 +1125,7 @@ def dashboard(session):
             (n, n, esc(o["connector"]), badge, status_rows, hidden, n, " checked" if o["enabled"] else "",
              n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]), esc(o["backup"]),
              options(BANDWIDTHS, o["bandwidth"]), esc(default_out_stream(n)),
-             options(mode_choices(o), o["mode_setting"]), hx_opt,
+             options(mode_choices(o), o["mode_setting"]),
              options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]), options(STANDBYS, o["standby"]), " checked" if o["cec"] else "",
              options(audio_choices(), o["audio_out"]), esc(o["audio_delay"]), n))
 
@@ -1154,9 +1146,6 @@ def dashboard(session):
     # Outgoing streams (capture devices)
     used = {i["slot"] for i in ins if i["slot"]}
     free_slots = [n for n in range(1, 9) if n not in used]
-    # Sending HX means encoding H.264 ourselves and passing it through the Advanced SDK.
-    hx_send_opt = '<option disabled>NDI|HX (H.264) &ndash; needs the NDI Advanced SDK%s</option>' % esc(
-        hx_send_needs())
     cards = []
     for i in ins:
         slot = i["slot"] or (free_slots.pop(0) if free_slots else 0)
@@ -1188,14 +1177,13 @@ def dashboard(session):
             '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Send this input over NDI</label>'
             '<div class="row"><div><label>NDI stream name</label><input type="text" name="name" value="%s" '
             'placeholder="%s" maxlength="100"></div><div><label>Capture mode</label><select name="mode">%s</select>'
-            '</div><div><label>Codec</label><select name="codec"><option selected>Full NDI (SpeedHQ)</option>'
-            '%s</select></div><div><label>Audio</label><select name="audio">%s</select></div></div>'
+            '</div><div><label>Audio</label><select name="audio">%s</select></div></div>'
             '<button>Save</button> %s</form></div>' %
             (esc(i["label"]), " on" if i["present"] else "", "connected" if i["present"] else "not connected",
              esc(i["id"]), k, " onair" if "ON AIR" in state else " playing" if state.startswith("sending") else "",
              esc(state), live, hidden,
              esc(i["id"]), slot, " checked" if i["enabled"] else "", esc(i["name"]), esc(default_in_stream(slot)),
-             options(cap_choices, i["mode"]), hx_send_opt,
+             options(cap_choices, i["mode"]),
              options([("auto", "From the device (USB audio)"), ("off", "Off")], i["audio_setting"]), remove))
     body = "".join(cards) if cards else (
         '<p class="hint">No capture devices detected. Plug in a USB HDMI capture card and reload this page.</p>')
@@ -2015,7 +2003,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                   "net": TRAFFIC.text()}
             st["health"], st["power"] = health()
             for o in outputs():
-                for k in ("state", "target", "source", "video", "format", "audio", "latency"):
+                for k in ("state", "target", "source", "video", "shown", "format", "audio", "latency"):
                     st["out%d.%s" % (o["n"], k)] = o[k]
             # Status files only: cheap enough to poll (no device enumeration).
             for n, conf in configured_inputs(read_env()).items():
