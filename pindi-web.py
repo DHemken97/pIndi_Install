@@ -670,7 +670,7 @@ def configured_inputs(env):
     """{slot: settings} from PINDI_IN<n>_* keys."""
     slots = {}
     for key, val in env.items():
-        m = re.match(r"^PINDI_IN(\d+)_(DEVICE|ENABLED|NAME|MODE)$", key)
+        m = re.match(r"^PINDI_IN(\d+)_(DEVICE|ENABLED|NAME|MODE|AUDIO)$", key)
         if m:
             slots.setdefault(int(m.group(1)), {})[m.group(2)] = val
     return {n: s for n, s in slots.items() if s.get("DEVICE")}
@@ -686,12 +686,12 @@ def inputs():
         slot = by_dev.pop(d["id"], None)
         s = conf.get(slot, {})
         out.append(dict(d, slot=slot, present=True, enabled=s.get("ENABLED") == "1",
-                        name=s.get("NAME", ""), mode=s.get("MODE", "")))
+                        name=s.get("NAME", ""), mode=s.get("MODE", ""), audio_setting=s.get("AUDIO", "auto")))
     for dev, slot in by_dev.items():
         s = conf[slot]
         out.append({"dev": "", "id": dev, "label": os.path.basename(dev), "modes": [], "slot": slot,
                     "present": False, "enabled": s.get("ENABLED") == "1", "name": s.get("NAME", ""),
-                    "mode": s.get("MODE", "")})
+                    "mode": s.get("MODE", ""), "audio_setting": s.get("AUDIO", "auto")})
     for i in out:
         st = read_kv("%s/in%d.status" % (RUN_DIR, i["slot"])) if i["slot"] else {}
         i["state"] = st.get("state", "") if i["enabled"] else "off"
@@ -699,6 +699,7 @@ def inputs():
         i["fps"] = st.get("fps", "")
         i["cam_fps"] = st.get("cam_fps", "")
         i["damaged"] = st.get("damaged", "0")
+        i["audio"] = st.get("audio", "") if i["enabled"] else ""
     return out
 
 
@@ -999,6 +1000,8 @@ def dashboard(session):
                     live += ", %s damaged frame%s skipped in the last 2 s" % (
                         esc(i["damaged"]), "" if i["damaged"] == "1" else "s")
                 live += ")"
+        if i["audio"]:
+            live += " &middot; audio: %s" % esc(i["audio"])
         k = "in%d." % slot
         remove = ('<button class="secondary" name="remove" value="1">Forget this device</button>'
                   if not i["present"] else "")
@@ -1011,11 +1014,13 @@ def dashboard(session):
             '<div class="row"><div><label>NDI stream name</label><input type="text" name="name" value="%s" '
             'placeholder="%s" maxlength="100"></div><div><label>Capture mode</label><select name="mode">%s</select>'
             '</div><div><label>Codec</label><select name="codec"><option selected>Full NDI (SpeedHQ)</option>'
-            '%s</select></div></div><button>Save</button> %s</form></div>' %
+            '%s</select></div><div><label>Audio</label><select name="audio">%s</select></div></div>'
+            '<button>Save</button> %s</form></div>' %
             (esc(i["label"]), " on" if i["present"] else "", "connected" if i["present"] else "not connected",
              esc(i["id"]), k, " playing" if state.startswith("sending") else "", esc(state), live, hidden,
              esc(i["id"]), slot, " checked" if i["enabled"] else "", esc(i["name"]), esc(default_in_stream(slot)),
-             options(cap_choices, i["mode"]), hx_send_opt, remove))
+             options(cap_choices, i["mode"]), hx_send_opt,
+             options([("auto", "From the device (USB audio)"), ("off", "Off")], i["audio_setting"]), remove))
     body = "".join(cards) if cards else (
         '<p class="hint">No capture devices detected. Plug in a USB HDMI capture card and reload this page.</p>')
     parts.append('<section class="card" id="outgoing"><h2>Configure Outgoing Streams</h2>'
@@ -1221,7 +1226,7 @@ def act_outgoing(form):
         slot = inp["slot"]
     elif not 1 <= slot <= 8 or slot in configured_inputs(read_env()):
         return ("err", "No free slot for another outgoing stream.")
-    keys = ["PINDI_IN%d_%s" % (slot, k) for k in ("ENABLED", "DEVICE", "NAME", "MODE")]
+    keys = ["PINDI_IN%d_%s" % (slot, k) for k in ("ENABLED", "DEVICE", "NAME", "MODE", "AUDIO")]
     if form.get("remove"):
         write_env({k: "" for k in keys})
         msg = "Forgot %s." % inp["label"]
@@ -1233,8 +1238,12 @@ def act_outgoing(form):
         if mode and mode not in dict(inp["modes"]) and mode != inp["mode"]:
             return ("err", "That capture mode is not offered by the device.")
         enabled = form.get("enabled") == "1"
+        audio = form.get("audio", "auto")
+        if audio not in ("auto", "off"):
+            return ("err", "Invalid audio setting.")
         write_env(dict(zip(keys, ["1" if enabled else "0", device,
-                                  "" if name == default_in_stream(slot) else name, mode])))
+                                  "" if name == default_in_stream(slot) else name, mode,
+                                  "" if audio == "auto" else audio])))
         msg = ("%s will be sent as \"%s\"." % (inp["label"], name or default_in_stream(slot))) if enabled \
             else ("%s is not sent." % inp["label"])
     log("outgoing: slot %d %s" % (slot, msg))

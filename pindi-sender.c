@@ -6,14 +6,17 @@
  *   PINDI_IN<n>_DEVICE=/dev/v4l/by-id/...      stable device path
  *   PINDI_IN<n>_NAME=IN_<serial>               NDI stream name (default IN_<serial>[_n])
  *   PINDI_IN<n>_MODE="MJPG 1920x1080@30"       optional, else the best mode up to 1080p30
+ *   PINDI_IN<n>_AUDIO=auto                     the device's own USB audio (default), or off
  *
- * One thread per input: V4L2 capture -> (MJPEG decode straight to YUV) -> NDI send.
+ * One thread per input: V4L2 capture -> (MJPEG decode straight to YUV) -> NDI send,
+ * and one for its audio: ALSA capture (48 kHz stereo) -> NDI send.
  * Status for the web UI in /run/pindi/in<n>.status.
  */
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <poll.h>
 #include <pthread.h>
@@ -32,6 +35,7 @@
 
 #include <linux/videodev2.h>
 #include <turbojpeg.h>
+#include <alsa/asoundlib.h>
 
 #include <dlfcn.h>
 #include <Processing.NDI.Lib.h>
@@ -210,15 +214,29 @@ static bool choose_mode(int fd, const char *want, struct mode *out)
 struct input {
     int n;
     char device[256], name[128], mode_s[64];
-    pthread_t thr;
+    bool audio_on;
+    pthread_t thr, athr;
+    NDIlib_send_instance_t send;
+    pthread_mutex_t lock;
+    char audio[128]; /* audio status line (lock) */
 };
+
+static void set_audio_status(struct input *in, const char *s)
+{
+    pthread_mutex_lock(&in->lock);
+    snprintf(in->audio, sizeof in->audio, "%s", s);
+    pthread_mutex_unlock(&in->lock);
+}
 
 /* fps = frames sent, cam_fps = frames from the device, damaged = frames skipped (last 2 s). */
 static void status(struct input *in, const char *state, const char *mode, double fps, double cam_fps, int damaged)
 {
-    char buf[768], path[64];
-    snprintf(buf, sizeof buf, "state=%s\ndevice=%s\nname=%s\nmode=%s\nfps=%.1f\ncam_fps=%.1f\ndamaged=%d\n", state,
-             in->device, in->name, mode ? mode : "", fps, cam_fps, damaged);
+    char buf[1024], path[64], audio[sizeof in->audio];
+    pthread_mutex_lock(&in->lock);
+    snprintf(audio, sizeof audio, "%s", in->audio);
+    pthread_mutex_unlock(&in->lock);
+    snprintf(buf, sizeof buf, "state=%s\ndevice=%s\nname=%s\nmode=%s\nfps=%.1f\ncam_fps=%.1f\ndamaged=%d\naudio=%s\n",
+             state, in->device, in->name, mode ? mode : "", fps, cam_fps, damaged, audio);
     snprintf(path, sizeof path, RUN_DIR "/in%d.status", in->n);
     write_file_atomic(path, buf);
 }
@@ -443,6 +461,106 @@ out:
         status(in, "device lost, retrying", mode_desc, 0, 0, 0);
 }
 
+/* ------------------------------------------------------------------ audio thread */
+
+/* The ALSA card on the same USB device as the video device, or -1. */
+static int audio_card_for(const char *video_dev)
+{
+    char real[PATH_MAX], sys[PATH_MAX + 64], usb[PATH_MAX];
+    if (!realpath(video_dev, real) || strncmp(real, "/dev/", 5))
+        return -1;
+    snprintf(sys, sizeof sys, "/sys/class/video4linux/%s/device", real + 5);
+    if (!realpath(sys, usb))
+        return -1;
+    char *slash = strrchr(usb, '/'); /* .../1-1.4/1-1.4:1.0 -> .../1-1.4 (the USB device) */
+    if (!slash)
+        return -1;
+    *slash = 0;
+    for (int card = 0; card < 32; card++) {
+        char p[64], dev[PATH_MAX];
+        snprintf(p, sizeof p, "/sys/class/sound/card%d/device", card);
+        if (!realpath(p, dev))
+            continue;
+        size_t n = strlen(usb);
+        if (!strncmp(dev, usb, n) && dev[n] == '/')
+            return card;
+    }
+    return -1;
+}
+
+#define AUDIO_RATE 48000
+#define AUDIO_PERIOD 960 /* 20 ms */
+
+static void *audio_thread(void *arg)
+{
+    struct input *in = arg;
+    int16_t *buf = malloc(AUDIO_PERIOD * 2 * sizeof(int16_t));
+    bool logged_none = false;
+    while (running && buf) {
+        int card = audio_card_for(in->device);
+        if (card < 0) {
+            if (!logged_none)
+                LOG("input %d: no USB audio on this device, sending video only", in->n);
+            logged_none = true;
+            set_audio_status(in, "none (the device has no audio input)");
+            for (int i = 0; i < 50 && running; i++)
+                usleep(100000);
+            continue;
+        }
+        logged_none = false;
+        char dev[32], *name = NULL;
+        snprintf(dev, sizeof dev, "plughw:%d,0", card);
+        snd_card_get_name(card, &name);
+        snd_pcm_t *pcm = NULL;
+        int err = snd_pcm_open(&pcm, dev, SND_PCM_STREAM_CAPTURE, 0);
+        if (!err)
+            err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, AUDIO_RATE, 1,
+                                     100000);
+        if (err) {
+            LOG("input %d: cannot capture audio from %s: %s", in->n, dev, snd_strerror(err));
+            char st[128];
+            snprintf(st, sizeof st, "cannot capture: %s", snd_strerror(err));
+            set_audio_status(in, st);
+            if (pcm)
+                snd_pcm_close(pcm);
+            free(name);
+            for (int i = 0; i < 50 && running; i++)
+                usleep(100000);
+            continue;
+        }
+        LOG("input %d: audio from %s (%s), 48 kHz stereo", in->n, name ? name : "?", dev);
+        char st[128];
+        snprintf(st, sizeof st, "48 kHz stereo from %s", name ? name : dev);
+        set_audio_status(in, st);
+        free(name);
+        while (running) {
+            snd_pcm_sframes_t r = snd_pcm_readi(pcm, buf, AUDIO_PERIOD);
+            if (r == -EPIPE || r == -ESTRPIPE || r == -EINTR) {
+                snd_pcm_recover(pcm, (int)r, 1);
+                continue;
+            }
+            if (r < 0)
+                break; /* device gone: look for it again */
+            /* Nobody listening: read and drop, as for the video. */
+            if (!ndi->send_get_no_connections(in->send, 0))
+                continue;
+            NDIlib_audio_frame_interleaved_16s_t a = {
+                .sample_rate = AUDIO_RATE, .no_channels = 2, .no_samples = (int)r,
+                .timecode = NDIlib_send_timecode_synthesize, .reference_level = 0, .p_data = buf,
+            };
+            ndi->util_send_send_audio_interleaved_16s(in->send, &a);
+        }
+        snd_pcm_close(pcm);
+        if (running) {
+            LOG("input %d: audio device lost", in->n);
+            set_audio_status(in, "device lost, retrying");
+            usleep(1000000);
+        }
+    }
+    free(buf);
+    return NULL;
+}
+
 static void *input_thread(void *arg)
 {
     struct input *in = arg;
@@ -453,11 +571,17 @@ static void *input_thread(void *arg)
         status(in, "cannot create NDI sender", NULL, 0, 0, 0);
         return NULL;
     }
+    in->send = send;
+    bool athr = in->audio_on && !pthread_create(&in->athr, NULL, audio_thread, in);
+    if (!in->audio_on)
+        set_audio_status(in, "off");
     while (running) {
         run_device(in, send);
         for (int i = 0; i < 20 && running; i++)
             usleep(100000);
     }
+    if (athr)
+        pthread_join(in->athr, NULL);
     ndi->send_destroy(send);
     return NULL;
 }
@@ -489,6 +613,8 @@ int main(void)
             snprintf(def, sizeof def, "IN_%s_%d", serial, n);
         snprintf(in->name, sizeof in->name, "%s", icfg(n, "NAME", def));
         snprintf(in->mode_s, sizeof in->mode_s, "%s", icfg(n, "MODE", ""));
+        in->audio_on = strcasecmp(icfg(n, "AUDIO", "auto"), "off") != 0;
+        pthread_mutex_init(&in->lock, NULL);
     }
     if (!nin) {
         LOG("no outgoing streams configured");

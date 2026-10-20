@@ -115,7 +115,7 @@ gcc -O2 -Wall $CPU_FLAGS -pthread -o "$TMP/pindi-player" "$SRC/pindi-player.c" \
     -I/usr/local/include/ndi $(pkg-config --cflags libdrm freetype2) \
     $(pkg-config --libs libdrm freetype2) -ljpeg -lasound -lm -ldl
 gcc -O2 -Wall $CPU_FLAGS -pthread -o "$TMP/pindi-sender" "$SRC/pindi-sender.c" \
-    -I/usr/local/include/ndi -lturbojpeg -lm -ldl
+    -I/usr/local/include/ndi -lturbojpeg -lasound -lm -ldl
 install -m 755 "$TMP/pindi-player" /usr/local/bin/pindi-player
 install -m 755 "$TMP/pindi-sender" /usr/local/bin/pindi-sender
 
