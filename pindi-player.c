@@ -1038,7 +1038,7 @@ static void output_service(struct output *o)
                 ok++;
             }
         if (ok < 2)
-            LOG("video: output %d: cannot display %dx%d - try PINDI_BANDWIDTH=lowest", o->n, o->pw, o->ph);
+            LOG("video: output %d: cannot display %dx%d - try receive quality \"low-bandwidth preview\"", o->n, o->pw, o->ph);
         else
             LOG("video: output %d: %dx%d %.4s", o->n, o->pw, o->ph, (const char *)&o->pfmt);
         pthread_mutex_unlock(&o->lock);
@@ -1258,7 +1258,7 @@ static void *receiver(void *arg)
         status_set(o, "disabled", "", "", "");
         return NULL;
     }
-    const char *bw_s = cfg("PINDI_BANDWIDTH", "highest");
+    const char *bw_s = ocfg(o->n, "BANDWIDTH", cfg("PINDI_BANDWIDTH", "highest"));
     NDIlib_recv_bandwidth_e bandwidth =
         !strcasecmp(bw_s, "lowest") ? NDIlib_recv_bandwidth_lowest : NDIlib_recv_bandwidth_highest;
     /* Many senders (screen capture, static graphics) only send frames on change. */
@@ -1481,6 +1481,15 @@ static bool load_ndi(void)
         LOG("ndi: NDIlib_initialize failed (unsupported CPU?) - splash only");
         return false;
     }
+    /* The standard SDK decodes only Full NDI (SpeedHQ); NDI|HX needs libndihx.so, which it does not
+       ship. Without it, software senders fall back to SpeedHQ and HX-only cameras show no picture. */
+    void *hx = dlopen("libndihx.so", RTLD_LAZY | RTLD_LOCAL);
+    if (hx)
+        dlclose(hx);
+    char buf[256];
+    snprintf(buf, sizeof buf, "version=%s\nhx_receive=%d\n", ndi->version ? ndi->version() : "", hx != NULL);
+    write_file_atomic(RUN_DIR "/ndi", buf);
+    LOG("ndi: %s, NDI|HX decoding %s", ndi->version ? ndi->version() : "?", hx ? "available" : "not available");
     return true;
 }
 
