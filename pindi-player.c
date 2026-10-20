@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,6 +46,8 @@
 #include <xf86drmMode.h>
 
 #include <jpeglib.h>
+
+#include <alsa/asoundlib.h>
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -495,6 +498,22 @@ struct output {
     bool disabled; /* PINDI_OUT<n>_ENABLED=0: no NDI, HDMI signal off (e.g. encoder-only units) */
     char target[160], alt[160], source_ip[64];
     const char *rot_s, *mirror_s;
+    const char *audio_s; /* PINDI_OUT<n>_AUDIO: hdmi, analog or off */
+    int audio_delay_ms;  /* PINDI_OUT<n>_AUDIO_DELAY_MS: audio buffer = lip-sync delay */
+
+    /* Audio playback (receiver thread only). */
+    struct {
+        snd_pcm_t *pcm;
+        int rate;
+        snd_pcm_uframes_t target, slack;
+        uint64_t retry_at, last_frame;
+        int16_t *buf;
+        size_t cap;
+        char info[160];
+        uint64_t in, dropped, xruns, frames; /* samples received / not played, underruns, NDI frames */
+        uint64_t max_gap, win_start;            /* longest wait between NDI audio frames (ms) */
+        snd_pcm_uframes_t win_min, pending_drop; /* lowest queue level in this 2 s window */
+    } au;
 
     /* Latency of frames that reached the screen (main thread), published every 5 s. */
     struct { double pi_sum, pi_min, pi_max, tot_sum, tot_min, tot_max; int n, tot_n; uint64_t since; } lat;
@@ -1281,6 +1300,211 @@ static void sources_publish(const NDIlib_source_t *srcs, uint32_t count)
     pthread_mutex_unlock(&sources_lock);
 }
 
+/* ------------------------------------------------------------------ audio (receiver thread) */
+
+static void audio_info(struct output *o, const char *fmt, ...)
+{
+    char buf[sizeof o->au.info], path[64];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (!strcmp(buf, o->au.info))
+        return;
+    snprintf(o->au.info, sizeof o->au.info, "%s", buf);
+    snprintf(path, sizeof path, RUN_DIR "/out%d.audio", o->n);
+    char line[sizeof buf + 2];
+    snprintf(line, sizeof line, "%s\n", buf);
+    write_file_atomic(path, line);
+}
+
+static void audio_close(struct output *o)
+{
+    if (o->au.pcm) {
+        snd_pcm_drop(o->au.pcm);
+        snd_pcm_close(o->au.pcm);
+        o->au.pcm = NULL;
+    }
+    o->au.rate = 0;
+    o->au.win_start = 0;
+    o->au.pending_drop = 0;
+}
+
+/* ALSA device for this output: its own HDMI port (Pi 4/5: vc4hdmi0/1, Pi 3: vc4hdmi), or the jack. */
+static void audio_device(struct output *o, char *dev, size_t n)
+{
+    if (!strcasecmp(o->audio_s, "analog")) {
+        snprintf(dev, n, "plughw:CARD=Headphones,DEV=0");
+        return;
+    }
+    int port = 0;
+    sscanf(o->conn_name, "HDMI-A-%d", &port);
+    char card[32];
+    snprintf(card, sizeof card, "vc4hdmi%d", port > 0 ? port - 1 : 0);
+    if (snd_card_get_index(card) < 0)
+        snprintf(card, sizeof card, "vc4hdmi");
+    /* "hdmi:" wraps the IEC958 framing the vc4 HDMI audio needs. */
+    snprintf(dev, n, "hdmi:CARD=%s,DEV=0", card);
+}
+
+/* After opening or an underrun: queue the target delay as silence, so frames that arrive
+ * with some jitter (or in large chunks) find audio still playing. */
+static void audio_prefill(struct output *o)
+{
+    static const int16_t zero[2 * 480] = { 0 };
+    snd_pcm_uframes_t left = o->au.target;
+    while (left > 0) {
+        snd_pcm_sframes_t w = snd_pcm_writei(o->au.pcm, zero, left < 480 ? left : 480);
+        if (w <= 0)
+            break;
+        left -= (snd_pcm_uframes_t)w;
+    }
+}
+
+static bool audio_open(struct output *o, int rate)
+{
+    char dev[64];
+    audio_device(o, dev, sizeof dev);
+    const char *where = !strcasecmp(o->audio_s, "analog") ? "headphone jack" : "HDMI";
+    snd_pcm_t *pcm = NULL;
+    snd_pcm_uframes_t buffer = 0, period = 0;
+    int target_ms = o->audio_delay_ms;
+    int err = snd_pcm_open(&pcm, dev, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
+    if (!err)
+        /* Room for the target, the slack and a large NDI audio frame (some senders use 100 ms). */
+        err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, rate, 1,
+                                 (unsigned)(target_ms + 300) * 1000);
+    if (!err)
+        err = snd_pcm_get_params(pcm, &buffer, &period);
+    if (!err) {
+        /* Keep the level just before each write between target and target + slack (see audio_play). */
+        snd_pcm_sw_params_t *sw;
+        snd_pcm_sw_params_alloca(&sw);
+        o->au.target = (snd_pcm_uframes_t)rate * target_ms / 1000;
+        o->au.slack = (snd_pcm_uframes_t)rate * 25 / 1000;
+        if (o->au.target + o->au.slack > buffer)
+            o->au.target = buffer > o->au.slack ? buffer - o->au.slack : buffer / 2;
+        err = snd_pcm_sw_params_current(pcm, sw);
+        if (!err)
+            err = snd_pcm_sw_params_set_start_threshold(pcm, sw, o->au.target);
+        if (!err)
+            err = snd_pcm_sw_params(pcm, sw);
+    }
+    if (err) {
+        if (pcm)
+            snd_pcm_close(pcm);
+        LOG("audio: output %d: cannot play on %s (%s): %s", o->n, where, dev, snd_strerror(err));
+        audio_info(o, "cannot play on the %s: %s", where, snd_strerror(err));
+        o->au.retry_at = now_ms() + 10000;
+        return false;
+    }
+    o->au.pcm = pcm;
+    o->au.rate = rate;
+    audio_prefill(o);
+    LOG("audio: output %d: %d Hz on %s (%s), %d ms delay", o->n, rate, where, dev, target_ms);
+    return true;
+}
+
+/* Play an NDI audio frame (planar float, any channel count) as 16 bit stereo. */
+static void audio_play(struct output *o, const NDIlib_audio_frame_v3_t *a)
+{
+    uint64_t tnow = now_ms();
+    if (o->au.last_frame && tnow - o->au.last_frame > o->au.max_gap && tnow - o->au.last_frame < 5000)
+        o->au.max_gap = tnow - o->au.last_frame;
+    o->au.last_frame = tnow;
+    o->au.frames++;
+    o->au.in += a->no_samples > 0 ? a->no_samples : 0;
+    if (a->FourCC != NDIlib_FourCC_audio_type_FLTP || a->no_samples <= 0 || a->no_channels <= 0 ||
+        a->sample_rate <= 0)
+        return;
+    const char *where = !strcasecmp(o->audio_s, "analog") ? "headphone jack" : "HDMI";
+    if (o->au.pcm && o->au.rate != a->sample_rate)
+        audio_close(o);
+    if (!o->au.pcm && (now_ms() < o->au.retry_at || !audio_open(o, a->sample_rate)))
+        return;
+    audio_info(o, "%g kHz, %d channel%s%s → %s, %d ms delay", a->sample_rate / 1000.0, a->no_channels,
+               a->no_channels == 1 ? "" : "s", a->no_channels > 2 ? " (first 2 played)" : "", where,
+               o->audio_delay_ms);
+
+    size_t n = (size_t)a->no_samples;
+    if (o->au.cap < n * 2) {
+        free(o->au.buf);
+        o->au.cap = n * 2;
+        o->au.buf = malloc(o->au.cap * sizeof(int16_t));
+        if (!o->au.buf) {
+            o->au.cap = 0;
+            return;
+        }
+    }
+    const float *l = (const float *)a->p_data;
+    const float *r = a->no_channels > 1 ? (const float *)(a->p_data + a->channel_stride_in_bytes) : l;
+    for (size_t i = 0; i < n; i++) {
+        float lv = l[i] * 32767.0f, rv = r[i] * 32767.0f;
+        o->au.buf[i * 2] = (int16_t)(lv > 32767.0f ? 32767 : lv < -32768.0f ? -32768 : lv);
+        o->au.buf[i * 2 + 1] = (int16_t)(rv > 32767.0f ? 32767 : rv < -32768.0f ? -32768 : rv);
+    }
+
+    /* Keep the queue just before a write near the target: if it has grown beyond target + slack
+     * (sender clock faster than ours), drop the oldest part of this frame. An underrun restarts
+     * with the target delay of silence. */
+    const int16_t *p = o->au.buf;
+    snd_pcm_sframes_t avail = snd_pcm_avail_update(o->au.pcm);
+    snd_pcm_uframes_t buffer, period;
+    if (avail == -EPIPE || avail == -ESTRPIPE) {
+        o->au.xruns++;
+        snd_pcm_prepare(o->au.pcm);
+        audio_prefill(o);
+        avail = snd_pcm_avail_update(o->au.pcm);
+    }
+    if (avail < 0 || snd_pcm_get_params(o->au.pcm, &buffer, &period)) {
+        LOG("audio: output %d: device error (%s), reopening", o->n, snd_strerror((int)avail));
+        audio_close(o);
+        return;
+    }
+    snd_pcm_uframes_t queued = buffer > (snd_pcm_uframes_t)avail ? buffer - avail : 0;
+    /* Senders deliver audio in bursts; only a queue that stays above target + slack for a whole
+     * 2 s window means their clock runs faster than ours. Then trim the excess. */
+    if (!o->au.win_start || queued < o->au.win_min)
+        o->au.win_min = queued;
+    if (!o->au.win_start)
+        o->au.win_start = tnow;
+    if (tnow - o->au.win_start >= 2000) {
+        if (o->au.win_min > o->au.target + o->au.slack)
+            o->au.pending_drop = o->au.win_min - o->au.target;
+        o->au.win_start = tnow;
+        o->au.win_min = queued;
+    }
+    if (o->au.pending_drop) {
+        size_t drop = o->au.pending_drop;
+        if (drop > n)
+            drop = n;
+        o->au.pending_drop -= drop;
+        p += drop * 2;
+        n -= drop;
+        o->au.dropped += drop;
+    }
+    while (n > 0) {
+        snd_pcm_sframes_t w = snd_pcm_writei(o->au.pcm, p, n);
+        if (w == -EAGAIN) {
+            o->au.dropped += n; /* full: drop the rest */
+            break;
+        }
+        if (w < 0) {
+            if (w == -EPIPE)
+                o->au.xruns++;
+            if (snd_pcm_recover(o->au.pcm, (int)w, 1) < 0) {
+                LOG("audio: output %d: %s, reopening", o->n, snd_strerror((int)w));
+                audio_close(o);
+                return;
+            }
+            audio_prefill(o);
+            continue;
+        }
+        p += w * 2;
+        n -= (size_t)w;
+    }
+}
+
 /* ------------------------------------------------------------------ NDI receiver (one thread per output) */
 
 /* NDI names look like "HOST (STREAM)". Return a pointer into name for STREAM, length in *len. */
@@ -1336,6 +1560,8 @@ static void *receiver(void *arg)
     /* The plane decides the pixel format: YUV straight through if it can, else RGB from the SDK. */
     NDIlib_recv_color_format_e color = (o->has_uyvy || o->has_nv16) ? NDIlib_recv_color_format_UYVY_BGRA
                                                                       : NDIlib_recv_color_format_BGRX_BGRA;
+    bool audio_on = strcasecmp(o->audio_s, "off") != 0;
+    audio_info(o, audio_on ? "" : "off");
 
     NDIlib_find_instance_t find = NULL;
     NDIlib_recv_instance_t recv = NULL;
@@ -1358,6 +1584,9 @@ static void *receiver(void *arg)
                 LOG("ndi: output %d: monitor gone, disconnecting %s", o->n, cur_src);
                 ndi->recv_destroy(recv);
                 recv = NULL;
+                audio_close(o);
+                if (audio_on)
+                    audio_info(o, "");
             }
             status_set(o, "no monitor", "", "", "");
             usleep(300000);
@@ -1445,7 +1674,8 @@ static void *receiver(void *arg)
         }
 
         NDIlib_video_frame_v2_t v;
-        NDIlib_frame_type_e t = ndi->recv_capture_v3(recv, &v, NULL, NULL, 100);
+        NDIlib_audio_frame_v3_t a;
+        NDIlib_frame_type_e t = ndi->recv_capture_v3(recv, &v, audio_on ? &a : NULL, NULL, 100);
         uint64_t recv_us = clock_us(CLOCK_MONOTONIC);
         now = now_ms();
         if (t == NDIlib_frame_type_video) {
@@ -1462,6 +1692,14 @@ static void *receiver(void *arg)
             last_frame = last_alive = now;
             failed_src[0] = 0;
         }
+        if (t == NDIlib_frame_type_audio) {
+            audio_play(o, &a);
+            ndi->recv_free_audio_v3(recv, &a);
+        }
+        if (audio_on && got_frame && now - o->au.last_frame > 3000 && now - recv_start > 3000) {
+            audio_close(o); /* stream without audio, or it stopped */
+            audio_info(o, "no audio in this stream");
+        }
         int conns = ndi->recv_get_no_connections(recv);
         if (conns > 0 && now > last_alive)
             last_alive = now;
@@ -1471,6 +1709,12 @@ static void *receiver(void *arg)
             ndi->recv_get_performance(recv, &total, &dropped);
             LOG("ndi: output %d stats %s: connections %d, video frames %lld received, %lld dropped", o->n,
                 cur_src, conns, (long long)total.video_frames, (long long)dropped.video_frames);
+            if (o->au.frames)
+                LOG("audio: output %d: %llu frames, %llu samples in (%.0f/s), %llu not played, %llu underruns, "
+                    "longest gap %llu ms", o->n, (unsigned long long)o->au.frames, (unsigned long long)o->au.in,
+                    o->au.in * 1000.0 / (now - last_stats + 1), (unsigned long long)o->au.dropped,
+                    (unsigned long long)o->au.xruns, (unsigned long long)o->au.max_gap);
+            o->au.frames = o->au.in = o->au.dropped = o->au.xruns = o->au.max_gap = 0;
             last_stats = now;
         }
 
@@ -1487,10 +1731,14 @@ static void *receiver(void *arg)
             ndi->recv_destroy(recv);
             recv = NULL;
             request_splash(o);
+            audio_close(o);
+            if (audio_on)
+                audio_info(o, "");
         }
     }
     if (recv)
         ndi->recv_destroy(recv);
+    audio_close(o);
     if (find)
         ndi->find_destroy(find);
     return NULL;
@@ -1520,6 +1768,12 @@ static void configure_output(struct output *o)
     snprintf(o->source_ip, sizeof o->source_ip, "%s", ocfg(o->n, "SOURCE_IP", ""));
     o->rot_s = ocfg(o->n, "ROTATE", "0");
     o->mirror_s = ocfg(o->n, "MIRROR", "none");
+    o->audio_s = ocfg(o->n, "AUDIO", "hdmi");
+    o->audio_delay_ms = atoi(ocfg(o->n, "AUDIO_DELAY_MS", "80"));
+    if (o->audio_delay_ms < 20)
+        o->audio_delay_ms = 20;
+    if (o->audio_delay_ms > 1000)
+        o->audio_delay_ms = 1000;
     o->disabled = !strcmp(ocfg(o->n, "ENABLED", "1"), "0");
     if (o->disabled)
         LOG("output %d: disabled", o->n);

@@ -57,7 +57,7 @@ if [ "$UPGRADE" -eq 1 ]; then
 fi
 apt-get "${APT_OPTS[@]}" install --no-install-recommends \
     gcc libc6-dev pkg-config \
-    libdrm-dev libfreetype-dev libjpeg-dev libturbojpeg0-dev \
+    libdrm-dev libfreetype-dev libjpeg-dev libturbojpeg0-dev libasound2-dev \
     v4l-utils \
     fonts-dejavu-core \
     avahi-daemon libavahi-client3 \
@@ -113,7 +113,7 @@ case "$NDI_ARCH" in
 esac
 gcc -O2 -Wall $CPU_FLAGS -pthread -o "$TMP/pindi-player" "$SRC/pindi-player.c" \
     -I/usr/local/include/ndi $(pkg-config --cflags libdrm freetype2) \
-    $(pkg-config --libs libdrm freetype2) -ljpeg -lm -ldl
+    $(pkg-config --libs libdrm freetype2) -ljpeg -lasound -lm -ldl
 gcc -O2 -Wall $CPU_FLAGS -pthread -o "$TMP/pindi-sender" "$SRC/pindi-sender.c" \
     -I/usr/local/include/ndi -lturbojpeg -lm -ldl
 install -m 755 "$TMP/pindi-player" /usr/local/bin/pindi-player

@@ -595,6 +595,10 @@ def outputs():
             "rotate": out_setting(env, n, "ROTATE", "0"), "mirror": out_setting(env, n, "MIRROR", "none"),
             "bandwidth": "lowest" if bandwidth == "lowest" else "highest", "format": fmt,
             "mode_setting": out_setting(env, n, "MODE"),
+            "audio_out": out_setting(env, n, "AUDIO", "hdmi").lower(),
+            "audio_delay": out_setting(env, n, "AUDIO_DELAY_MS", "80"),
+            "audio": read_text("%s/out%d.audio" % (RUN_DIR, n)).strip() if running and st.get("state") == "playing"
+            else "",
             "modes": [m.rstrip("*") for m in modes],
             "preferred_mode": next((m.rstrip("*") for m in modes if m.endswith("*")), ""),
             "state": st.get("state", "-"), "target": st.get("target", default_out_stream(n)),
@@ -755,7 +759,7 @@ main{max-width:860px;margin:0 auto;padding:16px}
 .card h2{margin:0 0 12px;font-size:16px}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:0}dt{color:var(--muted)}dd{margin:0;word-break:break-all}
 label{display:block;margin:10px 0 4px;color:var(--muted);font-size:13px}
-input[type=text],input[type=password],select{width:100%;padding:9px 10px;border-radius:7px;border:1px solid var(--line);
+input[type=text],input[type=password],input[type=number],select{width:100%;padding:9px 10px;border-radius:7px;border:1px solid var(--line);
 background:#0d1319;color:var(--text);font:inherit}
 option:disabled{color:var(--muted)}
 input:focus{outline:2px solid var(--accent2);border-color:var(--accent2)}
@@ -920,12 +924,14 @@ def dashboard(session):
             '<dt>Connected to</dt><dd data-k="%ssource">%s</dd>'
             '<dt>Video</dt><dd data-k="%svideo">%s</dd>'
             '<dt>Format</dt><dd data-k="%sformat">%s</dd>'
+            '<dt>Audio</dt><dd data-k="%saudio">%s</dd>'
             '<dt>Latency</dt><dd><span data-k="%slatency">%s</span>'
             '<span class="hint block">Measured per frame: from the moment the sender handed '
             'it to NDI until it was on screen. Not included: the camera/capture before the sender and the '
             'monitor&#39;s own processing.</span></dd></dl>' %
             (k, " playing" if o["state"] == "playing" else "", esc(o["state"]), k, esc(o["target"]),
              k, esc(o["source"] or "-"), k, esc(o["video"] or "-"), k, esc(o["format"] or "-"),
+             k, esc(o["audio"] or "-"),
              k, esc(o["latency"] or "-")))
         hx_opt = ('<option disabled>NDI|HX (H.264/HEVC) &ndash; %s</option>' %
                   ("chosen by the sender" if ndi["hx_receive"] else "needs the NDI Advanced SDK"))
@@ -941,6 +947,10 @@ def dashboard(session):
             '<div><label>Mirror</label><select name="mirror">%s</select></div>'
             '<div><label>Receive quality</label><select name="bandwidth">%s</select></div>'
             '<div><label>Display mode</label><select name="display_mode">%s</select></div>'
+            '<div><label>Audio output</label><select name="audio">%s</select></div>'
+            '<div><label>Audio delay (ms)</label><input type="number" name="audio_delay" min="20" max="1000" '
+            'step="10" value="%s"><span class="hint block">Lip sync: the picture appears about 25 ms after it '
+            'arrives. Raise it if the sound drops out on a busy network.</span></div>'
             '<div><label>Codec</label><select name="codec"><option selected>Full NDI (SpeedHQ)</option>%s'
             '</select></div></div>'
             '<p class="hint">Empty stream name = %s, empty IP = any host. A source IP is also searched '
@@ -951,7 +961,8 @@ def dashboard(session):
             (n, n, esc(o["connector"]), badge, status_rows, hidden, n, " checked" if o["enabled"] else "",
              n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]),
              options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]), options(BANDWIDTHS, o["bandwidth"]),
-             options(mode_choices(o), o["mode_setting"]), hx_opt, esc(default_out_stream(n)), n))
+             options(mode_choices(o), o["mode_setting"]), options(audio_choices(), o["audio_out"]),
+             esc(o["audio_delay"]), hx_opt, esc(default_out_stream(n)), n))
 
     # NDI sources on the network
     srcs = visible_sources()
@@ -1107,6 +1118,13 @@ BANDWIDTHS = [("highest", "Full quality"), ("lowest", "Low-bandwidth preview")]
 LEGACY_OUT1 = ("STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "MODE")
 
 
+def audio_choices():
+    choices = [("hdmi", "HDMI (this output)")]
+    if "Raspberry Pi 5" not in MODEL and "Raspberry Pi 500" not in MODEL:
+        choices.append(("analog", "Headphone jack"))
+    return choices + [("off", "Off")]
+
+
 def mode_choices(o):
     """[(value, label)] for an output's display mode: automatic plus what the monitor offers."""
     choices = [("", "Automatic (monitor's preferred, up to 1080p)")]
@@ -1132,7 +1150,7 @@ def act_output(form):
         return ("err", "Unknown output.")
     if n not in [o["n"] for o in outputs()]:
         return ("err", "Unknown output.")
-    keys = ("ENABLED", "STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "BANDWIDTH", "MODE")
+    keys = ("ENABLED", "STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "BANDWIDTH", "MODE", "AUDIO", "AUDIO_DELAY_MS")
     updates = {"PINDI_OUT%d_%s" % (n, k): "" for k in keys}
     if n == 1:  # settings from before multi-output support
         updates.update({"PINDI_" + k: "" for k in LEGACY_OUT1})
@@ -1142,6 +1160,15 @@ def act_output(form):
         source_ip = form.get("source_ip", "").strip()
         rotate, mirror = form.get("rotate", "0"), form.get("mirror", "none")
         bandwidth = form.get("bandwidth", "highest")
+        audio = form.get("audio", "hdmi")
+        if audio not in dict(audio_choices()):
+            return ("err", "Invalid audio output.")
+        try:
+            audio_delay = int(form.get("audio_delay") or 80)
+        except ValueError:
+            return ("err", "The audio delay must be a number of milliseconds.")
+        if not 20 <= audio_delay <= 1000:
+            return ("err", "The audio delay must be between 20 and 1000 ms.")
         mode = form.get("display_mode", "")
         if mode and not re.match(r"^\d{3,4}x\d{3,4}@\d{2,3}$", mode):
             return ("err", "Invalid display mode.")
@@ -1164,6 +1191,8 @@ def act_output(form):
             "PINDI_OUT%d_MIRROR" % n: "" if mirror == "none" else mirror,
             "PINDI_OUT%d_BANDWIDTH" % n: "" if bandwidth == default_bw else bandwidth,
             "PINDI_OUT%d_MODE" % n: mode,
+            "PINDI_OUT%d_AUDIO" % n: "" if audio == "hdmi" else audio,
+            "PINDI_OUT%d_AUDIO_DELAY_MS" % n: "" if audio_delay == 80 else str(audio_delay),
         })
     write_env(updates)
     later(0.5, run, "systemctl", "restart", "pindi.service")
@@ -1505,7 +1534,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                   "net": TRAFFIC.text()}
             st["health"], st["power"] = health()
             for o in outputs():
-                for k in ("state", "target", "source", "video", "format", "latency"):
+                for k in ("state", "target", "source", "video", "format", "audio", "latency"):
                     st["out%d.%s" % (o["n"], k)] = o[k]
             # Status files only: cheap enough to poll (no device enumeration).
             for n, conf in configured_inputs(read_env()).items():
