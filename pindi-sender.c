@@ -217,6 +217,8 @@ struct input {
     bool audio_on;
     pthread_t thr, athr;
     NDIlib_send_instance_t send;
+    int w, h, fps_n, fps_d; /* last capture mode, for the black "no signal" frames */
+    uint8_t *black;
     pthread_mutex_t lock;
     char audio[128]; /* audio status line (lock) */
 };
@@ -242,6 +244,31 @@ static void status(struct input *in, const char *state, const char *mode, double
 }
 
 struct capbuf { void *start; size_t len; };
+
+/* No picture from the device (HDMI source unplugged, device lost): send black once a second, so
+ * receivers don't sit on a frozen last frame. Only while someone is connected. */
+static void send_black(struct input *in, NDIlib_send_instance_t send)
+{
+    if (in->w <= 0 || in->h <= 0 || !ndi->send_get_no_connections(send, 0))
+        return;
+    if (!in->black) {
+        size_t n = (size_t)in->w * in->h * 2;
+        in->black = malloc(n);
+        if (!in->black)
+            return;
+        for (size_t i = 0; i < n; i += 2) {
+            in->black[i] = 0x80; /* U/V */
+            in->black[i + 1] = 0x10; /* Y: black */
+        }
+    }
+    NDIlib_video_frame_v2_t f = {
+        .xres = in->w, .yres = in->h, .FourCC = NDIlib_FourCC_video_type_UYVY,
+        .frame_rate_N = in->fps_n, .frame_rate_D = in->fps_d,
+        .frame_format_type = NDIlib_frame_format_type_progressive,
+        .timecode = NDIlib_send_timecode_synthesize, .p_data = in->black, .line_stride_in_bytes = in->w * 2,
+    };
+    ndi->send_send_video_v2(send, &f); /* synchronous: never mixed with the async capture frames */
+}
 
 static void run_device(struct input *in, NDIlib_send_instance_t send)
 {
@@ -281,6 +308,14 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
     }
     snprintf(mode_desc, sizeof mode_desc, "%.4s %dx%d@%.4g", (const char *)&m.fourcc, m.w, m.h,
              (double)m.den / m.num);
+    if (in->w != m.w || in->h != m.h) {
+        free(in->black); /* the black frame is made at the new size when needed */
+        in->black = NULL;
+    }
+    in->w = m.w;
+    in->h = m.h;
+    in->fps_n = (int)m.den;
+    in->fps_d = (int)m.num;
 
     struct v4l2_requestbuffers req = { .count = NCAP, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP };
     if (xioctl(fd, VIDIOC_REQBUFS, &req) || req.count < 2) {
@@ -328,6 +363,8 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
         int r = poll(&p, 1, 1000);
         if (r == 0) {
             status(in, "no signal", mode_desc, 0, 0, 0);
+            ndi->send_send_video_async_v2(send, NULL); /* NDI lets go of our capture frames */
+            send_black(in, send);
             if (++timeouts >= 5)
                 break; /* re-open the device */
             continue;
@@ -463,12 +500,12 @@ out:
 
 /* ------------------------------------------------------------------ audio thread */
 
-/* The ALSA card on the same USB device as the video device, or -1. */
+/* The ALSA card on the same USB device as the video device, -1 if it has none, -2 if the device is gone. */
 static int audio_card_for(const char *video_dev)
 {
     char real[PATH_MAX], sys[PATH_MAX + 64], usb[PATH_MAX];
     if (!realpath(video_dev, real) || strncmp(real, "/dev/", 5))
-        return -1;
+        return -2;
     snprintf(sys, sizeof sys, "/sys/class/video4linux/%s/device", real + 5);
     if (!realpath(sys, usb))
         return -1;
@@ -498,6 +535,12 @@ static void *audio_thread(void *arg)
     bool logged_none = false;
     while (running && buf) {
         int card = audio_card_for(in->device);
+        if (card == -2) {
+            set_audio_status(in, "waiting for the device");
+            for (int i = 0; i < 20 && running; i++)
+                usleep(100000);
+            continue;
+        }
         if (card < 0) {
             if (!logged_none)
                 LOG("input %d: no USB audio on this device, sending video only", in->n);
@@ -577,9 +620,13 @@ static void *input_thread(void *arg)
         set_audio_status(in, "off");
     while (running) {
         run_device(in, send);
-        for (int i = 0; i < 20 && running; i++)
+        for (int i = 0; i < 20 && running; i++) {
+            if (i % 10 == 0)
+                send_black(in, send);
             usleep(100000);
+        }
     }
+    free(in->black);
     if (athr)
         pthread_join(in->athr, NULL);
     ndi->send_destroy(send);

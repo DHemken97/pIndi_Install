@@ -501,6 +501,7 @@ struct output {
     int pending; /* P_*: a commit is in flight */
     uint64_t rotation;
     bool rot_logged, commit_logged, mode_failed;
+    uint64_t enable_retry_at;
 
     /* Shared with the receiver thread (lock). */
     pthread_mutex_t lock;
@@ -518,6 +519,7 @@ struct output {
     int ready, queued, scanout;
     char splash_msg[192]; /* what the receiver is doing, shown on the splash */
     bool thumb_reading;   /* the preview thread is reading a buffer: don't free any */
+    bool cant_display;    /* no buffers for the current frame size (pw x ph) */
 
     /* Configuration. */
     bool disabled; /* PINDI_OUT<n>_ENABLED=0: no NDI, HDMI signal off (e.g. encoder-only units) */
@@ -1163,10 +1165,19 @@ static void output_service(struct output *o)
                 o->vstate[b] = B_FREE;
                 ok++;
             }
-        if (ok < 2)
-            LOG("video: output %d: cannot display %dx%d - try receive quality \"low-bandwidth preview\"", o->n, o->pw, o->ph);
-        else
+        o->cant_display = ok < 2; /* one buffer would freeze on the first frame: treat as failure */
+        if (o->cant_display) {
+            LOG("video: output %d: cannot display %dx%d (not enough video memory) - try receive quality "
+                "\"low-bandwidth preview\"", o->n, o->pw, o->ph);
+            int w = o->pw, h = o->ph;
+            uint32_t f = o->pfmt;
+            pool_free(o);
+            o->pw = w; /* remembered, so frames of this size are refused instead of retried */
+            o->ph = h;
+            o->pfmt = f;
+        } else {
             LOG("video: output %d: %dx%d %.4s", o->n, o->pw, o->ph, (const char *)&o->pfmt);
+        }
         pthread_mutex_unlock(&o->lock);
         return;
     }
@@ -1220,7 +1231,7 @@ static void output_service(struct output *o)
 }
 
 /* Receiver thread: hand a frame to the display. Drops it if no buffer is free. */
-static void post_frame(struct output *o, const NDIlib_video_frame_v2_t *v, uint64_t recv_us)
+static bool post_frame(struct output *o, const NDIlib_video_frame_v2_t *v, uint64_t recv_us)
 {
     uint32_t fmt;
     switch (v->FourCC) {
@@ -1234,13 +1245,17 @@ static void post_frame(struct output *o, const NDIlib_video_frame_v2_t *v, uint6
     case NDIlib_FourCC_video_type_RGBX:
         fmt = DRM_FORMAT_XBGR8888; break;
     default:
-        return;
+        return true;
     }
 
     pthread_mutex_lock(&o->lock);
     if (!o->usable) {
         pthread_mutex_unlock(&o->lock);
-        return;
+        return true;
+    }
+    if (o->cant_display && o->pw == v->xres && o->ph == v->yres && o->pfmt == fmt) {
+        pthread_mutex_unlock(&o->lock);
+        return false;
     }
     if (o->pw != v->xres || o->ph != v->yres || o->pfmt != fmt) {
         if (!o->want_realloc || o->ww != v->xres || o->wh != v->yres || o->wfmt != fmt) {
@@ -1252,7 +1267,7 @@ static void post_frame(struct output *o, const NDIlib_video_frame_v2_t *v, uint6
         }
         pthread_mutex_unlock(&o->lock);
         wake();
-        return;
+        return true;
     }
     int idx = -1;
     for (int b = 0; b < NBUF && idx < 0; b++)
@@ -1264,7 +1279,7 @@ static void post_frame(struct output *o, const NDIlib_video_frame_v2_t *v, uint6
     }
     if (idx < 0) {
         pthread_mutex_unlock(&o->lock);
-        return;
+        return true;
     }
     o->vstate[idx] = B_WRITING;
     o->want_splash = false;
@@ -1292,6 +1307,7 @@ static void post_frame(struct output *o, const NDIlib_video_frame_v2_t *v, uint6
     }
     pthread_mutex_unlock(&o->lock);
     wake();
+    return true;
 }
 
 static void request_splash(struct output *o)
@@ -1334,6 +1350,9 @@ static void status_set(struct output *o, const char *state, const char *source, 
         snprintf(msg, sizeof msg, "Connecting to %s", source);
     else if (!strcmp(state, "connected, no frames"))
         snprintf(msg, sizeof msg, "%s: connected, no video", source);
+    else if (!strncmp(state, "cannot display", 14))
+        snprintf(msg, sizeof msg, "%s: %s is too big for this device - use the low-bandwidth preview", source,
+                 video);
     else if (!strcmp(state, "searching") || !strncmp(state, "playing", 7))
         snprintf(msg, sizeof msg, "Waiting for NDI stream %s%s", o->target, from);
     else
@@ -1905,11 +1924,12 @@ static void *receiver(void *arg)
             if (!got_frame)
                 LOG("ndi: output %d: first frame after %llu ms (%dx%d)", o->n,
                     (unsigned long long)(now - recv_start), v.xres, v.yres);
-            post_frame(o, &v, recv_us);
+            bool shown = post_frame(o, &v, recv_us);
             char vid[64];
             snprintf(vid, sizeof vid, "%dx%d %.2f fps", v.xres, v.yres,
                      v.frame_rate_D ? (double)v.frame_rate_N / v.frame_rate_D : 0.0);
-            status_set(o, on_backup ? "playing (backup)" : "playing", cur_src, cur_url, vid);
+            status_set(o, !shown ? "cannot display (too big)" : on_backup ? "playing (backup)" : "playing", cur_src,
+                       cur_url, vid);
             splash_at = 0;
             ndi->recv_free_video_v2(recv, &v);
             got_frame = true;
@@ -2233,7 +2253,9 @@ static void hotplug_poll(void)
         bool connected = c && c->connection == DRM_MODE_CONNECTED;
         drmModeFreeConnector(c);
         if (connected && !o->active) {
-            output_enable(o);
+            /* A monitor that can't be set up (bad EDID, unsupported mode): retry every 5 s, not every second. */
+            if (now_ms() >= o->enable_retry_at && !output_enable(o))
+                o->enable_retry_at = now_ms() + 5000;
         } else if (!connected && o->active) {
             LOG("display: output %d: monitor disconnected", o->n);
             output_disable(o);

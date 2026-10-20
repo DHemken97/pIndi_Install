@@ -518,6 +518,51 @@ def write_ndi_settings(discovery, send_groups, recv_groups, machinename):
     write_atomic(NDI_CONFIG, json.dumps(cfg, indent=2) + "\n")
 
 
+_tz_cache = []
+
+
+def timezones():
+    if not _tz_cache:
+        _tz_cache.extend(run("timedatectl", "list-timezones").stdout.split() or ["UTC"])
+    return _tz_cache
+
+
+def current_timezone():
+    return run("timedatectl", "show", "-p", "Timezone", "--value").stdout.strip() or "UTC"
+
+
+REBOOT_TIMER = "/etc/systemd/system/pindi-reboot.timer"
+REBOOT_SERVICE = "/etc/systemd/system/pindi-reboot.service"
+
+
+def reboot_time():
+    """"HH:MM" of the scheduled daily reboot, or ""."""
+    m = re.search(r"^OnCalendar=\*-\*-\* (\d\d:\d\d):00$", read_text(REBOOT_TIMER), re.M)
+    return m.group(1) if m else ""
+
+
+def set_reboot_time(hhmm):
+    if hhmm == reboot_time():
+        return
+    if not hhmm:
+        run("systemctl", "disable", "--now", "pindi-reboot.timer")
+        for f in (REBOOT_TIMER, REBOOT_SERVICE):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        run("systemctl", "daemon-reload")
+        log("daily reboot: off")
+        return
+    write_atomic(REBOOT_SERVICE, "[Unit]\nDescription=PiNDI scheduled daily reboot\n\n[Service]\nType=oneshot\n"
+                                 "ExecStart=/usr/bin/systemctl reboot\n")
+    write_atomic(REBOOT_TIMER, "[Unit]\nDescription=PiNDI scheduled daily reboot\n\n[Timer]\n"
+                               "OnCalendar=*-*-* %s:00\n\n[Install]\nWantedBy=timers.target\n" % hhmm)
+    run("systemctl", "daemon-reload")
+    run("systemctl", "enable", "--now", "pindi-reboot.timer")
+    log("daily reboot: %s" % hhmm)
+
+
 def device_name():
     return ndi_settings()["machinename"] or socket.gethostname()
 
@@ -798,7 +843,7 @@ main{max-width:860px;margin:0 auto;padding:16px}
 .card h2{margin:0 0 12px;font-size:16px}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:0}dt{color:var(--muted)}dd{margin:0;word-break:break-all}
 label{display:block;margin:10px 0 4px;color:var(--muted);font-size:13px}
-input[type=text],input[type=password],input[type=number],select{width:100%;padding:9px 10px;border-radius:7px;border:1px solid var(--line);
+input[type=text],input[type=password],input[type=number],input[type=time],select{width:100%;padding:9px 10px;border-radius:7px;border:1px solid var(--line);
 background:#0d1319;color:var(--text);font:inherit}
 option:disabled{color:var(--muted)}
 input:focus{outline:2px solid var(--accent2);border-color:var(--accent2)}
@@ -1108,6 +1153,10 @@ def dashboard(session):
         'placeholder="Public" maxlength="200"></div>'
         '<div><label>NDI groups to send to</label><input type="text" name="send_groups" value="%s" '
         'placeholder="Public" maxlength="200"></div></div>'
+        '<div class="row"><div><label>Time zone</label><select name="timezone">%s</select></div>'
+        '<div><label>Reboot every day at (optional)</label><input type="time" name="reboot_at" value="%s">'
+        '<span class="hint block">Empty = never. A daily reboot clears any slow build-up on '
+        'installations that run for months.</span></div></div>'
         '<label class="check"><input type="checkbox" name="splash_info" value="1"%s> Show IP address, serial '
         'and status on the splash screen</label>'
         '<label class="check"><input type="checkbox" name="frame_timeout" value="1"%s> Show the splash when a '
@@ -1123,7 +1172,8 @@ def dashboard(session):
         '</dl><form method="post" action="/api-token" data-confirm="Generate a new API token? The current one '
         'stops working.">%s<button class="secondary">New token</button></form></section>' %
         (hidden, esc(device_name()), esc(socket.gethostname()), esc(ns["discovery"]), esc(ns["recv_groups"]),
-         esc(ns["send_groups"]), "" if env.get("PINDI_SPLASH_INFO") == "0" else " checked",
+         esc(ns["send_groups"]), options([(z, esc(z)) for z in timezones()], current_timezone()),
+         esc(reboot_time()), "" if env.get("PINDI_SPLASH_INFO") == "0" else " checked",
          " checked" if (env.get("PINDI_FRAME_TIMEOUT_MS") or "0") not in ("", "0") else "",
          esc(api_token()), hidden))
 
@@ -1530,6 +1580,17 @@ def act_device(form):
             if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$", s):
                 return ("err", "%s is not a valid %s." % (s, "server address" if key == "discovery" else "group name"))
         lists[key] = ",".join(items)
+    tz = form.get("timezone", "")
+    if tz and tz not in timezones():
+        return ("err", "Unknown time zone.")
+    reboot_at = form.get("reboot_at", "")
+    if reboot_at and not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", reboot_at):
+        return ("err", "The daily reboot time must look like 04:30.")
+
+    # Everything is valid: apply. Video restarts only if something it uses changed.
+    media_keys = ("PINDI_SPLASH_INFO", "PINDI_FRAME_TIMEOUT_MS")
+    env = read_env()
+    before = (ndi_settings(), [env.get(k, "") for k in media_keys])
     host = hostname_for(name)
     try:
         renamed = set_hostname(host)
@@ -1539,10 +1600,18 @@ def act_device(form):
     # else ("Lobby left") also becomes the NDI machine name, so sources show it exactly as typed.
     write_ndi_settings(lists["discovery"], lists["send_groups"], lists["recv_groups"],
                        "" if name == host else name)
+    if tz and tz != current_timezone():
+        run("timedatectl", "set-timezone", tz)
+        log("time zone: %s" % tz)
+    set_reboot_time(reboot_at)
     write_env({"PINDI_SPLASH_INFO": "" if form.get("splash_info") == "1" else "0",
                "PINDI_FRAME_TIMEOUT_MS": "10000" if form.get("frame_timeout") == "1" else ""})
+    env = read_env()
+    restart = renamed or before != (ndi_settings(), [env.get(k, "") for k in media_keys])
     log("device settings: name=%s host=%s discovery=%s recv=%s send=%s" % (
         name, host, lists["discovery"] or "-", lists["recv_groups"] or "-", lists["send_groups"] or "-"))
+    if not restart:
+        return ("ok", "Device settings saved.")
 
     def apply():
         if renamed:
@@ -1559,7 +1628,8 @@ def backup_json():
     return json.dumps({"format": BACKUP_FORMAT, "version": version(), "serial": SERIAL,
                        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "device_name": device_name(),
                        "settings": {k: v for k, v in read_env().items() if k.startswith("PINDI_")},
-                       "ndi": read_ndi_config(), "network": read_text(NETWORK_FILE)}, indent=2) + "\n"
+                       "ndi": read_ndi_config(), "network": read_text(NETWORK_FILE),
+                       "timezone": current_timezone(), "reboot_at": reboot_time()}, indent=2) + "\n"
 
 
 def act_restore(form):
@@ -1588,6 +1658,12 @@ def act_restore(form):
                 later(0.3, run, "systemctl", "restart", "avahi-daemon.service")
         except RuntimeError:
             pass
+    tz = str(data.get("timezone", ""))
+    if tz and tz in timezones() and tz != current_timezone():
+        run("timedatectl", "set-timezone", tz)
+    reboot_at = str(data.get("reboot_at", ""))
+    if re.match(r"^(([01]\d|2[0-3]):[0-5]\d)?$", reboot_at):
+        set_reboot_time(reboot_at)
     later(0.5, restart_media)
     log("settings restored from backup of %s (%s)" % (data.get("serial", "?"), data.get("created", "?")))
     if network and network != read_text(NETWORK_FILE):
