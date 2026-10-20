@@ -622,10 +622,21 @@ def latency_text(n):
     return text
 
 
+_player = {"t": 0, "ok": False}
+
+
+def player_running():
+    """systemctl is-active pindi, cached for 2 s (the status poll asks for it every 3 s per browser)."""
+    if time.time() - _player["t"] > 2:
+        _player["ok"] = run("systemctl", "is-active", "pindi.service").stdout.strip() == "active"
+        _player["t"] = time.time()
+    return _player["ok"]
+
+
 def outputs():
     """Display outputs as detected by the player, with their settings and live status."""
     env = read_env()
-    running = run("systemctl", "is-active", "pindi.service").stdout.strip() == "active"
+    running = player_running()
     hx = ndi_info()["hx_receive"]
     out = []
     for line in read_text(RUN_DIR + "/outputs").splitlines():
