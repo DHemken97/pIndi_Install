@@ -102,6 +102,19 @@ the HDMI source is unplugged), receivers get black instead of a frozen frame.
 When a switcher (vMix, TriCaster, ...) has the stream on program, the web
 interface shows it **ON AIR** (or "on preview").
 
+MJPEG from capture cards is decoded on two CPU cores (three with NDI|HX), so
+1080p60 cards deliver their full frame rate. An output showing one of the
+device's own inputs takes the picture and sound straight from it, without NDI
+encoding and decoding (the status says "Direct from the capture input"); NDI
+is then only encoded while another device receives the stream.
+
+**Sending and showing at the same time on a Pi 3B** shares four slow cores,
+one memory bus and one video unit. Measured with a 1080p60 capture card:
+showing Full NDI 1080p60 leaves the outgoing stream about 10 fps; with NDI|HX
+in both directions (hardware decoding and encoding) the display gets about
+33 fps and the outgoing stream about 19 fps. A Pi 4 (faster cores, Ethernet
+not on USB) should have far more headroom; not measured yet.
+
 ## NDI|HX
 
 The standard NDI SDK sends and receives **Full NDI (SpeedHQ)** only.
@@ -115,8 +128,13 @@ web interface shows which one a stream uses and how many frames per second
 actually reach the screen. On a Pi 3 or 4, H.264 HX is decoded by the Pi's
 hardware decoder (1080p60 on a Pi 3B). HEVC HX, and everything on a Pi 5
 (which has no H.264 decoder), is decoded in software by the NDI library, which
-manages only a few frames per second at 1080p on a Pi 3. PiNDI always sends
-Full NDI.
+manages only a few frames per second at 1080p on a Pi 3.
+
+With the Advanced SDK on a Pi 3 or 4, an outgoing stream can also be sent as
+**NDI|HX** (Codec under Outgoing streams): the Pi's hardware encoder makes
+the H.264, so sending costs almost no CPU and a tenth of the bandwidth
+(about 16 Mbit/s at 1080p60). Receivers need NDI|HX support (NDI Tools, vMix,
+OBS and most NDI software have it).
 
 ## HTTP API
 

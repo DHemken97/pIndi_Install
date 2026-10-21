@@ -1253,6 +1253,67 @@ static void output_service(struct output *o)
     pthread_mutex_unlock(&o->lock);
 }
 
+/* Receiver thread: a free video buffer of w x h fmt to write a frame into (state B_WRITING), or -1:
+ * none free (drop the frame), a new buffer pool was requested, or no display. *too_big: frames
+ * of this size can't be shown (not enough video memory). */
+static int frame_begin(struct output *o, int w, int h, uint32_t fmt, bool *too_big)
+{
+    *too_big = false;
+    pthread_mutex_lock(&o->lock);
+    if (!o->usable) {
+        pthread_mutex_unlock(&o->lock);
+        return -1;
+    }
+    if (o->cant_display && o->pw == w && o->ph == h && o->pfmt == fmt) {
+        pthread_mutex_unlock(&o->lock);
+        *too_big = true;
+        return -1;
+    }
+    if (o->pw != w || o->ph != h || o->pfmt != fmt) {
+        if (!o->want_realloc || o->ww != w || o->wh != h || o->wfmt != fmt) {
+            o->ww = w;
+            o->wh = h;
+            o->wfmt = fmt;
+            o->want_realloc = true;
+            o->want_splash = false;
+        }
+        pthread_mutex_unlock(&o->lock);
+        wake();
+        return -1;
+    }
+    int idx = -1;
+    for (int b = 0; b < NBUF && idx < 0; b++)
+        if (o->vstate[b] == B_FREE)
+            idx = b;
+    if (idx < 0 && o->ready >= 0) { /* replace the not-yet-shown frame with this newer one */
+        idx = o->ready;
+        o->ready = -1;
+    }
+    if (idx >= 0) {
+        o->vstate[idx] = B_WRITING;
+        o->want_splash = false;
+    }
+    pthread_mutex_unlock(&o->lock);
+    return idx;
+}
+
+/* The frame in buffer idx is complete: next on screen. sent: NDI timestamp (100 ns UTC) or INT64_MAX. */
+static void frame_end(struct output *o, int idx, double aspect, int64_t sent, uint64_t recv_us)
+{
+    pthread_mutex_lock(&o->lock);
+    if (o->vstate[idx] == B_WRITING) {
+        if (o->ready >= 0)
+            o->vstate[o->ready] = B_FREE;
+        o->ready = idx;
+        o->vstate[idx] = B_READY;
+        o->vaspect[idx] = aspect;
+        o->vsent[idx] = sent;
+        o->vrecv[idx] = recv_us;
+    }
+    pthread_mutex_unlock(&o->lock);
+    wake();
+}
+
 /* Receiver thread: hand a frame to the display. Drops it if no buffer is free. */
 static bool post_frame(struct output *o, const NDIlib_video_frame_v2_t *v, uint64_t recv_us)
 {
@@ -1270,45 +1331,11 @@ static bool post_frame(struct output *o, const NDIlib_video_frame_v2_t *v, uint6
     default:
         return true;
     }
-
-    pthread_mutex_lock(&o->lock);
-    if (!o->usable) {
-        pthread_mutex_unlock(&o->lock);
-        return true;
-    }
-    if (o->cant_display && o->pw == v->xres && o->ph == v->yres && o->pfmt == fmt) {
-        pthread_mutex_unlock(&o->lock);
-        return false;
-    }
-    if (o->pw != v->xres || o->ph != v->yres || o->pfmt != fmt) {
-        if (!o->want_realloc || o->ww != v->xres || o->wh != v->yres || o->wfmt != fmt) {
-            o->ww = v->xres;
-            o->wh = v->yres;
-            o->wfmt = fmt;
-            o->want_realloc = true;
-            o->want_splash = false;
-        }
-        pthread_mutex_unlock(&o->lock);
-        wake();
-        return true;
-    }
-    int idx = -1;
-    for (int b = 0; b < NBUF && idx < 0; b++)
-        if (o->vstate[b] == B_FREE)
-            idx = b;
-    if (idx < 0 && o->ready >= 0) { /* replace the not-yet-shown frame with this newer one */
-        idx = o->ready;
-        o->ready = -1;
-    }
-    if (idx < 0) {
-        pthread_mutex_unlock(&o->lock);
-        return true;
-    }
-    o->vstate[idx] = B_WRITING;
-    o->want_splash = false;
+    bool too_big;
+    int idx = frame_begin(o, v->xres, v->yres, fmt, &too_big);
+    if (idx < 0)
+        return !too_big;
     struct buf *b = &o->vid[idx];
-    pthread_mutex_unlock(&o->lock);
-
     for (int y = 0; y < v->yres; y++) {
         const uint8_t *src = v->p_data + (size_t)y * v->line_stride_in_bytes;
         uint8_t *dst = b->map + (size_t)y * b->pitch;
@@ -1317,19 +1344,76 @@ static bool post_frame(struct output *o, const NDIlib_video_frame_v2_t *v, uint6
         else
             memcpy(dst, src, (size_t)v->xres * (fmt == DRM_FORMAT_UYVY ? 2 : 4));
     }
+    frame_end(o, idx, v->picture_aspect_ratio > 0 ? v->picture_aspect_ratio : (double)v->xres / v->yres,
+              v->timestamp, recv_us);
+    return true;
+}
 
-    pthread_mutex_lock(&o->lock);
-    if (o->vstate[idx] == B_WRITING) {
-        if (o->ready >= 0)
-            o->vstate[o->ready] = B_FREE;
-        o->ready = idx;
-        o->vstate[idx] = B_READY;
-        o->vaspect[idx] = v->picture_aspect_ratio > 0 ? v->picture_aspect_ratio : (double)v->xres / v->yres;
-        o->vsent[idx] = v->timestamp;
-        o->vrecv[idx] = recv_us;
+/* U and V rows -> one interleaved CbCr row (NV16 / NV12). n = chroma samples. */
+static void uv_interleave(const uint8_t *u, const uint8_t *v, uint8_t *d, int n)
+{
+    int x = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    for (; x + 16 <= n; x += 16) {
+        uint8x16x2_t p = { { vld1q_u8(u + x), vld1q_u8(v + x) } };
+        vst2q_u8(d + x * 2, p);
     }
-    pthread_mutex_unlock(&o->lock);
-    wake();
+#endif
+    for (; x < n; x++) {
+        d[x * 2] = u[x];
+        d[x * 2 + 1] = v[x];
+    }
+}
+
+/* Planar 4:2:2 row -> UYVY row. */
+static void yuv422p_to_uyvy(const uint8_t *y, const uint8_t *u, const uint8_t *v, uint8_t *d, int w)
+{
+    int x = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    for (; x + 32 <= w; x += 32) {
+        uint8x16x2_t yy = vld2q_u8(y + x);
+        uint8x16x4_t p = { { vld1q_u8(u + x / 2), yy.val[0], vld1q_u8(v + x / 2), yy.val[1] } };
+        vst4q_u8(d + x * 2, p);
+    }
+#endif
+    for (; x + 2 <= w; x += 2) {
+        d[x * 2] = u[x / 2];
+        d[x * 2 + 1] = y[x];
+        d[x * 2 + 2] = v[x / 2];
+        d[x * 2 + 3] = y[x + 1];
+    }
+}
+
+/* Receiver thread: a planar 4:2:2 or 4:2:0 picture (this device's own capture input). False if this
+ * display can't show it. */
+static bool post_planar(struct output *o, const uint8_t *y, const uint8_t *u, const uint8_t *v, int w, int h,
+                        bool is420, int64_t sent, uint64_t recv_us)
+{
+    uint32_t fmt = is420 ? (o->has_nv12 ? DRM_FORMAT_NV12 : 0)
+                         : (o->has_nv16 ? DRM_FORMAT_NV16 : o->has_uyvy ? DRM_FORMAT_UYVY : 0);
+    if (!fmt)
+        return false;
+    bool too_big;
+    int idx = frame_begin(o, w, h, fmt, &too_big);
+    if (idx < 0)
+        return !too_big;
+    struct buf *b = &o->vid[idx];
+    int cw = w / 2;
+    for (int r = 0; r < h; r++) {
+        const uint8_t *yr = y + (size_t)r * w;
+        uint8_t *dst = b->map + (size_t)r * b->pitch;
+        if (fmt == DRM_FORMAT_UYVY) {
+            yuv422p_to_uyvy(yr, u + (size_t)r * cw, v + (size_t)r * cw, dst, w);
+            continue;
+        }
+        memcpy(dst, yr, (size_t)w);
+        if (fmt == DRM_FORMAT_NV16)
+            uv_interleave(u + (size_t)r * cw, v + (size_t)r * cw, b->map + b->uv_off + (size_t)r * b->pitch, cw);
+        else if (!(r & 1))
+            uv_interleave(u + (size_t)(r / 2) * cw, v + (size_t)(r / 2) * cw,
+                          b->map + b->uv_off + (size_t)(r / 2) * b->pitch, cw);
+    }
+    frame_end(o, idx, (double)w / h, sent, recv_us);
     return true;
 }
 
@@ -2154,6 +2238,218 @@ static bool codec_is_h264(uint32_t cc)
     return c && !strcmp(c, "NDI|HX (H.264)");
 }
 
+/* ------------------------------------------------------------------ this device's own capture inputs */
+
+/* pindi-sender publishes each input's pictures and audio in /run/pindi/in<n>.local. An output showing
+ * one of them reads it from there: no NDI encoding and decoding on the same Pi (a Pi 3 can't do both
+ * at 1080p60). Keep in sync with pindi-sender.c. */
+#define LOCAL_MAGIC 0x4c444e50 /* "PNDL" */
+#define LOCAL_SLOTS 4
+#define LOCAL_AUDIO 32768
+#define LOCAL_DATA 262144
+enum { LOCAL_422P = 1, LOCAL_420P = 2 };
+
+struct local_feed {
+    uint32_t magic, version;
+    char name[128];
+    int32_t w, h, fps_n, fps_d;
+    uint32_t fmt, slot_size;
+    uint64_t seq;
+    uint64_t slot_seq[LOCAL_SLOTS];
+    int64_t slot_time[LOCAL_SLOTS];
+    uint64_t writer_ms, reader_ms;
+    uint64_t audio_wr;
+    int16_t audio[LOCAL_AUDIO * 2];
+};
+
+#define LOAD(p) __atomic_load_n(&(p), __ATOMIC_ACQUIRE)
+#define STORE(p, v) __atomic_store_n(&(p), (v), __ATOMIC_RELEASE)
+
+/* Empty, 127.0.0.1 or one of this device's addresses. */
+static bool ip_is_local(const char *ip)
+{
+    if (!*ip || !strcmp(ip, "127.0.0.1"))
+        return true;
+    struct ifaddrs *ifa, *p;
+    bool local = false;
+    if (getifaddrs(&ifa))
+        return false;
+    for (p = ifa; p && !local; p = p->ifa_next) {
+        char a[INET_ADDRSTRLEN];
+        if (p->ifa_addr && p->ifa_addr->sa_family == AF_INET &&
+            inet_ntop(AF_INET, &((struct sockaddr_in *)p->ifa_addr)->sin_addr, a, sizeof a))
+            local = !strcmp(a, ip);
+    }
+    freeifaddrs(ifa);
+    return local;
+}
+
+/* The live local feed the output's stream names: its path in path, else false. */
+static bool local_find(struct output *o, char *path, size_t n)
+{
+    if (!*o->target || !ip_is_local(o->source_ip))
+        return false;
+    for (int i = 1; i <= 8; i++) {
+        char p[64], full[160];
+        struct local_feed hdr;
+        snprintf(p, sizeof p, RUN_DIR "/in%d.local", i);
+        int fd = open(p, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            continue;
+        ssize_t r = pread(fd, &hdr, offsetof(struct local_feed, audio), 0);
+        close(fd);
+        if (r != (ssize_t)offsetof(struct local_feed, audio) || hdr.magic != LOCAL_MAGIC || !hdr.writer_ms ||
+            now_ms() - hdr.writer_ms > 3000)
+            continue;
+        hdr.name[sizeof hdr.name - 1] = 0;
+        snprintf(full, sizeof full, "LOCAL (%s)", hdr.name);
+        if (name_matches(full, o->target, o->alt)) {
+            snprintf(path, n, "%s", p);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Show a local feed until the output's stream is switched (returns switch_poll's result), the
+ * sender stops or the display goes away (0). */
+static int local_play(struct output *o, const char *path, uint64_t *switch_seen, NDIlib_find_instance_t find,
+                      bool audio_on, int stats_ms)
+{
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    uint8_t *map = NULL;
+    size_t len = 0;
+    struct local_feed *lf = NULL;
+    char src[200] = "";
+    uint64_t start = now_ms(), last_seq = 0, last_switch = 0, last_sources = 0, last_stats = start, audio_rd = 0;
+    unsigned long shown = 0, torn = 0;
+    bool got = false;
+    float *abuf = malloc(960 * 2 * sizeof(float));
+    int ret = 0;
+    while (running && abuf) {
+        uint64_t now = now_ms();
+        pthread_mutex_lock(&o->lock);
+        bool usable = o->usable;
+        pthread_mutex_unlock(&o->lock);
+        if (!usable)
+            break;
+        if (now - last_switch >= 300) {
+            last_switch = now;
+            if ((ret = switch_poll(o, switch_seen)))
+                break;
+        }
+        if (find && o->n == 1 && now - last_sources >= 2000) {
+            uint32_t count = 0;
+            const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+            sources_publish(srcs, count);
+            last_sources = now;
+        }
+        struct stat st;
+        if (fstat(fd, &st))
+            break;
+        if ((size_t)st.st_size != len) { /* new capture mode: the sender resized the frame slots */
+            if (map)
+                munmap(map, len);
+            len = (size_t)st.st_size;
+            map = len >= LOCAL_DATA ? mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : NULL;
+            if (map == MAP_FAILED)
+                map = NULL;
+            if (!map)
+                break;
+            lf = (struct local_feed *)map;
+            if (!*src) {
+                char name[sizeof lf->name];
+                memcpy(name, lf->name, sizeof name);
+                name[sizeof name - 1] = 0;
+                snprintf(src, sizeof src, "this device (%s)", name);
+                LOG("local: output %d: showing %s straight from the capture input (no NDI)", o->n, name);
+            }
+        }
+        if (LOAD(lf->magic) != LOCAL_MAGIC)
+            break;
+        STORE(lf->reader_ms, now); /* the sender decodes only while someone reads */
+        uint64_t wms = LOAD(lf->writer_ms);
+        if (!wms || now - wms > 3000) {
+            LOG("local: output %d: %s stopped", o->n, src);
+            break;
+        }
+
+        uint64_t s = LOAD(lf->seq);
+        if (s && s != last_seq) {
+            last_seq = s;
+            int slot = (int)(s % LOCAL_SLOTS);
+            uint32_t ssz = LOAD(lf->slot_size);
+            int w = lf->w, h = lf->h;
+            bool is420 = lf->fmt == LOCAL_420P;
+            if (LOAD(lf->slot_seq[slot]) == s && w > 0 && h > 0 && ssz >= (uint32_t)w * h * 2 &&
+                LOCAL_DATA + (size_t)ssz * LOCAL_SLOTS <= len) {
+                const uint8_t *base = map + LOCAL_DATA + (size_t)slot * ssz;
+                size_t ysz = (size_t)w * h, csz = is420 ? ysz / 4 : ysz / 2;
+                bool ok = post_planar(o, base, base + ysz, base + ysz + csz, w, h, is420, lf->slot_time[slot],
+                                      clock_us(CLOCK_MONOTONIC));
+                if (LOAD(lf->slot_seq[slot]) != s)
+                    torn++; /* overwritten while copying (we fell 4 frames behind): a mixed picture */
+                char vid[64];
+                snprintf(vid, sizeof vid, "%dx%d %.2f fps", w, h, lf->fps_d ? (double)lf->fps_n / lf->fps_d : 0.0);
+                status_set(o, ok ? "playing" : "cannot display (format)", src, "this device", vid);
+                shown++;
+                if (!got) {
+                    char buf[512], cpath[64];
+                    snprintf(buf, sizeof buf, "source=%s\ncodec=Direct from the capture input (no NDI)\n", src);
+                    snprintf(cpath, sizeof cpath, RUN_DIR "/out%d.codec", o->n);
+                    write_file_atomic(cpath, buf);
+                    LOG("local: output %d: first frame after %llu ms (%dx%d)", o->n,
+                        (unsigned long long)(now - start), w, h);
+                    got = true;
+                }
+            }
+        }
+
+        if (audio_on) { /* the input's audio: 48 kHz stereo, played like an NDI stream's */
+            uint64_t wr = LOAD(lf->audio_wr);
+            if (!audio_rd || wr < audio_rd || wr - audio_rd > LOCAL_AUDIO / 2)
+                audio_rd = wr; /* start (or resync) at the newest samples */
+            while (audio_rd < wr) {
+                size_t n = (size_t)(wr - audio_rd);
+                if (n > 960)
+                    n = 960;
+                for (size_t i = 0; i < n; i++) {
+                    size_t at = (size_t)((audio_rd + i) % LOCAL_AUDIO) * 2;
+                    abuf[i] = lf->audio[at] / 32768.0f;
+                    abuf[n + i] = lf->audio[at + 1] / 32768.0f;
+                }
+                NDIlib_audio_frame_v3_t a = {
+                    .sample_rate = 48000, .no_channels = 2, .no_samples = (int)n,
+                    .FourCC = NDIlib_FourCC_audio_type_FLTP, .p_data = (uint8_t *)abuf,
+                    .channel_stride_in_bytes = (int)(n * sizeof(float)),
+                };
+                audio_play(o, &a);
+                audio_rd += n;
+            }
+            if (got && now - o->au.last_frame > 3000 && now - start > 3000 && o->au.pcm) {
+                audio_close(o);
+                audio_info(o, "no audio in this stream");
+            }
+        }
+
+        if (stats_ms > 0 && now - last_stats >= (uint64_t)stats_ms) {
+            LOG("local: output %d: %lu frames in %.0f s from %s%s", o->n, shown, (now - last_stats) / 1000.0, src,
+                torn ? " (some overwritten while copying)" : "");
+            shown = torn = 0;
+            last_stats = now;
+        }
+        usleep(2000);
+    }
+    audio_close(o);
+    free(abuf);
+    if (map)
+        munmap(map, len);
+    close(fd);
+    return ret;
+}
+
 static void *codec_probe_thread(void *arg)
 {
     struct codec_probe *p = arg;
@@ -2368,14 +2664,48 @@ static void *receiver(void *arg)
         }
 
         /* Keep the visible-sources list fresh for the web UI while playing too. */
-        if (recv && o->n == 1 && now - last_sources >= 2000) {
-            uint32_t count = 0;
-            const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
-            sources_publish(srcs, count);
+        if (recv && now - last_sources >= 2000) {
+            if (o->n == 1) {
+                uint32_t count = 0;
+                const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+                sources_publish(srcs, count);
+            }
             last_sources = now;
+            /* Our stream is one of this device's inputs again (pindi-sender restarted): take it from there. */
+            char lpath[64];
+            if (!on_backup && local_find(o, lpath, sizeof lpath)) {
+                LOG("ndi: output %d: %s is this device's own input, showing it directly", o->n, cur_src);
+                ndi->recv_destroy(recv);
+                recv = NULL;
+                audio_close(o);
+                continue;
+            }
         }
 
         if (!recv) {
+            /* One of this device's own capture inputs: straight from pindi-sender, not over NDI. */
+            char lpath[64];
+            if (local_find(o, lpath, sizeof lpath)) {
+                int sw = local_play(o, lpath, &switch_seen, find, audio_on, stats_ms);
+                now = now_ms();
+                if (audio_on)
+                    audio_info(o, "");
+                if (sw) {
+                    splash_at = now + 6000; /* keep the picture until the new stream's first frame */
+                    search_since = now;
+                    failed_src[0] = 0;
+                    status_set(o, "searching", "", "", "");
+                    if (sw == 2 && find) {
+                        snprintf(extra_ips, sizeof extra_ips, "%s%s%s", extra, *o->source_ip && *extra ? "," : "",
+                                 o->source_ip);
+                        ndi->find_destroy(find);
+                        find = NULL;
+                    }
+                } else {
+                    request_splash(o);
+                }
+                continue;
+            }
             if (!search_since)
                 search_since = now;
             /* With a backup, the last picture stays up while it takes over (at most 6 s). */

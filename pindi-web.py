@@ -413,6 +413,21 @@ def mbit(bps):
 TRAFFIC = NetTraffic()
 
 
+def hx_send_available():
+    """Sending NDI|HX needs the NDI Advanced SDK and the Pi's hardware H.264 encoder (Pi 3/4)."""
+    if not os.path.exists("/usr/local/lib/libndi_advanced.so"):
+        return False
+    base = "/sys/class/video4linux"
+    try:
+        return any(read_text(os.path.join(base, d, "name")).strip() == "bcm2835-codec-encode"
+                   for d in os.listdir(base))
+    except OSError:
+        return False
+
+
+CODECS = [("speedhq", "Full NDI (SpeedHQ)"), ("hx", "NDI|HX (H.264, hardware encoder)")]
+
+
 def ndi_info():
     """What the player found out about the installed NDI SDK (/run/pindi/ndi)."""
     info = read_kv(RUN_DIR + "/ndi")
@@ -748,7 +763,7 @@ def configured_inputs(env):
     """{slot: settings} from PINDI_IN<n>_* keys."""
     slots = {}
     for key, val in env.items():
-        m = re.match(r"^PINDI_IN(\d+)_(DEVICE|ENABLED|NAME|MODE|AUDIO)$", key)
+        m = re.match(r"^PINDI_IN(\d+)_(DEVICE|ENABLED|NAME|MODE|AUDIO|CODEC)$", key)
         if m:
             slots.setdefault(int(m.group(1)), {})[m.group(2)] = val
     return {n: s for n, s in slots.items() if s.get("DEVICE")}
@@ -764,12 +779,14 @@ def inputs():
         slot = by_dev.pop(d["id"], None)
         s = conf.get(slot, {})
         out.append(dict(d, slot=slot, present=True, enabled=s.get("ENABLED") == "1",
-                        name=s.get("NAME", ""), mode=s.get("MODE", ""), audio_setting=s.get("AUDIO", "auto")))
+                        name=s.get("NAME", ""), mode=s.get("MODE", ""), audio_setting=s.get("AUDIO", "auto"),
+                        codec=s.get("CODEC", "speedhq")))
     for dev, slot in by_dev.items():
         s = conf[slot]
         out.append({"dev": "", "id": dev, "label": os.path.basename(dev), "modes": [], "slot": slot,
                     "present": False, "enabled": s.get("ENABLED") == "1", "name": s.get("NAME", ""),
-                    "mode": s.get("MODE", ""), "audio_setting": s.get("AUDIO", "auto")})
+                    "mode": s.get("MODE", ""), "audio_setting": s.get("AUDIO", "auto"),
+                    "codec": s.get("CODEC", "speedhq")})
     for i in out:
         st = read_kv("%s/in%d.status" % (RUN_DIR, i["slot"])) if i["slot"] else {}
         i["state"] = st.get("state", "") if i["enabled"] else "off"
@@ -1146,6 +1163,16 @@ def dashboard(session):
     # Outgoing streams (capture devices)
     used = {i["slot"] for i in ins if i["slot"]}
     free_slots = [n for n in range(1, 9) if n not in used]
+    hx_ok = hx_send_available()
+
+    def codec_field(i):
+        """Codec choice, only where NDI|HX can be sent (else Full NDI, nothing to choose)."""
+        if not hx_ok:
+            return ""
+        return ('<div><label>Codec</label><select name="codec">%s</select><span class="hint block">NDI|HX: '
+                'H.264 from the Pi&#39;s hardware encoder &ndash; far less CPU and bandwidth; receivers need NDI|HX '
+                'support (NDI Tools, vMix, OBS...).</span></div>' % options(CODECS, i.get("codec", "speedhq")))
+
     cards = []
     for i in ins:
         slot = i["slot"] or (free_slots.pop(0) if free_slots else 0)
@@ -1177,13 +1204,13 @@ def dashboard(session):
             '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Send this input over NDI</label>'
             '<div class="row"><div><label>NDI stream name</label><input type="text" name="name" value="%s" '
             'placeholder="%s" maxlength="100"></div><div><label>Capture mode</label><select name="mode">%s</select>'
-            '</div><div><label>Audio</label><select name="audio">%s</select></div></div>'
+            '</div>%s<div><label>Audio</label><select name="audio">%s</select></div></div>'
             '<button>Save</button> %s</form></div>' %
             (esc(i["label"]), " on" if i["present"] else "", "connected" if i["present"] else "not connected",
              esc(i["id"]), k, " onair" if "ON AIR" in state else " playing" if state.startswith("sending") else "",
              esc(state), live, hidden,
              esc(i["id"]), slot, " checked" if i["enabled"] else "", esc(i["name"]), esc(default_in_stream(slot)),
-             options(cap_choices, i["mode"]),
+             options(cap_choices, i["mode"]), codec_field(i),
              options([("auto", "From the device (USB audio)"), ("off", "Off")], i["audio_setting"]), remove))
     body = "".join(cards) if cards else (
         '<p class="hint">No capture devices detected. Plug in a USB HDMI capture card and reload this page.</p>')
@@ -1439,7 +1466,7 @@ def act_outgoing(form):
         slot = inp["slot"]
     elif not 1 <= slot <= 8 or slot in configured_inputs(read_env()):
         return ("err", "No free slot for another outgoing stream.")
-    keys = ["PINDI_IN%d_%s" % (slot, k) for k in ("ENABLED", "DEVICE", "NAME", "MODE", "AUDIO")]
+    keys = ["PINDI_IN%d_%s" % (slot, k) for k in ("ENABLED", "DEVICE", "NAME", "MODE", "AUDIO", "CODEC")]
     if form.get("remove"):
         write_env({k: "" for k in keys})
         msg = "Forgot %s." % inp["label"]
@@ -1454,9 +1481,12 @@ def act_outgoing(form):
         audio = form.get("audio", "auto")
         if audio not in ("auto", "off"):
             return ("err", "Invalid audio setting.")
+        codec = form.get("codec", "speedhq")
+        if codec not in dict(CODECS) or (codec == "hx" and not hx_send_available()):
+            return ("err", "Invalid codec.")
         write_env(dict(zip(keys, ["1" if enabled else "0", device,
                                   "" if name == default_in_stream(slot) else name, mode,
-                                  "" if audio == "auto" else audio])))
+                                  "" if audio == "auto" else audio, "" if codec == "speedhq" else codec])))
         msg = ("%s will be sent as \"%s\"." % (inp["label"], name or default_in_stream(slot))) if enabled \
             else ("%s is not sent." % inp["label"])
     log("outgoing: slot %d %s" % (slot, msg))
