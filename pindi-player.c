@@ -29,6 +29,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +54,7 @@
 #include FT_FREETYPE_H
 
 #include <dlfcn.h>
+#include <linux/videodev2.h>
 #include <Processing.NDI.Lib.h>
 #include <Processing.NDI.DynamicLoad.h>
 
@@ -70,6 +72,7 @@
 
 static const NDIlib_v6 *ndi;
 static bool hx_decode; /* the SDK can decode NDI|HX, so a sender may use either codec */
+static void (*ndi_request_keyframe)(NDIlib_recv_instance_t); /* Advanced SDK only */
 static volatile sig_atomic_t running = 1;
 static void on_signal(int sig) { (void)sig; running = 0; }
 
@@ -393,16 +396,20 @@ static int wake_pipe[2] = { -1, -1 };
 struct buf {
     uint32_t fb, handle, pitch, fmt;
     int w, h;
-    uint64_t size, uv_off; /* uv_off: CbCr plane offset for NV16 */
+    uint64_t size, uv_off; /* uv_off: CbCr plane offset for NV16 / NV12 */
     uint8_t *map;
 };
 
-/* XRGB8888 / XBGR8888 / UYVY (one plane) or NV16 (Y plane then CbCr plane, one allocation). */
+/* XRGB8888 / XBGR8888 / UYVY (one plane) or NV16 / NV12 (Y plane then CbCr plane, one allocation).
+ * NV12 is what the hardware H.264 decoder writes: its planes are 16 lines aligned. */
+static int nv12_rows(int h) { return (h + 15) & ~15; }
+
 static bool buf_create(int w, int h, uint32_t fmt, struct buf *b)
 {
-    bool nv16 = fmt == DRM_FORMAT_NV16;
-    int bpp = nv16 ? 8 : fmt == DRM_FORMAT_UYVY ? 16 : 32;
-    struct drm_mode_create_dumb c = { .width = w, .height = nv16 ? h * 2 : h, .bpp = bpp };
+    bool nv16 = fmt == DRM_FORMAT_NV16, nv12 = fmt == DRM_FORMAT_NV12;
+    int bpp = nv16 || nv12 ? 8 : fmt == DRM_FORMAT_UYVY ? 16 : 32;
+    struct drm_mode_create_dumb c = { .width = w, .height = nv16 ? h * 2 : nv12 ? nv12_rows(h) * 3 / 2 : h,
+                                      .bpp = bpp };
     struct drm_mode_map_dumb m = { 0 };
     memset(b, 0, sizeof *b);
     if (drmIoctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &c)) {
@@ -415,9 +422,9 @@ static bool buf_create(int w, int h, uint32_t fmt, struct buf *b)
     b->w = w;
     b->h = h;
     b->fmt = fmt;
-    b->uv_off = nv16 ? (uint64_t)c.pitch * h : 0;
-    uint32_t handles[4] = { c.handle, nv16 ? c.handle : 0 };
-    uint32_t pitches[4] = { c.pitch, nv16 ? c.pitch : 0 };
+    b->uv_off = nv16 ? (uint64_t)c.pitch * h : nv12 ? (uint64_t)c.pitch * nv12_rows(h) : 0;
+    uint32_t handles[4] = { c.handle, nv16 || nv12 ? c.handle : 0 };
+    uint32_t pitches[4] = { c.pitch, nv16 || nv12 ? c.pitch : 0 };
     uint32_t offsets[4] = { 0, (uint32_t)b->uv_off };
     if (drmModeAddFB2(drm_fd, w, h, fmt, handles, pitches, offsets, &b->fb, 0))
         goto fail;
@@ -484,7 +491,7 @@ struct output {
     int n; /* 1-based, as shown in the web UI */
     char conn_name[32];
     uint32_t conn_id, crtc_id, plane_id;
-    bool has_uyvy, has_nv16;
+    bool has_uyvy, has_nv16, has_nv12;
     struct { uint32_t fb, crtc, sx, sy, sw, sh, cx, cy, cw, ch, rot; } pp;
     uint32_t p_mode, p_active, p_conn_crtc;
 
@@ -524,6 +531,8 @@ struct output {
     bool thumb_reading;   /* the preview thread is reading a buffer: don't free any */
     bool cant_display;    /* no buffers for the current frame size (pw x ph) */
     bool wake_request;    /* receiver: our stream is there, turn the display back on */
+    const char *probe_codec; /* codec_name() the format check found for probe_src (lock) */
+    char probe_src[256];
 
     /* Configuration. */
     bool disabled; /* PINDI_OUT<n>_ENABLED=0: no NDI, HDMI signal off (e.g. encoder-only units) */
@@ -682,6 +691,7 @@ static void discover_outputs(void)
                 for (uint32_t f = 0; f < pl->count_formats; f++) {
                     o->has_uyvy |= pl->formats[f] == DRM_FORMAT_UYVY;
                     o->has_nv16 |= pl->formats[f] == DRM_FORMAT_NV16;
+                    o->has_nv12 |= pl->formats[f] == DRM_FORMAT_NV12;
                 }
             }
             drmModeFreePlane(pl);
@@ -1335,6 +1345,391 @@ static void request_splash(struct output *o)
     wake();
 }
 
+/* ------------------------------------------------------------------ hardware H.264 decoding */
+
+/* The NDI library decodes NDI|HX in software on one core: a Pi 3 manages a few frames per second
+ * at 1080p. The Pi 3/4 have a hardware H.264 decoder (bcm2835-codec, a V4L2 memory-to-memory
+ * device). For H.264 streams the receiver asks NDI for the compressed frames and feeds them to it;
+ * the decoder writes the pictures straight into the output's NV12 buffers (DMABUF), which are then
+ * shown like any other frame. Buffer states: B_WRITING = queued in the decoder. */
+
+#define HW_IN_BUFS 4
+#define HW_IN_SIZE (2 << 20)
+
+/* NDIlib_compressed_packet_t (Processing.NDI.Advanced.h): it precedes each compressed frame. */
+struct ndi_packet {
+    int32_t version; /* structure size: the frame data starts this many bytes in */
+    uint32_t fourcc;
+    int64_t pts, dts;
+    uint64_t reserved;
+    uint32_t flags; /* 1 = keyframe */
+    uint32_t data_size, extra_data_size; /* extra data (SPS/PPS) follows the frame data */
+};
+
+struct hwdec {
+    int fd;
+    struct { uint8_t *map; size_t len; bool queued; } in[HW_IN_BUFS];
+    bool cap_on;          /* capture queue set up with the output's buffers */
+    bool want_cap;        /* the decoder knows the stream format: set the capture queue up */
+    int cw, ch, vw, vh;   /* coded and visible size */
+    int dmabuf[NBUF];
+    bool need_key;        /* skip to the next keyframe (start, or after a dropped frame) */
+    uint32_t seq;
+    struct { int64_t sent; uint64_t recv; } meta[16];
+    double aspect;
+    uint64_t decoded, fed;
+};
+
+static char hw_dev[32]; /* the decoder's /dev/videoN, "" if there is none */
+
+static void hwdec_find(void)
+{
+    for (int i = 0; i < 64; i++) {
+        char path[64], name[64] = "";
+        snprintf(path, sizeof path, "/sys/class/video4linux/video%d/name", i);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            continue;
+        if (fgets(name, sizeof name, f) && !strncmp(name, "bcm2835-codec-decode", 20))
+            snprintf(hw_dev, sizeof hw_dev, "/dev/video%d", i);
+        fclose(f);
+        if (*hw_dev)
+            break;
+    }
+    LOG("video: hardware H.264 decoder %s", *hw_dev ? hw_dev : "not available");
+}
+
+static int xioctl(int fd, unsigned long req, void *arg)
+{
+    int r;
+    do
+        r = ioctl(fd, req, arg);
+    while (r < 0 && errno == EINTR);
+    return r;
+}
+
+/* Give the capture buffers back to the output (stream off returns them all). */
+static void hwdec_cap_stop(struct output *o, struct hwdec *d)
+{
+    if (!d->cap_on)
+        return;
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    xioctl(d->fd, VIDIOC_STREAMOFF, &type);
+    struct v4l2_requestbuffers rb = { .count = 0, .type = type, .memory = V4L2_MEMORY_DMABUF };
+    xioctl(d->fd, VIDIOC_REQBUFS, &rb);
+    pthread_mutex_lock(&o->lock);
+    for (int b = 0; b < NBUF; b++)
+        if (o->vstate[b] == B_WRITING)
+            o->vstate[b] = B_FREE;
+    pthread_mutex_unlock(&o->lock);
+    for (int b = 0; b < NBUF; b++) {
+        if (d->dmabuf[b] >= 0)
+            close(d->dmabuf[b]);
+        d->dmabuf[b] = -1;
+    }
+    d->cap_on = false;
+}
+
+static void hwdec_close(struct output *o, struct hwdec *d)
+{
+    if (d->fd < 0)
+        return;
+    hwdec_cap_stop(o, d);
+    int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    xioctl(d->fd, VIDIOC_STREAMOFF, &type);
+    for (int i = 0; i < HW_IN_BUFS; i++)
+        if (d->in[i].map)
+            munmap(d->in[i].map, d->in[i].len);
+    close(d->fd);
+    LOG("video: output %d: hardware decoder closed (%llu of %llu frames decoded)", o->n,
+        (unsigned long long)d->decoded, (unsigned long long)d->fed);
+    memset(d, 0, sizeof *d);
+    d->fd = -1;
+}
+
+static bool hwdec_open(struct output *o, struct hwdec *d, int w, int h)
+{
+    memset(d, 0, sizeof *d);
+    for (int b = 0; b < NBUF; b++)
+        d->dmabuf[b] = -1;
+    d->need_key = true;
+    d->fd = open(hw_dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (d->fd < 0) {
+        LOG("video: output %d: cannot open %s: %s", o->n, hw_dev, strerror(errno));
+        return false;
+    }
+    struct v4l2_format f = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE };
+    f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264;
+    f.fmt.pix_mp.width = w;
+    f.fmt.pix_mp.height = h;
+    f.fmt.pix_mp.num_planes = 1;
+    f.fmt.pix_mp.plane_fmt[0].sizeimage = HW_IN_SIZE;
+    struct v4l2_requestbuffers rb = { .count = HW_IN_BUFS, .type = f.type, .memory = V4L2_MEMORY_MMAP };
+    struct v4l2_event_subscription sub = { .type = V4L2_EVENT_SOURCE_CHANGE };
+    if (xioctl(d->fd, VIDIOC_S_FMT, &f) || xioctl(d->fd, VIDIOC_REQBUFS, &rb) || rb.count < 1 ||
+        xioctl(d->fd, VIDIOC_SUBSCRIBE_EVENT, &sub))
+        goto fail;
+    for (uint32_t i = 0; i < rb.count && i < HW_IN_BUFS; i++) {
+        struct v4l2_plane pl = { 0 };
+        struct v4l2_buffer b = { .index = i, .type = f.type, .memory = V4L2_MEMORY_MMAP, .m.planes = &pl,
+                                 .length = 1 };
+        if (xioctl(d->fd, VIDIOC_QUERYBUF, &b))
+            goto fail;
+        d->in[i].len = pl.length;
+        d->in[i].map = mmap(NULL, pl.length, PROT_READ | PROT_WRITE, MAP_SHARED, d->fd, pl.m.mem_offset);
+        if (d->in[i].map == MAP_FAILED) {
+            d->in[i].map = NULL;
+            goto fail;
+        }
+    }
+    int type = f.type;
+    if (xioctl(d->fd, VIDIOC_STREAMON, &type))
+        goto fail;
+    /* NDI gives the size: set the capture side up now. The decoder reports a format change
+     * (source change event) only if the stream turns out different. */
+    d->vw = d->cw = w;
+    d->vh = h;
+    d->ch = nv12_rows(h);
+    d->want_cap = true;
+    LOG("video: output %d: hardware H.264 decoding (%s)", o->n, hw_dev);
+    return true;
+fail:
+    LOG("video: output %d: hardware decoder setup failed: %s", o->n, strerror(errno));
+    hwdec_close(o, d);
+    return false;
+}
+
+/* The decoder found the stream's size: get NV12 buffers of that size from the main thread, then
+ * hand them to the decoder. Returns false while still waiting for the buffers. */
+static bool hwdec_cap_start(struct output *o, struct hwdec *d)
+{
+    pthread_mutex_lock(&o->lock);
+    bool fits = o->usable && !o->want_realloc && o->pfmt == DRM_FORMAT_NV12 && o->pw == d->vw && o->ph == d->vh;
+    bool idle = fits;
+    for (int b = 0; b < NBUF && fits; b++)
+        idle &= o->vstate[b] == B_FREE || o->vstate[b] == B_SCANOUT || o->vstate[b] == B_QUEUED ||
+                o->vstate[b] == B_READY;
+    if (!fits && o->usable && !o->cant_display &&
+        (!o->want_realloc || o->ww != d->vw || o->wh != d->vh || o->wfmt != DRM_FORMAT_NV12)) {
+        o->ww = d->vw;
+        o->wh = d->vh;
+        o->wfmt = DRM_FORMAT_NV12;
+        o->want_realloc = true;
+        o->want_splash = false;
+    }
+    uint32_t pitch = o->vid[0].pitch;
+    uint64_t size = o->vid[0].size;
+    uint32_t handle[NBUF];
+    for (int b = 0; b < NBUF; b++)
+        handle[b] = o->vid[b].handle;
+    pthread_mutex_unlock(&o->lock);
+    if (!fits) {
+        wake();
+        return false;
+    }
+    if (!idle)
+        return false;
+
+    struct v4l2_format f = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE };
+    f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+    f.fmt.pix_mp.width = d->cw;
+    f.fmt.pix_mp.height = d->ch;
+    f.fmt.pix_mp.num_planes = 1;
+    f.fmt.pix_mp.plane_fmt[0].bytesperline = pitch;
+    if (xioctl(d->fd, VIDIOC_S_FMT, &f)) {
+        LOG("video: output %d: decoder capture format: %s", o->n, strerror(errno));
+        return false;
+    }
+    if (f.fmt.pix_mp.plane_fmt[0].bytesperline != pitch || f.fmt.pix_mp.plane_fmt[0].sizeimage > size ||
+        f.fmt.pix_mp.height != (uint32_t)nv12_rows(d->vh)) {
+        LOG("video: output %d: decoder wants %ux%u, %u bytes per line, %u bytes; display buffers have %u, %llu",
+            o->n, f.fmt.pix_mp.width, f.fmt.pix_mp.height, f.fmt.pix_mp.plane_fmt[0].bytesperline,
+            f.fmt.pix_mp.plane_fmt[0].sizeimage, pitch, (unsigned long long)size);
+        return false;
+    }
+    struct v4l2_requestbuffers rb = { .count = NBUF, .type = f.type, .memory = V4L2_MEMORY_DMABUF };
+    if (xioctl(d->fd, VIDIOC_REQBUFS, &rb) || rb.count < NBUF) {
+        LOG("video: output %d: decoder buffers: %s", o->n, strerror(errno));
+        return false;
+    }
+    for (int b = 0; b < NBUF; b++)
+        if (drmPrimeHandleToFD(drm_fd, handle[b], DRM_CLOEXEC | DRM_RDWR, &d->dmabuf[b])) {
+            LOG("video: output %d: cannot export display buffer: %s", o->n, strerror(errno));
+            d->cap_on = true; /* so that stop cleans up */
+            hwdec_cap_stop(o, d);
+            return false;
+        }
+    int type = f.type;
+    if (xioctl(d->fd, VIDIOC_STREAMON, &type)) {
+        LOG("video: output %d: decoder start: %s", o->n, strerror(errno));
+        d->cap_on = true;
+        hwdec_cap_stop(o, d);
+        return false;
+    }
+    d->cap_on = true;
+    d->want_cap = false;
+    LOG("video: output %d: decoding %dx%d into the display buffers", o->n, d->vw, d->vh);
+    return true;
+}
+
+/* Queue every free display buffer to the decoder. */
+static void hwdec_refill(struct output *o, struct hwdec *d)
+{
+    if (!d->cap_on)
+        return;
+    for (int b = 0; b < NBUF; b++) {
+        pthread_mutex_lock(&o->lock);
+        bool take = o->vstate[b] == B_FREE && b != o->last_video;
+        if (take)
+            o->vstate[b] = B_WRITING;
+        pthread_mutex_unlock(&o->lock);
+        if (!take)
+            continue;
+        struct v4l2_plane pl = { .m.fd = d->dmabuf[b], .length = (uint32_t)o->vid[b].size };
+        struct v4l2_buffer vb = { .index = b, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+                                  .memory = V4L2_MEMORY_DMABUF, .m.planes = &pl, .length = 1 };
+        if (xioctl(d->fd, VIDIOC_QBUF, &vb)) {
+            pthread_mutex_lock(&o->lock);
+            o->vstate[b] = B_FREE;
+            pthread_mutex_unlock(&o->lock);
+        }
+    }
+}
+
+/* Events, finished input buffers and decoded pictures; waits up to wait_ms for a picture. */
+static void hwdec_poll(struct output *o, struct hwdec *d, int wait_ms)
+{
+    uint64_t until = now_ms() + wait_ms;
+    for (;;) {
+        struct v4l2_event ev;
+        while (!xioctl(d->fd, VIDIOC_DQEVENT, &ev))
+            if (ev.type == V4L2_EVENT_SOURCE_CHANGE) {
+                struct v4l2_format f = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE };
+                struct v4l2_selection sel = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .target = V4L2_SEL_TGT_COMPOSE };
+                if (xioctl(d->fd, VIDIOC_G_FMT, &f))
+                    continue;
+                d->cw = f.fmt.pix_mp.width;
+                d->ch = f.fmt.pix_mp.height;
+                d->vw = d->cw;
+                d->vh = d->ch;
+                if (!xioctl(d->fd, VIDIOC_G_SELECTION, &sel) && sel.r.width && sel.r.height) {
+                    d->vw = sel.r.width;
+                    d->vh = sel.r.height;
+                }
+                LOG("video: output %d: decoder: %dx%d (coded %dx%d)", o->n, d->vw, d->vh, d->cw, d->ch);
+                hwdec_cap_stop(o, d);
+                d->want_cap = true;
+            }
+        if (d->want_cap && hwdec_cap_start(o, d)) {
+            d->need_key = true; /* the frames since the format change were not decoded */
+        }
+        hwdec_refill(o, d);
+
+        for (;;) { /* input buffers the decoder is done with */
+            struct v4l2_plane pl = { 0 };
+            struct v4l2_buffer vb = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, .memory = V4L2_MEMORY_MMAP,
+                                      .m.planes = &pl, .length = 1 };
+            if (xioctl(d->fd, VIDIOC_DQBUF, &vb))
+                break;
+            d->in[vb.index].queued = false;
+        }
+        bool got = false;
+        while (d->cap_on) { /* decoded pictures */
+            struct v4l2_plane pl = { 0 };
+            struct v4l2_buffer vb = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, .memory = V4L2_MEMORY_DMABUF,
+                                      .m.planes = &pl, .length = 1 };
+            if (xioctl(d->fd, VIDIOC_DQBUF, &vb))
+                break;
+            int idx = vb.index;
+            bool ok = !(vb.flags & V4L2_BUF_FLAG_ERROR) && pl.bytesused > 0 && idx < NBUF;
+            uint32_t m = (uint32_t)vb.timestamp.tv_usec % 16;
+            pthread_mutex_lock(&o->lock);
+            if (idx < NBUF && o->vstate[idx] == B_WRITING) {
+                if (ok) {
+                    if (o->ready >= 0)
+                        o->vstate[o->ready] = B_FREE;
+                    o->ready = idx;
+                    o->vstate[idx] = B_READY;
+                    o->vaspect[idx] = d->aspect > 0 ? d->aspect : (double)d->vw / d->vh;
+                    o->vsent[idx] = d->meta[m].sent;
+                    o->vrecv[idx] = d->meta[m].recv;
+                    o->want_splash = false;
+                } else {
+                    o->vstate[idx] = B_FREE;
+                }
+            }
+            pthread_mutex_unlock(&o->lock);
+            if (ok) {
+                d->decoded++;
+                got = true;
+                wake();
+            }
+            hwdec_refill(o, d);
+        }
+        if (got || now_ms() >= until)
+            return;
+        struct pollfd p = { .fd = d->fd, .events = POLLIN | POLLPRI };
+        int left = (int)(until - now_ms());
+        if (poll(&p, 1, left > 0 ? left : 0) <= 0)
+            return;
+    }
+}
+
+/* One compressed H.264 frame from NDI. False: the decoder failed (fall back to the NDI library). */
+static bool hwdec_feed(struct output *o, struct hwdec *d, const NDIlib_video_frame_v2_t *v, uint64_t recv_us)
+{
+    const struct ndi_packet *pk = (const struct ndi_packet *)v->p_data;
+    /* version is the header's size: 44 bytes (sizeof here is 48, padded to 8 for the int64s). */
+    const int32_t hdr = (int32_t)(offsetof(struct ndi_packet, extra_data_size) + sizeof pk->extra_data_size);
+    if (!v->p_data || v->data_size_in_bytes < hdr || pk->version < hdr ||
+        (int64_t)pk->version + pk->data_size + pk->extra_data_size > v->data_size_in_bytes)
+        return true;
+    bool key = pk->flags & 1;
+    d->aspect = v->picture_aspect_ratio > 0 ? v->picture_aspect_ratio : (double)v->xres / v->yres;
+    pthread_mutex_lock(&o->lock);
+    bool usable = o->usable && !o->cant_display;
+    pthread_mutex_unlock(&o->lock);
+    if (!usable) {
+        hwdec_cap_stop(o, d); /* the output is going away or being reallocated */
+        if (d->cw)
+            d->want_cap = true;
+        d->need_key = true;
+        return true;
+    }
+    if (d->need_key && !key)
+        return true;
+    int i = 0;
+    while (i < HW_IN_BUFS && (d->in[i].queued || !d->in[i].map))
+        i++;
+    size_t len = (size_t)pk->data_size + (key ? pk->extra_data_size : 0);
+    if (i == HW_IN_BUFS || len > d->in[i].len) {
+        d->need_key = true; /* decoder busy: drop, and restart cleanly at the next keyframe */
+        return true;
+    }
+    const uint8_t *data = (const uint8_t *)pk + pk->version;
+    size_t off = 0;
+    if (key) { /* parameter sets (SPS/PPS) first */
+        memcpy(d->in[i].map, data + pk->data_size, pk->extra_data_size);
+        off = pk->extra_data_size;
+    }
+    memcpy(d->in[i].map + off, data, pk->data_size);
+    uint32_t m = d->seq++ % 16;
+    d->meta[m].sent = v->timestamp;
+    d->meta[m].recv = recv_us;
+    struct v4l2_plane pl = { .bytesused = (uint32_t)len, .length = (uint32_t)d->in[i].len };
+    struct v4l2_buffer vb = { .index = i, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, .memory = V4L2_MEMORY_MMAP,
+                              .m.planes = &pl, .length = 1 };
+    vb.timestamp.tv_usec = m;
+    if (xioctl(d->fd, VIDIOC_QBUF, &vb)) {
+        LOG("video: output %d: decoder input: %s", o->n, strerror(errno));
+        return false;
+    }
+    d->in[i].queued = true;
+    d->need_key = false;
+    d->fed++;
+    return true;
+}
+
 /* ------------------------------------------------------------------ status for the web UI */
 
 static void status_set(struct output *o, const char *state, const char *source, const char *url, const char *video)
@@ -1735,7 +2130,7 @@ static const NDIlib_source_t *find_primary(struct output *o, const NDIlib_source
  * Advanced SDK, a second receiver asking for compressed frames gets them undecoded, and the
  * FourCC names the codec. It connects once per stream, reads one frame and goes away. */
 struct codec_probe {
-    int n;
+    struct output *o;
     NDIlib_recv_bandwidth_e bandwidth;
     char name[256], url[128];
 };
@@ -1751,6 +2146,12 @@ static const char *codec_name(uint32_t cc)
     if (!strcmp(c, "H264") || !strcmp(c, "A264")) return "NDI|HX (H.264)";
     if (!strcmp(c, "HEVC") || !strcmp(c, "AEVC")) return "NDI|HX (HEVC)";
     return NULL; /* uncompressed video (e.g. from the SDK's own decoder) tells nothing */
+}
+
+static bool codec_is_h264(uint32_t cc)
+{
+    const char *c = codec_name(cc);
+    return c && !strcmp(c, "NDI|HX (H.264)");
 }
 
 static void *codec_probe_thread(void *arg)
@@ -1781,21 +2182,29 @@ static void *codec_probe_thread(void *arg)
     if (codec && *codec) {
         char buf[512], path[64];
         snprintf(buf, sizeof buf, "source=%s\ncodec=%s\n", p->name, codec);
-        snprintf(path, sizeof path, RUN_DIR "/out%d.codec", p->n);
+        snprintf(path, sizeof path, RUN_DIR "/out%d.codec", p->o->n);
         write_file_atomic(path, buf);
-        LOG("ndi: output %d: %s sends %s", p->n, p->name, codec);
+        LOG("ndi: output %d: %s sends %s", p->o->n, p->name, codec);
+        pthread_mutex_lock(&p->o->lock);
+        p->o->probe_codec = codec;
+        snprintf(p->o->probe_src, sizeof p->o->probe_src, "%s", p->name);
+        pthread_mutex_unlock(&p->o->lock);
     }
     free(p);
     return NULL;
 }
 
-static void codec_probe_start(int n, NDIlib_recv_bandwidth_e bandwidth, const char *name, const char *url)
+static void codec_probe_start(struct output *o, NDIlib_recv_bandwidth_e bandwidth, const char *name,
+                              const char *url)
 {
     struct codec_probe *p = calloc(1, sizeof *p);
     pthread_t t;
     if (!p)
         return;
-    p->n = n;
+    pthread_mutex_lock(&o->lock);
+    o->probe_codec = NULL;
+    pthread_mutex_unlock(&o->lock);
+    p->o = o;
     p->bandwidth = bandwidth;
     snprintf(p->name, sizeof p->name, "%s", name);
     snprintf(p->url, sizeof p->url, "%s", url);
@@ -1840,9 +2249,19 @@ static void *receiver(void *arg)
     char cur_src[256] = "", cur_url[128] = "", failed_src[256] = "", last_src[256] = "";
     bool got_frame = false, on_backup = false;
     uint64_t search_since = 0, primary_check = 0, splash_at = 0;
+    /* NDI|HX H.264 through the hardware decoder (see hwdec_*): the receiver then gets compressed frames. */
+    struct hwdec hw = { .fd = -1 };
+    bool hx_mode = false;
+    char hw_failed[256] = ""; /* the source the hardware decoder failed on: the NDI library decodes it */
+    int last_w = 0, last_h = 0;
+    uint64_t key_asked = 0;
 
     while (running) {
         uint64_t now = now_ms();
+        if (!recv && hx_mode) {
+            hwdec_close(o, &hw);
+            hx_mode = false;
+        }
         bool usable;
         pthread_mutex_lock(&o->lock);
         usable = o->usable;
@@ -1998,6 +2417,10 @@ static void *receiver(void *arg)
                 snprintf(cur_src, sizeof cur_src, "%s", pick->p_ndi_name);
                 snprintf(cur_url, sizeof cur_url, "%s", pick->p_url_address ? pick->p_url_address : "");
                 recv = ndi->recv_create_v3(&rc);
+                if (recv && hx_mode) { /* a new connection starts with the NDI library's decoding */
+                    hwdec_close(o, &hw);
+                    hx_mode = false;
+                }
                 if (recv) {
                     LOG("ndi: output %d: connecting to %s (%s)%s", o->n, cur_src, cur_url,
                         backup ? " - main stream unavailable, using the backup" : "");
@@ -2044,17 +2467,29 @@ static void *receiver(void *arg)
 
         NDIlib_video_frame_v2_t v;
         NDIlib_audio_frame_v3_t a;
-        NDIlib_frame_type_e t = ndi->recv_capture_v3(recv, &v, audio_on ? &a : NULL, NULL, 100);
+        NDIlib_frame_type_e t = ndi->recv_capture_v3(recv, &v, audio_on ? &a : NULL, NULL, hx_mode ? 20 : 100);
         uint64_t recv_us = clock_us(CLOCK_MONOTONIC);
         now = now_ms();
+        bool hx_leave = false;
         if (t == NDIlib_frame_type_video) {
             if (!got_frame) {
                 LOG("ndi: output %d: first frame after %llu ms (%dx%d)", o->n,
                     (unsigned long long)(now - recv_start), v.xres, v.yres);
-                if (hx_decode)
-                    codec_probe_start(o->n, bandwidth, cur_src, cur_url);
+                if (hx_decode && !hx_mode)
+                    codec_probe_start(o, bandwidth, cur_src, cur_url);
             }
-            bool shown = post_frame(o, &v, recv_us);
+            bool shown = true;
+            if (!hx_mode) {
+                shown = post_frame(o, &v, recv_us);
+            } else if (!codec_is_h264((uint32_t)v.FourCC)) {
+                LOG("video: output %d: %s no longer sends H.264", o->n, cur_src);
+                hx_leave = true;
+            } else if (!hwdec_feed(o, &hw, &v, recv_us)) {
+                snprintf(hw_failed, sizeof hw_failed, "%s", cur_src);
+                hx_leave = true;
+            }
+            last_w = v.xres;
+            last_h = v.yres;
             char vid[64];
             snprintf(vid, sizeof vid, "%dx%d %.2f fps", v.xres, v.yres,
                      v.frame_rate_D ? (double)v.frame_rate_N / v.frame_rate_D : 0.0);
@@ -2070,6 +2505,62 @@ static void *receiver(void *arg)
             audio_play(o, &a);
             ndi->recv_free_audio_v3(recv, &a);
         }
+
+        if (hx_mode && !hx_leave) {
+            hwdec_poll(o, &hw, t == NDIlib_frame_type_video ? 40 : 0);
+            if (hw.need_key && ndi_request_keyframe && now - key_asked > 1000) {
+                ndi_request_keyframe(recv); /* don't wait for the sender's next one */
+                key_asked = now;
+            }
+        }
+        /* H.264 from the sender (the format check says so): switch to the hardware decoder; back to the
+         * NDI library's decoding when the sender changes codec or the hardware decoder fails. */
+        bool to_hx = false;
+        if (!hx_mode && got_frame && *hw_dev && o->has_nv12 && strcmp(hw_failed, cur_src)) {
+            pthread_mutex_lock(&o->lock);
+            to_hx = o->probe_codec && !strcmp(o->probe_codec, "NDI|HX (H.264)") && !strcmp(o->probe_src, cur_src);
+            o->probe_codec = to_hx ? NULL : o->probe_codec;
+            pthread_mutex_unlock(&o->lock);
+        }
+        if (to_hx || hx_leave) {
+            NDIlib_recv_create_v3_t rc = {
+                .source_to_connect_to = { .p_ndi_name = cur_src, .p_url_address = *cur_url ? cur_url : NULL },
+                .color_format = to_hx ? (NDIlib_recv_color_format_e)302 /* compressed_v3: SpeedHQ, H.264 */ : color,
+                .bandwidth = bandwidth,
+                .allow_video_fields = false,
+                .p_ndi_recv_name = recv_name,
+            };
+            if (hx_leave)
+                hwdec_close(o, &hw);
+            NDIlib_recv_instance_t r2 = NULL;
+            if (to_hx && !hwdec_open(o, &hw, last_w, last_h))
+                snprintf(hw_failed, sizeof hw_failed, "%s", cur_src);
+            else
+                r2 = ndi->recv_create_v3(&rc);
+            if (r2) {
+                ndi->recv_destroy(recv);
+                recv = r2;
+                hx_mode = to_hx;
+                key_asked = 0;
+                if (to_hx) {
+                    char buf[512], path[64];
+                    snprintf(buf, sizeof buf, "source=%s\ncodec=NDI|HX (H.264), hardware decoded\n", cur_src);
+                    snprintf(path, sizeof path, RUN_DIR "/out%d.codec", o->n);
+                    write_file_atomic(path, buf);
+                }
+                last_alive = now + 5000;
+                if (!to_hx && hx_decode)
+                    codec_probe_start(o, bandwidth, cur_src, cur_url); /* which codec now? */
+            } else if (to_hx) {
+                hwdec_close(o, &hw);
+            } else { /* no receiver for the NDI library's decoding: reconnect from scratch */
+                ndi->recv_destroy(recv);
+                recv = NULL;
+                hx_mode = false;
+            }
+            if (!recv)
+                continue;
+        }
         if (audio_on && got_frame && now - o->au.last_frame > 3000 && now - recv_start > 3000) {
             audio_close(o); /* stream without audio, or it stopped */
             audio_info(o, "no audio in this stream");
@@ -2083,6 +2574,10 @@ static void *receiver(void *arg)
             ndi->recv_get_performance(recv, &total, &dropped);
             LOG("ndi: output %d stats %s: connections %d, video frames %lld received, %lld dropped", o->n,
                 cur_src, conns, (long long)total.video_frames, (long long)dropped.video_frames);
+            if (hx_mode)
+                LOG("video: output %d: hardware decoder: %llu frames in, %llu decoded%s", o->n,
+                    (unsigned long long)hw.fed, (unsigned long long)hw.decoded,
+                    hw.need_key ? ", waiting for a keyframe" : "");
             if (o->au.frames)
                 LOG("audio: output %d: %llu frames, %llu samples in (%.0f/s), %llu not played, %llu underruns, "
                     "longest gap %llu ms", o->n, (unsigned long long)o->au.frames, (unsigned long long)o->au.in,
@@ -2117,6 +2612,7 @@ static void *receiver(void *arg)
                 audio_info(o, "");
         }
     }
+    hwdec_close(o, &hw);
     if (recv)
         ndi->recv_destroy(recv);
     audio_close(o);
@@ -2190,6 +2686,10 @@ static uint32_t buf_pixel(const struct buf *b, int x, int y)
     case DRM_FORMAT_UYVY: { const uint8_t *p = row + (x & ~1) * 2; U = p[0]; V = p[2]; Y = p[1 + (x & 1) * 2]; break; }
     case DRM_FORMAT_NV16: {
         const uint8_t *uv = b->map + b->uv_off + (size_t)y * b->pitch + (x & ~1);
+        Y = row[x]; U = uv[0]; V = uv[1]; break;
+    }
+    case DRM_FORMAT_NV12: {
+        const uint8_t *uv = b->map + b->uv_off + (size_t)(y / 2) * b->pitch + (x & ~1);
         Y = row[x]; U = uv[0]; V = uv[1]; break;
     }
     default: return 0;
@@ -2370,6 +2870,10 @@ static bool load_ndi(void)
     if (hx)
         dlclose(hx);
     hx_decode = hx != NULL;
+    if (hx_decode) {
+        ndi_request_keyframe = (void (*)(NDIlib_recv_instance_t))dlsym(lib, "NDIlib_recv_request_keyframe");
+        hwdec_find();
+    }
     char buf[256];
     snprintf(buf, sizeof buf, "version=%s\nhx_receive=%d\n", ndi->version ? ndi->version() : "", hx != NULL);
     write_file_atomic(RUN_DIR "/ndi", buf);

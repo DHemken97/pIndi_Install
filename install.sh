@@ -275,16 +275,20 @@ if ! grep -qE "Raspberry Pi (4|5|400|500|Compute Module (4|5))" /proc/device-tre
     unit_exists rpi-eeprom-update.service && systemctl disable rpi-eeprom-update.service >/dev/null 2>&1 || true
 fi
 
-# Camera / ISP / hardware codec drivers are never used; they cost boot time.
-cat > /etc/modprobe.d/pindi-blacklist.conf <<'EOF'
-# Installed by PiNDI: unused camera, ISP and V4L2 codec drivers.
-blacklist bcm2835_v4l2
-blacklist bcm2835_isp
-blacklist bcm2835_codec
-blacklist bcm2835_mmal_vchiq
-blacklist vc_sm_cma
-blacklist rpi_hevc_dec
-EOF
+# Camera / ISP drivers are never used; they cost boot time. The Pi 3/4 hardware H.264
+# decoder (bcm2835_codec and what it needs) is kept when the NDI Advanced SDK is
+# installed: the player uses it for NDI|HX.
+{
+    echo "# Installed by PiNDI: unused camera, ISP and V4L2 codec drivers."
+    echo "blacklist bcm2835_v4l2"
+    echo "blacklist bcm2835_isp"
+    if [ ! -e /usr/local/lib/libndi_advanced.so ]; then
+        echo "blacklist bcm2835_codec"
+        echo "blacklist bcm2835_mmal_vchiq"
+        echo "blacklist vc_sm_cma"
+    fi
+    echo "blacklist rpi_hevc_dec"
+} > /etc/modprobe.d/pindi-blacklist.conf
 
 # Unattended operation: the hardware watchdog reboots the device if the system hangs,
 # and the journal stays small so it never fills the SD card.
