@@ -67,7 +67,7 @@
 /* Text height cap: 16pt at 96 dpi. */
 #define FONT_PT_PX 21
 #define MAX_OUT 4
-#define NBUF 4
+#define NBUF 8 /* per output; outputs showing its source hold some of them (decode once) */
 #define RUN_DIR "/run/pindi"
 
 static const NDIlib_v6 *ndi;
@@ -485,7 +485,7 @@ static void uyvy_to_nv16(const uint8_t *s, uint8_t *y, uint8_t *uv, int w)
 /* ------------------------------------------------------------------ outputs */
 
 enum { B_NONE = -1, B_FREE, B_WRITING, B_READY, B_QUEUED, B_SCANOUT };
-enum { P_NONE, P_SPLASH, P_VIDEO };
+enum { P_NONE, P_SPLASH, P_VIDEO, P_EXT };
 
 struct output {
     int n; /* 1-based, as shown in the web UI */
@@ -565,6 +565,19 @@ struct output {
     /* Latency of frames that reached the screen (main thread), published every 5 s. */
     struct { double pi_sum, pi_min, pi_max, tot_sum, tot_min, tot_max; int n, tot_n; uint64_t since; } lat;
 
+    /* Decode once (share_mu): outputs showing the same source use one receiver, the leader's, and put
+     * its decoded buffers on their own planes - no copy; rotation, mirror, size and brightness stay
+     * per output. vuse[b]: how many other outputs have this output's buffer b ready, queued or on
+     * screen (it is not written to until 0). ext_*: a leader's buffer this output shows, and whose. */
+    struct output *leader;  /* following this output's receiver, NULL = none */
+    char share_src[256];    /* leader: the source its receiver is connected to, "" = not leading */
+    char share_url[128], share_video[64];
+    int share_bw;
+    bool share_flush;       /* the owner reallocates its buffers: get its buffers off screen */
+    int vuse[NBUF];
+    int ext_ready, ext_queued, ext_scanout;
+    struct output *ext_ready_of, *ext_queued_of, *ext_scanout_of;
+
     /* Receiver thread. */
     pthread_t thr;
     bool thr_started;
@@ -573,12 +586,123 @@ struct output {
 
 static struct output outs[MAX_OUT];
 static int nout;
+static pthread_mutex_t share_mu = PTHREAD_MUTEX_INITIALIZER; /* taken after an output's lock, never before */
 static struct image splash_img;
 
 static void wake(void)
 {
     char c = 1;
     if (write(wake_pipe[1], &c, 1) < 0) { /* pipe full: main thread is awake anyway */ }
+}
+
+/* share_mu held: o no longer uses buffer idx of owner. */
+static void ext_release(struct output *owner, int idx)
+{
+    if (owner && idx >= 0 && owner->vuse[idx] > 0)
+        owner->vuse[idx]--;
+}
+
+/* Leader thread: buffer idx of L is its newest frame - make it the next one on its followers too. */
+static void share_publish(struct output *L, int idx)
+{
+    bool any = false;
+    pthread_mutex_lock(&L->lock);
+    pthread_mutex_lock(&share_mu);
+    int st = L->vstate[idx];
+    if (st == B_READY || st == B_QUEUED || st == B_SCANOUT)
+        for (int i = 0; i < nout; i++) {
+            struct output *f = &outs[i];
+            if (f->leader != L)
+                continue;
+            ext_release(f->ext_ready_of, f->ext_ready);
+            f->ext_ready = idx;
+            f->ext_ready_of = L;
+            L->vuse[idx]++;
+            any = true;
+        }
+    pthread_mutex_unlock(&share_mu);
+    pthread_mutex_unlock(&L->lock);
+    if (any)
+        wake();
+}
+
+/* share_mu held: o stops leading; its followers search on their own. */
+static void share_drop_followers(struct output *o)
+{
+    o->share_src[0] = 0;
+    for (int i = 0; i < nout; i++)
+        if (outs[i].leader == o) {
+            outs[i].leader = NULL;
+            ext_release(outs[i].ext_ready_of, outs[i].ext_ready);
+            outs[i].ext_ready = -1;
+            outs[i].ext_ready_of = NULL;
+        }
+}
+
+/* Receiver thread: o's receiver is gone. */
+static void share_release(struct output *o)
+{
+    pthread_mutex_lock(&share_mu);
+    share_drop_followers(o);
+    pthread_mutex_unlock(&share_mu);
+}
+
+/* Receiver thread: stop following. */
+static void share_leave(struct output *o)
+{
+    pthread_mutex_lock(&share_mu);
+    o->leader = NULL;
+    ext_release(o->ext_ready_of, o->ext_ready);
+    o->ext_ready = -1;
+    o->ext_ready_of = NULL;
+    pthread_mutex_unlock(&share_mu);
+}
+
+/* Receiver thread: about to connect to source name: the output already receiving it (then follow
+ * it), or NULL after claiming the source for o (then connect). */
+static struct output *share_claim(struct output *o, const char *name, const char *url, int bw)
+{
+    struct output *L = NULL;
+    pthread_mutex_lock(&share_mu);
+    share_drop_followers(o); /* they followed what o received before */
+    for (int i = 0; i < nout && !L; i++)
+        if (&outs[i] != o && outs[i].share_bw == bw && !strcmp(outs[i].share_src, name) &&
+            outs[i].has_uyvy == o->has_uyvy && outs[i].has_nv16 == o->has_nv16 && outs[i].has_nv12 == o->has_nv12)
+            L = &outs[i];
+    if (L) {
+        o->leader = L;
+    } else {
+        snprintf(o->share_src, sizeof o->share_src, "%s", name);
+        snprintf(o->share_url, sizeof o->share_url, "%s", url);
+        o->share_video[0] = 0;
+        o->share_bw = bw;
+    }
+    pthread_mutex_unlock(&share_mu);
+    return L;
+}
+
+/* Main thread: o's buffers go away (display off, reallocation): forget them wherever they are shown,
+ * and give back the other outputs' buffers o itself held. */
+static void share_forget(struct output *o)
+{
+    pthread_mutex_lock(&share_mu);
+    ext_release(o->ext_ready_of, o->ext_ready);
+    ext_release(o->ext_queued_of, o->ext_queued);
+    ext_release(o->ext_scanout_of, o->ext_scanout);
+    o->ext_ready = o->ext_queued = o->ext_scanout = -1;
+    o->ext_ready_of = o->ext_queued_of = o->ext_scanout_of = NULL;
+    for (int i = 0; i < nout; i++) {
+        struct output *f = &outs[i];
+        if (f->ext_ready_of == o)
+            f->ext_ready = -1, f->ext_ready_of = NULL;
+        if (f->ext_queued_of == o)
+            f->ext_queued = -1, f->ext_queued_of = NULL;
+        if (f->ext_scanout_of == o)
+            f->ext_scanout = -1, f->ext_scanout_of = NULL;
+    }
+    memset(o->vuse, 0, sizeof o->vuse);
+    o->share_flush = false;
+    pthread_mutex_unlock(&share_mu);
 }
 
 static uint32_t prop_id(uint32_t obj, uint32_t type, const char *name)
@@ -744,6 +868,7 @@ static void discover_outputs(void)
     for (int i = 0; i < nout; i++) {
         struct output *o = &outs[i];
         o->n = i + 1;
+        o->ext_ready = o->ext_queued = o->ext_scanout = -1;
         pthread_mutex_init(&o->lock, NULL);
         o->ready = o->queued = o->scanout = o->last_video = -1;
         for (int b = 0; b < NBUF; b++)
@@ -990,6 +1115,7 @@ static void splash_update_text(struct output *o, const char *ip, bool force)
 /* Free the video buffers. Caller holds o->lock and has made sure none is on screen. */
 static void pool_free(struct output *o)
 {
+    share_forget(o);
     for (int b = 0; b < NBUF; b++) {
         buf_destroy(&o->vid[b]);
         o->vstate[b] = B_NONE;
@@ -1135,21 +1261,21 @@ static uint64_t clock_us(clockid_t id)
 }
 
 /* A video frame reached the screen at flip_us (monotonic, from the vblank event). */
-static void latency_add(struct output *o, int idx, uint64_t flip_us)
+static void latency_add(struct output *o, int64_t sent, uint64_t recv_us, uint64_t flip_us)
 {
     if (!o->lat.n && !o->lat.tot_n) {
         o->lat.pi_min = o->lat.tot_min = 1e9;
         o->lat.pi_max = o->lat.tot_max = -1e9;
     }
-    double pi = (double)(int64_t)(flip_us - o->vrecv[idx]) / 1000.0;
+    double pi = (double)(int64_t)(flip_us - recv_us) / 1000.0;
     o->lat.pi_sum += pi;
     o->lat.pi_min = fmin(o->lat.pi_min, pi);
     o->lat.pi_max = fmax(o->lat.pi_max, pi);
     o->lat.n++;
-    if (o->vsent[idx] != INT64_MAX) {
+    if (sent != INT64_MAX) {
         /* Sender time is UTC: move the flip time from the monotonic to the realtime clock. */
         int64_t offset_us = (int64_t)clock_us(CLOCK_REALTIME) - (int64_t)clock_us(CLOCK_MONOTONIC);
-        double tot = ((double)((int64_t)flip_us + offset_us) * 10.0 - (double)o->vsent[idx]) / 10000.0;
+        double tot = ((double)((int64_t)flip_us + offset_us) * 10.0 - (double)sent) / 10000.0;
         o->lat.tot_sum += tot;
         o->lat.tot_min = fmin(o->lat.tot_min, tot);
         o->lat.tot_max = fmax(o->lat.tot_max, tot);
@@ -1184,15 +1310,36 @@ static void on_flip(int fd, unsigned seq, unsigned sec, unsigned usec, unsigned 
 {
     (void)fd; (void)seq; (void)crtc;
     struct output *o = data;
+    uint64_t flip_us = (uint64_t)sec * 1000000 + usec;
     pthread_mutex_lock(&o->lock);
-    if (o->pending == P_VIDEO) {
+    /* Whatever is on screen now replaces a leader's buffer shown before. */
+    pthread_mutex_lock(&share_mu);
+    ext_release(o->ext_scanout_of, o->ext_scanout);
+    o->ext_scanout = -1;
+    o->ext_scanout_of = NULL;
+    if (o->pending == P_EXT) {
+        o->ext_scanout = o->ext_queued;
+        o->ext_scanout_of = o->ext_queued_of;
+        o->ext_queued = -1;
+        o->ext_queued_of = NULL;
+    } else {
+        ext_release(o->ext_queued_of, o->ext_queued); /* a commit that didn't show it */
+        o->ext_queued = -1;
+        o->ext_queued_of = NULL;
+    }
+    struct output *L = o->ext_scanout_of;
+    int li = o->ext_scanout;
+    pthread_mutex_unlock(&share_mu);
+    if (o->pending == P_VIDEO || o->pending == P_EXT) {
         if (o->scanout >= 0)
             o->vstate[o->scanout] = B_FREE;
-        o->scanout = o->queued;
+        o->scanout = o->pending == P_VIDEO ? o->queued : -1;
         if (o->scanout >= 0) {
             o->last_video = o->scanout;
             o->vstate[o->scanout] = B_SCANOUT;
-            latency_add(o, o->scanout, (uint64_t)sec * 1000000 + usec);
+            latency_add(o, o->vsent[o->scanout], o->vrecv[o->scanout], flip_us);
+        } else if (L) { /* the leader's buffer is held for us (vuse): its times stay put */
+            latency_add(o, L->vsent[li], L->vrecv[li], flip_us);
         }
         o->queued = -1;
         o->on_splash = false;
@@ -1220,6 +1367,13 @@ static void output_service(struct output *o)
         bool writing = o->thumb_reading;
         for (int b = 0; b < NBUF; b++)
             writing |= o->vstate[b] == B_WRITING;
+        pthread_mutex_lock(&share_mu);
+        for (int b = 0; b < NBUF; b++)
+            if (o->vuse[b]) { /* shown by other outputs: they put their splash up first */
+                writing = true;
+                o->share_flush = true;
+            }
+        pthread_mutex_unlock(&share_mu);
         if (!o->on_splash) {
             pthread_mutex_unlock(&o->lock);
             commit_buf(o, &o->splash, 0, P_SPLASH); /* get the old buffers off screen first */
@@ -1280,6 +1434,47 @@ static void output_service(struct output *o)
         }
     }
 
+    /* A frame of the receiver this output follows (or a flush: its buffers are needed back). */
+    pthread_mutex_lock(&share_mu);
+    struct output *L = o->ext_ready_of;
+    int li = o->ext_ready;
+    bool flush = (o->ext_scanout_of && o->ext_scanout_of->share_flush) ||
+                 (o->ext_ready_of && o->ext_ready_of->share_flush);
+    if (flush) {
+        ext_release(o->ext_ready_of, o->ext_ready);
+        o->ext_ready = -1;
+        o->ext_ready_of = NULL;
+        L = NULL;
+    } else if (L && o->ready < 0 && !o->identify) {
+        o->ext_queued = li;
+        o->ext_queued_of = L;
+        o->ext_ready = -1;
+        o->ext_ready_of = NULL;
+    } else {
+        L = NULL;
+    }
+    pthread_mutex_unlock(&share_mu);
+    if (flush && !o->on_splash) {
+        pthread_mutex_unlock(&o->lock);
+        commit_buf(o, &o->splash, 0, P_SPLASH);
+        return;
+    }
+    if (L) {
+        o->want_splash = false;
+        pthread_mutex_unlock(&o->lock);
+        pthread_mutex_lock(&L->lock); /* aspect: written before the frame was published */
+        double ar = L->vaspect[li];
+        pthread_mutex_unlock(&L->lock);
+        if (!commit_buf(o, &L->vid[li], ar, P_EXT)) {
+            pthread_mutex_lock(&share_mu);
+            ext_release(o->ext_queued_of, o->ext_queued);
+            o->ext_queued = -1;
+            o->ext_queued_of = NULL;
+            pthread_mutex_unlock(&share_mu);
+        }
+        return;
+    }
+
     if (o->ready >= 0) {
         int idx = o->ready;
         double ar = o->vaspect[idx];
@@ -1334,13 +1529,15 @@ static int frame_begin(struct output *o, int w, int h, uint32_t fmt, bool *too_b
         return -1;
     }
     int idx = -1;
+    pthread_mutex_lock(&share_mu); /* buffers other outputs show are not written to */
     for (int b = 0; b < NBUF && idx < 0; b++)
-        if (o->vstate[b] == B_FREE)
+        if (o->vstate[b] == B_FREE && !o->vuse[b])
             idx = b;
-    if (idx < 0 && o->ready >= 0) { /* replace the not-yet-shown frame with this newer one */
+    if (idx < 0 && o->ready >= 0 && !o->vuse[o->ready]) { /* replace the not-yet-shown frame with this newer one */
         idx = o->ready;
         o->ready = -1;
     }
+    pthread_mutex_unlock(&share_mu);
     if (idx >= 0) {
         o->vstate[idx] = B_WRITING;
         o->want_splash = false;
@@ -1364,6 +1561,7 @@ static void frame_end(struct output *o, int idx, double aspect, int64_t sent, ui
     }
     pthread_mutex_unlock(&o->lock);
     wake();
+    share_publish(o, idx);
 }
 
 /* Receiver thread: hand a frame to the display. Drops it if no buffer is free. */
@@ -1715,7 +1913,9 @@ static void hwdec_refill(struct output *o, struct hwdec *d)
         return;
     for (int b = 0; b < NBUF; b++) {
         pthread_mutex_lock(&o->lock);
-        bool take = o->vstate[b] == B_FREE && b != o->last_video;
+        pthread_mutex_lock(&share_mu);
+        bool take = o->vstate[b] == B_FREE && b != o->last_video && !o->vuse[b];
+        pthread_mutex_unlock(&share_mu);
         if (take)
             o->vstate[b] = B_WRITING;
         pthread_mutex_unlock(&o->lock);
@@ -1799,6 +1999,7 @@ static void hwdec_poll(struct output *o, struct hwdec *d, int wait_ms)
                 d->decoded++;
                 got = true;
                 wake();
+                share_publish(o, idx);
             }
             hwdec_refill(o, d);
         }
@@ -2562,6 +2763,16 @@ static void codec_probe_start(struct output *o, NDIlib_recv_bandwidth_e bandwidt
         free(p);
 }
 
+/* Leader thread: an audio frame for the outputs following o (each plays it with its own settings). */
+static void share_audio(struct output *o, const NDIlib_audio_frame_v3_t *a)
+{
+    pthread_mutex_lock(&share_mu);
+    for (int i = 0; i < nout; i++)
+        if (outs[i].leader == o && strcasecmp(outs[i].audio_s, "off"))
+            audio_play(&outs[i], a);
+    pthread_mutex_unlock(&share_mu);
+}
+
 static void *receiver(void *arg)
 {
     struct output *o = arg;
@@ -2604,12 +2815,70 @@ static void *receiver(void *arg)
     int last_w = 0, last_h = 0;
     uint64_t key_asked = 0;
     int prev_conns = -1; /* connections to the sender at the last check; -1: none yet */
+    bool following = false; /* showing another output's receiver (decode once) */
 
     while (running) {
         uint64_t now = now_ms();
         if (!recv && hx_mode) {
             hwdec_close(o, &hw);
             hx_mode = false;
+        }
+        if (!recv && *o->share_src)
+            share_release(o); /* our receiver is gone: the outputs following it search on their own */
+
+        /* Following another output's receiver: its frames and audio come to this output by themselves.
+         * Stop when it stops receiving, this display goes away or this output gets another stream. */
+        if (following) {
+            char src[256] = "", url[128] = "", vid[64] = "";
+            pthread_mutex_lock(&share_mu);
+            struct output *L = o->leader;
+            if (L) {
+                snprintf(src, sizeof src, "%s", L->share_src);
+                snprintf(url, sizeof url, "%s", L->share_url);
+                snprintf(vid, sizeof vid, "%s", L->share_video);
+            }
+            pthread_mutex_unlock(&share_mu);
+            pthread_mutex_lock(&o->lock);
+            bool use = o->usable;
+            pthread_mutex_unlock(&o->lock);
+            int sw = 0;
+            if (L && use && now - switch_check >= 300) {
+                switch_check = now;
+                sw = switch_poll(o, &switch_seen);
+            }
+            if (L && use && !sw) {
+                status_set(o, on_backup ? "playing (backup)" : "playing", src, url, vid);
+                usleep(50000);
+                continue;
+            }
+            share_leave(o);
+            following = false;
+            audio_close(o);
+            if (audio_on)
+                audio_info(o, "");
+            search_since = now;
+            failed_src[0] = 0;
+            if (!L) {
+                LOG("ndi: output %d: the receiver it showed stopped", o->n);
+                if (*o->backup) {
+                    splash_at = now + 6000; /* hold the picture while the other stream takes over */
+                    if (!on_backup)
+                        search_since = now - 3000;
+                } else {
+                    request_splash(o);
+                }
+            } else if (sw) {
+                splash_at = now + 6000; /* keep the picture until the new stream's first frame */
+                if (sw == 2 && find) {
+                    snprintf(extra_ips, sizeof extra_ips, "%s%s%s", extra, *o->source_ip && *extra ? "," : "",
+                             o->source_ip);
+                    ndi->find_destroy(find);
+                    find = NULL;
+                }
+            }
+            on_backup = false;
+            status_set(o, "searching", "", "", "");
+            continue;
         }
         bool usable;
         pthread_mutex_lock(&o->lock);
@@ -2790,6 +3059,19 @@ static void *receiver(void *arg)
                 backup = pick != NULL;
             }
             if (pick) {
+                /* Another output already receives it: show its frames instead of decoding it again. */
+                struct output *L = share_claim(o, pick->p_ndi_name, pick->p_url_address ? pick->p_url_address : "",
+                                               (int)bandwidth);
+                if (L) {
+                    LOG("ndi: output %d: %s is already received by output %d, showing it from there (decoded once)",
+                        o->n, pick->p_ndi_name, L->n);
+                    following = true;
+                    on_backup = backup;
+                    search_since = 0;
+                    splash_at = 0;
+                    last_match = now;
+                    continue;
+                }
                 NDIlib_recv_create_v3_t rc = {
                     .source_to_connect_to = *pick,
                     .color_format = color,
@@ -2820,6 +3102,7 @@ static void *receiver(void *arg)
                 } else {
                     LOG("ndi: output %d: cannot create receiver for %s", o->n, cur_src);
                     snprintf(failed_src, sizeof failed_src, "%s", cur_src);
+                    share_release(o);
                 }
                 last_match = now;
             } else if (now - last_match > 30000 && now - find_created > 30000) {
@@ -2881,6 +3164,11 @@ static void *receiver(void *arg)
                      v.frame_rate_D ? (double)v.frame_rate_N / v.frame_rate_D : 0.0);
             status_set(o, !shown ? "cannot display (too big)" : on_backup ? "playing (backup)" : "playing", cur_src,
                        cur_url, vid);
+            if (strcmp(vid, o->share_video)) {
+                pthread_mutex_lock(&share_mu);
+                snprintf(o->share_video, sizeof o->share_video, "%s", vid);
+                pthread_mutex_unlock(&share_mu);
+            }
             splash_at = 0;
             ndi->recv_free_video_v2(recv, &v);
             got_frame = true;
@@ -2889,6 +3177,7 @@ static void *receiver(void *arg)
         }
         if (t == NDIlib_frame_type_audio) {
             audio_play(o, &a);
+            share_audio(o, &a);
             ndi->recv_free_audio_v3(recv, &a);
         }
 
@@ -3003,6 +3292,8 @@ static void *receiver(void *arg)
                 audio_info(o, "");
         }
     }
+    share_release(o);
+    share_leave(o);
     hwdec_close(o, &hw);
     if (recv)
         ndi->recv_destroy(recv);
@@ -3120,7 +3411,29 @@ static void thumb_publish(struct output *o)
     double ar = b ? o->vaspect[o->scanout] : 0;
     const uint32_t *comp = o->comp;
     int W = o->W, sw = b ? b->w : o->W, sh = b ? b->h : o->H;
+    struct output *L = NULL; /* showing another output's buffer (decode once): pin that one instead */
+    int li = -1;
+    if (!b && !o->on_splash) {
+        pthread_mutex_lock(&share_mu);
+        L = o->ext_scanout_of;
+        li = o->ext_scanout;
+        pthread_mutex_unlock(&share_mu);
+    }
     pthread_mutex_unlock(&o->lock);
+    if (L) {
+        struct output *lo = L;
+        pthread_mutex_lock(&lo->lock);
+        if (lo->usable && lo->vstate[li] != B_NONE) {
+            lo->thumb_reading = true; /* this thread does one output at a time: never L's own preview now */
+            b = &lo->vid[li];
+            ar = lo->vaspect[li];
+            sw = b->w;
+            sh = b->h;
+        } else {
+            L = NULL;
+        }
+        pthread_mutex_unlock(&lo->lock);
+    }
     if (!ar)
         ar = (double)sw / sh;
     int tw = THUMB_W, th = (int)(THUMB_W / ar + 0.5);
@@ -3146,6 +3459,11 @@ static void thumb_publish(struct output *o)
     pthread_mutex_lock(&o->lock);
     o->thumb_reading = false;
     pthread_mutex_unlock(&o->lock);
+    if (L) {
+        pthread_mutex_lock(&L->lock);
+        L->thumb_reading = false;
+        pthread_mutex_unlock(&L->lock);
+    }
 
     struct jpeg_compress_struct ci;
     struct jpeg_error_mgr je;
