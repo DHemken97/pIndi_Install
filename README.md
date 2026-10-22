@@ -112,8 +112,10 @@ is then only encoded while another device receives the stream.
 one memory bus and one video unit. Measured with a 1080p60 capture card:
 showing Full NDI 1080p60 leaves the outgoing stream about 10 fps; with NDI|HX
 in both directions (hardware decoding and encoding) the display gets about
-33 fps and the outgoing stream about 19 fps. A Pi 4 (faster cores, Ethernet
-not on USB) should have far more headroom; not measured yet.
+33 fps and the outgoing stream about 19 fps. A Pi 4B showing Full NDI 1080p60
+on one output and 1080p on the other (no capture) holds 60 fps with no dropped
+frames at about 40% CPU and 66 °C, unthrottled; sending from a capture card on
+a Pi 4 is not measured yet.
 
 ## NDI|HX
 
