@@ -527,7 +527,7 @@ struct output {
     int ww, wh;
     uint32_t wfmt; /* format the receiver needs */
     bool want_realloc, want_splash, on_splash;
-    int ready, queued, scanout;
+    int ready, ready2, queued, scanout; /* ready, ready2: the next frames to show, oldest first */
     char splash_msg[192]; /* what the receiver is doing, shown on the splash */
     bool thumb_reading;   /* the preview thread is reading a buffer: don't free any */
     bool cant_display;    /* no buffers for the current frame size (pw x ph) */
@@ -575,8 +575,8 @@ struct output {
     int share_bw;
     bool share_flush;       /* the owner reallocates its buffers: get its buffers off screen */
     int vuse[NBUF];
-    int ext_ready, ext_queued, ext_scanout;
-    struct output *ext_ready_of, *ext_queued_of, *ext_scanout_of;
+    int ext_ready, ext_ready2, ext_queued, ext_scanout;
+    struct output *ext_ready_of, *ext_ready2_of, *ext_queued_of, *ext_scanout_of;
 
     /* Receiver thread. */
     pthread_t thr;
@@ -602,6 +602,61 @@ static void ext_release(struct output *owner, int idx)
         owner->vuse[idx]--;
 }
 
+/* o->lock held: frame idx is complete. Up to two frames wait to be shown, so a frame that arrives
+ * right after another (decoders work in bursts) waits one refresh instead of replacing it; with
+ * both waiting, the oldest is dropped (at most one refresh of delay). */
+static void ready_push(struct output *o, int idx)
+{
+    if (o->ready < 0) {
+        o->ready = idx;
+    } else if (o->ready2 < 0) {
+        o->ready2 = idx;
+    } else {
+        o->vstate[o->ready] = B_FREE;
+        o->ready = o->ready2;
+        o->ready2 = idx;
+    }
+    o->vstate[idx] = B_READY;
+}
+
+/* o->lock held: drop the frames waiting to be shown. */
+static void ready_clear(struct output *o)
+{
+    if (o->ready >= 0)
+        o->vstate[o->ready] = B_FREE;
+    if (o->ready2 >= 0)
+        o->vstate[o->ready2] = B_FREE;
+    o->ready = o->ready2 = -1;
+}
+
+/* share_mu held: the same for an output showing a leader's frames. */
+static void ext_push(struct output *f, struct output *L, int idx)
+{
+    if (f->ext_ready >= 0 && f->ext_ready2 >= 0) {
+        ext_release(f->ext_ready_of, f->ext_ready);
+        f->ext_ready = f->ext_ready2;
+        f->ext_ready_of = f->ext_ready2_of;
+        f->ext_ready2 = -1;
+        f->ext_ready2_of = NULL;
+    }
+    if (f->ext_ready < 0) {
+        f->ext_ready = idx;
+        f->ext_ready_of = L;
+    } else {
+        f->ext_ready2 = idx;
+        f->ext_ready2_of = L;
+    }
+    L->vuse[idx]++;
+}
+
+static void ext_clear_ready(struct output *f)
+{
+    ext_release(f->ext_ready_of, f->ext_ready);
+    ext_release(f->ext_ready2_of, f->ext_ready2);
+    f->ext_ready = f->ext_ready2 = -1;
+    f->ext_ready_of = f->ext_ready2_of = NULL;
+}
+
 /* Leader thread: buffer idx of L is its newest frame - make it the next one on its followers too. */
 static void share_publish(struct output *L, int idx)
 {
@@ -614,10 +669,7 @@ static void share_publish(struct output *L, int idx)
             struct output *f = &outs[i];
             if (f->leader != L)
                 continue;
-            ext_release(f->ext_ready_of, f->ext_ready);
-            f->ext_ready = idx;
-            f->ext_ready_of = L;
-            L->vuse[idx]++;
+            ext_push(f, L, idx);
             any = true;
         }
     pthread_mutex_unlock(&share_mu);
@@ -633,9 +685,7 @@ static void share_drop_followers(struct output *o)
     for (int i = 0; i < nout; i++)
         if (outs[i].leader == o) {
             outs[i].leader = NULL;
-            ext_release(outs[i].ext_ready_of, outs[i].ext_ready);
-            outs[i].ext_ready = -1;
-            outs[i].ext_ready_of = NULL;
+            ext_clear_ready(&outs[i]);
         }
 }
 
@@ -652,9 +702,7 @@ static void share_leave(struct output *o)
 {
     pthread_mutex_lock(&share_mu);
     o->leader = NULL;
-    ext_release(o->ext_ready_of, o->ext_ready);
-    o->ext_ready = -1;
-    o->ext_ready_of = NULL;
+    ext_clear_ready(o);
     pthread_mutex_unlock(&share_mu);
 }
 
@@ -686,15 +734,21 @@ static struct output *share_claim(struct output *o, const char *name, const char
 static void share_forget(struct output *o)
 {
     pthread_mutex_lock(&share_mu);
-    ext_release(o->ext_ready_of, o->ext_ready);
+    ext_clear_ready(o);
     ext_release(o->ext_queued_of, o->ext_queued);
     ext_release(o->ext_scanout_of, o->ext_scanout);
-    o->ext_ready = o->ext_queued = o->ext_scanout = -1;
-    o->ext_ready_of = o->ext_queued_of = o->ext_scanout_of = NULL;
+    o->ext_queued = o->ext_scanout = -1;
+    o->ext_queued_of = o->ext_scanout_of = NULL;
     for (int i = 0; i < nout; i++) {
         struct output *f = &outs[i];
         if (f->ext_ready_of == o)
             f->ext_ready = -1, f->ext_ready_of = NULL;
+        if (f->ext_ready2_of == o)
+            f->ext_ready2 = -1, f->ext_ready2_of = NULL;
+        if (f->ext_ready < 0 && f->ext_ready2 >= 0) {
+            f->ext_ready = f->ext_ready2, f->ext_ready_of = f->ext_ready2_of;
+            f->ext_ready2 = -1, f->ext_ready2_of = NULL;
+        }
         if (f->ext_queued_of == o)
             f->ext_queued = -1, f->ext_queued_of = NULL;
         if (f->ext_scanout_of == o)
@@ -868,9 +922,9 @@ static void discover_outputs(void)
     for (int i = 0; i < nout; i++) {
         struct output *o = &outs[i];
         o->n = i + 1;
-        o->ext_ready = o->ext_queued = o->ext_scanout = -1;
+        o->ext_ready = o->ext_ready2 = o->ext_queued = o->ext_scanout = -1;
         pthread_mutex_init(&o->lock, NULL);
-        o->ready = o->queued = o->scanout = o->last_video = -1;
+        o->ready = o->ready2 = o->queued = o->scanout = o->last_video = -1;
         for (int b = 0; b < NBUF; b++)
             o->vstate[b] = B_NONE;
         LOG("display: output %d = %s (video as %s)", o->n, o->conn_name,
@@ -1122,7 +1176,7 @@ static void pool_free(struct output *o)
     }
     o->pw = o->ph = 0;
     o->pfmt = 0;
-    o->ready = o->queued = o->scanout = o->last_video = -1;
+    o->ready = o->ready2 = o->queued = o->scanout = o->last_video = -1;
 }
 
 static void output_disable(struct output *o)
@@ -1412,10 +1466,7 @@ static void output_service(struct output *o)
     }
 
     if (o->identify) {
-        if (o->ready >= 0) {
-            o->vstate[o->ready] = B_FREE;
-            o->ready = -1;
-        }
+        ready_clear(o);
         bool show = !o->on_splash;
         pthread_mutex_unlock(&o->lock);
         if (show)
@@ -1441,15 +1492,15 @@ static void output_service(struct output *o)
     bool flush = (o->ext_scanout_of && o->ext_scanout_of->share_flush) ||
                  (o->ext_ready_of && o->ext_ready_of->share_flush);
     if (flush) {
-        ext_release(o->ext_ready_of, o->ext_ready);
-        o->ext_ready = -1;
-        o->ext_ready_of = NULL;
+        ext_clear_ready(o);
         L = NULL;
     } else if (L && o->ready < 0 && !o->identify) {
         o->ext_queued = li;
         o->ext_queued_of = L;
-        o->ext_ready = -1;
-        o->ext_ready_of = NULL;
+        o->ext_ready = o->ext_ready2;
+        o->ext_ready_of = o->ext_ready2_of;
+        o->ext_ready2 = -1;
+        o->ext_ready2_of = NULL;
     } else {
         L = NULL;
     }
@@ -1478,7 +1529,8 @@ static void output_service(struct output *o)
     if (o->ready >= 0) {
         int idx = o->ready;
         double ar = o->vaspect[idx];
-        o->ready = -1;
+        o->ready = o->ready2;
+        o->ready2 = -1;
         o->vstate[idx] = B_QUEUED;
         o->queued = idx;
         pthread_mutex_unlock(&o->lock);
@@ -1533,7 +1585,10 @@ static int frame_begin(struct output *o, int w, int h, uint32_t fmt, bool *too_b
     for (int b = 0; b < NBUF && idx < 0; b++)
         if (o->vstate[b] == B_FREE && !o->vuse[b])
             idx = b;
-    if (idx < 0 && o->ready >= 0 && !o->vuse[o->ready]) { /* replace the not-yet-shown frame with this newer one */
+    if (idx < 0 && o->ready2 >= 0 && !o->vuse[o->ready2]) { /* replace the newest not-yet-shown frame */
+        idx = o->ready2;
+        o->ready2 = -1;
+    } else if (idx < 0 && o->ready >= 0 && o->ready2 < 0 && !o->vuse[o->ready]) {
         idx = o->ready;
         o->ready = -1;
     }
@@ -1551,10 +1606,7 @@ static void frame_end(struct output *o, int idx, double aspect, int64_t sent, ui
 {
     pthread_mutex_lock(&o->lock);
     if (o->vstate[idx] == B_WRITING) {
-        if (o->ready >= 0)
-            o->vstate[o->ready] = B_FREE;
-        o->ready = idx;
-        o->vstate[idx] = B_READY;
+        ready_push(o, idx);
         o->vaspect[idx] = aspect;
         o->vsent[idx] = sent;
         o->vrecv[idx] = recv_us;
@@ -1671,10 +1723,7 @@ static void request_splash(struct output *o)
 {
     pthread_mutex_lock(&o->lock);
     o->want_splash = true;
-    if (o->ready >= 0) {
-        o->vstate[o->ready] = B_FREE;
-        o->ready = -1;
-    }
+    ready_clear(o);
     pthread_mutex_unlock(&o->lock);
     wake();
 }
@@ -1982,10 +2031,7 @@ static void hwdec_poll(struct output *o, struct hwdec *d, int wait_ms)
             pthread_mutex_lock(&o->lock);
             if (idx < NBUF && o->vstate[idx] == B_WRITING) {
                 if (ok) {
-                    if (o->ready >= 0)
-                        o->vstate[o->ready] = B_FREE;
-                    o->ready = idx;
-                    o->vstate[idx] = B_READY;
+                    ready_push(o, idx);
                     o->vaspect[idx] = d->aspect > 0 ? d->aspect : (double)d->vw / d->vh;
                     o->vsent[idx] = d->meta[m].sent;
                     o->vrecv[idx] = d->meta[m].recv;
