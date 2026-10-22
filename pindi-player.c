@@ -2551,6 +2551,7 @@ static void *receiver(void *arg)
     char hw_failed[256] = ""; /* the source the hardware decoder failed on: the NDI library decodes it */
     int last_w = 0, last_h = 0;
     uint64_t key_asked = 0;
+    int prev_conns = -1; /* connections to the sender at the last check; -1: none yet */
 
     while (running) {
         uint64_t now = now_ms();
@@ -2901,6 +2902,11 @@ static void *receiver(void *arg)
         int conns = ndi->recv_get_no_connections(recv);
         if (conns > 0 && now > last_alive)
             last_alive = now;
+        /* The sender came back (e.g. restarted with another codec): the NDI library reconnects by itself,
+         * so check the codec again, or HX would stay decoded in software. */
+        if (conns > 0 && prev_conns == 0 && got_frame && !hx_mode && hx_decode)
+            codec_probe_start(o, bandwidth, cur_src, cur_url);
+        prev_conns = conns;
 
         if (stats_ms > 0 && now - last_stats >= (uint64_t)stats_ms) {
             NDIlib_recv_performance_t total, dropped;
