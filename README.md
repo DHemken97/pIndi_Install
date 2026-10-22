@@ -112,7 +112,11 @@ is then only encoded while another device receives the stream.
 one memory bus and one video unit. Measured with a 1080p60 capture card:
 showing Full NDI 1080p60 leaves the outgoing stream about 10 fps; with NDI|HX
 in both directions (hardware decoding and encoding) the display gets about
-33 fps and the outgoing stream about 19 fps. A Pi 4B showing Full NDI 1080p60
+33 fps and the outgoing stream about 19 fps. A Pi 3B+ (with a fan) is CPU-bound
+the same way: Full NDI both ways gives about 39 fps on screen and 7 fps out;
+sending HX gives about 19 fps out and 22 fps on screen. Showing Full NDI
+1080p60 alone, a 3B+ holds 59 fps. A Pi 3B or 3B+ is a one-input device:
+three capture cards on a 3B+ got about 5 fps each. A Pi 4B showing Full NDI 1080p60
 on one output and 1080p on the other (no capture) holds 60 fps with no dropped
 frames at about 40% CPU and 66 °C, unthrottled; sending from a capture card on
 a Pi 4 is not measured yet.
