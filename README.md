@@ -128,7 +128,9 @@ To receive HX, put `Install_NDI_Advanced_SDK_v6_Linux.tar.gz` next to
 which that SDK uses to decode H.264/HEVC. The sender chooses the codec; the
 web interface shows which one a stream uses and how many frames per second
 actually reach the screen. On a Pi 3 or 4, H.264 HX is decoded by the Pi's
-hardware decoder (1080p60 on a Pi 3B). HEVC HX, and everything on a Pi 5
+hardware decoder (1080p60 on a Pi 3B and 4B). The decoder is shared, so a
+Pi 4 with two HX 1080p60 streams shows each at about 49 fps with about 250 ms
+of delay; use Full NDI (or 30 fps HX) for the second output. HEVC HX, and everything on a Pi 5
 (which has no H.264 decoder), is decoded in software by the NDI library, which
 manages only a few frames per second at 1080p on a Pi 3.
 

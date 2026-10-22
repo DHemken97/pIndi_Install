@@ -2797,7 +2797,10 @@ static void *receiver(void *arg)
 
         NDIlib_video_frame_v2_t v;
         NDIlib_audio_frame_v3_t a;
-        NDIlib_frame_type_e t = ndi->recv_capture_v3(recv, &v, audio_on ? &a : NULL, NULL, hx_mode ? 20 : 100);
+        /* HX: never wait on the decoder (NDI drops frames it can't hand over, which breaks the H.264
+         * references); while pictures are in flight, come back every few ms to collect them. */
+        int wait = !hx_mode ? 100 : hw.fed > hw.decoded ? 4 : 20;
+        NDIlib_frame_type_e t = ndi->recv_capture_v3(recv, &v, audio_on ? &a : NULL, NULL, wait);
         uint64_t recv_us = clock_us(CLOCK_MONOTONIC);
         now = now_ms();
         bool hx_leave = false;
@@ -2837,7 +2840,7 @@ static void *receiver(void *arg)
         }
 
         if (hx_mode && !hx_leave) {
-            hwdec_poll(o, &hw, t == NDIlib_frame_type_video ? 40 : 0);
+            hwdec_poll(o, &hw, 0);
             if (hw.need_key && ndi_request_keyframe && now - key_asked > 1000) {
                 ndi_request_keyframe(recv); /* don't wait for the sender's next one */
                 key_asked = now;
