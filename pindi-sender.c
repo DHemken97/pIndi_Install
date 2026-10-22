@@ -448,6 +448,8 @@ struct hwenc {
     size_t pkt_cap;
     int64_t frame_100ns;
     uint64_t sent;
+    int keys, forced; /* keyframes sent / forced for new receivers, since the last log */
+    int conns;        /* receivers at the last frame: a new one gets a keyframe right away */
 };
 
 static char enc_dev[32]; /* "" = no hardware H.264 encoder */
@@ -530,7 +532,10 @@ static bool hwenc_open(struct hwenc *e, const struct mode *m, NDIlib_send_instan
     if (bps > 25000000)
         bps = 25000000;
     enc_ctrl(e->fd, V4L2_CID_MPEG_VIDEO_BITRATE, bps);
-    enc_ctrl(e->fd, V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, (int)(m->den / m->num + 0.5));
+    /* A keyframe at least every 30 frames: the encoder manages about 1080p30, so that's about a second
+     * even from a 60 fps card (a period of 60 gave one every 2 s). */
+    int period = (int)(m->den / m->num + 0.5);
+    enc_ctrl(e->fd, V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, period > 30 ? 30 : period);
     enc_ctrl(e->fd, V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER, 1);
     enc_ctrl(e->fd, V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_MPEG_VIDEO_H264_LEVEL_4_2);
 
@@ -647,6 +652,7 @@ static void hwenc_send(struct hwenc *e, NDIlib_send_instance_t send, const struc
     };
     ndi->send_send_video_v2(send, &f);
     e->sent++;
+    e->keys += key;
 }
 
 struct pipeline;
@@ -691,8 +697,14 @@ static void hx_step(struct pipeline *pl, int i, int wait_ms)
 {
     struct hwenc *e = &pl->enc;
     if (i >= 0) {
-        if (ndi_keyframe_required && ndi_keyframe_required(pl->send, &pl->pframe))
+        /* A new receiver can't start before a keyframe: send one now (NDI|HX: within 100 ms). The
+         * SDK's own request is checked too, but it never fired with these compressed frames. */
+        int conns = ndi->send_get_no_connections(pl->send, 0);
+        if (conns > e->conns || (ndi_keyframe_required && ndi_keyframe_required(pl->send, &pl->pframe))) {
             enc_ctrl(e->fd, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 1);
+            e->forced++;
+        }
+        e->conns = conns;
         struct v4l2_plane p = { .bytesused = (uint32_t)e->in_len[i], .length = (uint32_t)e->in_len[i] };
         struct v4l2_buffer b = { .index = i, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, .memory = V4L2_MEMORY_MMAP,
                                  .m.planes = &p, .length = 1 };
@@ -1201,6 +1213,10 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
             LOG("input %d: last %.0f s: camera %.1f fps, decoded %.1f fps, NDI %.1f fps, %d damaged frame%s skipped",
                 in->n, secs, log_cam / secs, log_sent / secs, log_ndi / secs, log_damaged,
                 log_damaged == 1 ? "" : "s");
+            if (pl.hx) {
+                LOG("input %d: NDI|HX: %d keyframes, %d forced for new receivers", in->n, pl.enc.keys, pl.enc.forced);
+                pl.enc.keys = pl.enc.forced = 0;
+            }
             log_cam = log_sent = log_ndi = log_damaged = 0;
             t_log = now;
         }
