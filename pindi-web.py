@@ -699,9 +699,11 @@ def outputs():
 
 # ---------------------------------------------------------------- inputs (capture devices)
 
-def _stable_path(dev):
-    """/dev/v4l/by-id (or by-path) link for /dev/videoN, so the setting survives re-plugging."""
-    for d in ("/dev/v4l/by-id", "/dev/v4l/by-path"):
+def _stable_path(dev, by_port=False):
+    """/dev/v4l/by-id (or by-path) link for /dev/videoN, so the setting survives re-plugging.
+    by_port: by-path only. Identical cards without a serial number share one by-id link, which
+    then points at either of them; the USB port tells them apart."""
+    for d in ("/dev/v4l/by-path",) if by_port else ("/dev/v4l/by-id", "/dev/v4l/by-path"):
         try:
             for name in sorted(os.listdir(d)):
                 p = os.path.join(d, name)
@@ -759,8 +761,13 @@ def detected_inputs():
         a, sep, b = label.partition(": ")
         if sep and a.strip() == b.strip():
             label = a.strip()  # UVC names are often "NAME: NAME"
-        found.append({"dev": dev, "id": _stable_path(dev), "label": label,
-                      "modes": modes})
+        usb = os.path.realpath(os.path.join(sysdir, "device", ".."))
+        found.append({"dev": dev, "label": label, "modes": modes,
+                      "model": read_text(os.path.join(usb, "idVendor")).strip() + ":" +
+                               read_text(os.path.join(usb, "idProduct")).strip()})
+    models = [d["model"] for d in found]
+    for d in found:
+        d["id"] = _stable_path(d["dev"], by_port=models.count(d.pop("model")) > 1)
     return found
 
 
