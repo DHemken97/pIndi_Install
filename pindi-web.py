@@ -715,7 +715,12 @@ def _stable_path(dev):
 def capture_modes(dev):
     """[(value, label)] of capture modes, e.g. ("MJPG 1920x1080@30", "MJPEG 1920x1080 @ 30 fps")."""
     modes, fourcc, size = [], None, None
-    for line in run("v4l2-ctl", "-d", dev, "--list-formats-ext").stdout.splitlines():
+    try:
+        listing = subprocess.run(("v4l2-ctl", "-d", dev, "--list-formats-ext"), capture_output=True, text=True,
+                                 timeout=5).stdout
+    except subprocess.TimeoutExpired:
+        listing = ""  # a hung device (e.g. dropping off USB) must not hang the page
+    for line in listing.splitlines():
         m = re.match(r"\s*\[\d+\]: '(\w+)'", line)
         if m:
             fourcc, size = m.group(1), None
