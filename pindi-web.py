@@ -7,7 +7,7 @@ Small standard-library HTTP server (runs as root, port 80):
     (default OUT_<serial>[_n]), source IP (default any), rotation, mirror, status
   - "Configure Outgoing Streams": detected USB capture devices, off until enabled
   - network: DHCP or static IP, with automatic rollback unless confirmed
-  - change the login (SSH) password, reboot
+  - change the login password, reboot
 """
 import base64
 import ctypes
@@ -681,6 +681,7 @@ def outputs():
             "standby": out_setting(env, n, "STANDBY_MIN", "0"),
             "cec": out_setting(env, n, "CEC", "0") == "1",
             "rotate": out_setting(env, n, "ROTATE", "0"), "mirror": out_setting(env, n, "MIRROR", "none"),
+            "brightness": out_setting(env, n, "BRIGHTNESS", "0"),
             "bandwidth": "lowest" if bandwidth == "lowest" else "highest", "format": fmt,
             "mode_setting": out_setting(env, n, "MODE"),
             "audio_out": out_setting(env, n, "AUDIO", "hdmi").lower(),
@@ -1020,7 +1021,7 @@ def login_page(error=""):
     body = ('<div class="login card"><h2>Sign in</h2>%s<form method="post" action="/login">'
             '<label>User</label><input type="text" name="user" autocomplete="username" autofocus required>'
             '<label>Password</label><input type="password" name="password" autocomplete="current-password" required>'
-            '<button>Sign in</button><p class="hint">Use the same login as SSH.</p></form>'
+            '<button>Sign in</button></form>'
             '<p class="hint">%s &middot; serial %s</p></div>' % (err, esc(device_name()), esc(SERIAL)))
     return page("Sign in", body)
 
@@ -1137,11 +1138,13 @@ def dashboard(session):
             '<div><label>Display mode</label><select name="display_mode">%s</select></div>'
             '<div><label>Rotation</label><select name="rotate">%s</select></div>'
             '<div><label>Mirror</label><select name="mirror">%s</select></div>'
+            '<div><label>Brightness</label><select name="brightness">%s</select></div>'
             '<div><label>Display off without video</label><select name="standby">%s</select>'
             '<label class="check"><input type="checkbox" name="cec" value="1"%s> Also switch the TV off '
             'and on (HDMI-CEC)</label></div></div>'
             '<p class="hint">180&deg; is for ceiling mounting, mirror for rear projection. With the display '
-            'switched off the monitor goes to sleep; it comes back on as soon as the stream appears.</p>'
+            'switched off the monitor goes to sleep; it comes back on as soon as the stream appears. Brightness '
+            'lightens or darkens the mid-tones; black and white stay as they are.</p>'
             '<h3 class="group">Sound</h3><div class="row">'
             '<div><label>Audio output</label><select name="audio">%s</select></div>'
             '<div><label>Audio delay (ms)</label><input type="number" name="audio_delay" min="20" max="1000" '
@@ -1155,7 +1158,8 @@ def dashboard(session):
              n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]), esc(o["backup"]),
              options(BANDWIDTHS, o["bandwidth"]), esc(default_out_stream(n)),
              options(mode_choices(o), o["mode_setting"]),
-             options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]), options(STANDBYS, o["standby"]), " checked" if o["cec"] else "",
+             options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]),
+             options(BRIGHTNESSES, o["brightness"]), options(STANDBYS, o["standby"]), " checked" if o["cec"] else "",
              options(audio_choices(), o["audio_out"]), esc(o["audio_delay"]), n))
 
     # NDI sources on the network
@@ -1307,7 +1311,7 @@ def dashboard(session):
         '<div class="row"><div><label>New password</label><input type="password" name="new" '
         'autocomplete="new-password" required></div><div><label>Repeat new password</label>'
         '<input type="password" name="confirm" autocomplete="new-password" required></div></div>'
-        '<p class="hint">Changes the password of <b>%s</b> for both this page and SSH.</p>'
+        '<p class="hint">Changes the password of <b>%s</b>.</p>'
         '<button>Change password</button></form></section>' % (hidden, esc(session["user"])))
 
     # System
@@ -1346,6 +1350,7 @@ def dashboard(session):
 # ---------------------------------------------------------------- actions
 
 ROTATIONS = [("0", "0&deg; (normal)"), ("180", "180&deg; (upside down)")]
+BRIGHTNESSES = [(str(v), "Normal" if v == 0 else "%+d" % v) for v in range(-50, 51, 10)]
 MIRRORS = [("none", "None"), ("horizontal", "Horizontal (left/right)"), ("vertical", "Vertical (top/bottom)")]
 BANDWIDTHS = [("highest", "Full quality"), ("lowest", "Low-bandwidth preview")]
 STANDBYS = [("0", "Never (always show the splash)"), ("1", "After 1 minute"), ("5", "After 5 minutes"),
@@ -1386,7 +1391,7 @@ def act_output(form):
     if n not in [o["n"] for o in outputs()]:
         return ("err", "Unknown output.")
     keys = ("ENABLED", "STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "BANDWIDTH", "MODE", "AUDIO", "AUDIO_DELAY_MS",
-            "BACKUP_STREAM", "STANDBY_MIN", "CEC")
+            "BACKUP_STREAM", "STANDBY_MIN", "CEC", "BRIGHTNESS")
     updates = {"PINDI_OUT%d_%s" % (n, k): "" for k in keys}
     if n == 1:  # settings from before multi-output support
         updates.update({"PINDI_" + k: "" for k in LEGACY_OUT1})
@@ -1419,7 +1424,9 @@ def act_output(form):
                 source_ip = str(ipaddress.IPv4Address(source_ip))
             except ValueError:
                 return ("err", "Source IP must be an IPv4 address, or empty for any host.")
-        if rotate not in dict(ROTATIONS) or mirror not in dict(MIRRORS) or bandwidth not in dict(BANDWIDTHS):
+        brightness = form.get("brightness", "0")
+        if (rotate not in dict(ROTATIONS) or mirror not in dict(MIRRORS) or bandwidth not in dict(BANDWIDTHS) or
+                brightness not in dict(BRIGHTNESSES)):
             return ("err", "Invalid display setting.")
         # Explicit per output, so the shared PINDI_BANDWIDTH default of other outputs is left alone.
         default_bw = (read_env().get("PINDI_BANDWIDTH") or "highest").lower()
@@ -1429,6 +1436,7 @@ def act_output(form):
             "PINDI_OUT%d_SOURCE_IP" % n: source_ip,
             "PINDI_OUT%d_ROTATE" % n: "" if rotate == "0" else rotate,
             "PINDI_OUT%d_MIRROR" % n: "" if mirror == "none" else mirror,
+            "PINDI_OUT%d_BRIGHTNESS" % n: "" if brightness == "0" else brightness,
             "PINDI_OUT%d_BANDWIDTH" % n: "" if bandwidth == default_bw else bandwidth,
             "PINDI_OUT%d_MODE" % n: mode,
             "PINDI_OUT%d_BACKUP_STREAM" % n: backup,
@@ -1565,7 +1573,7 @@ def act_password(session, form):
     if r.returncode:
         return ("err", "Could not change the password: %s" % r.stderr.strip())
     log("password changed for %s" % session["user"])
-    return ("ok", "Password changed. Use the new password for this page and SSH.")
+    return ("ok", "Password changed.")
 
 
 def write_switch(n, stream, source_ip, backup):
@@ -2097,7 +2105,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 token = SESSIONS.create(user)
                 if password in WELL_KNOWN_PASSWORDS:
                     SESSIONS.get(token)["flash"] = ("warn", "You signed in with a well-known default password. "
-                                                    "Please change it below (it is also the SSH password).")
+                                                    "Please change it below.")
                 log("login: %s from %s" % (user, ip))
                 return self.redirect("/", [("Set-Cookie", "pindi_session=%s; Path=/; HttpOnly; SameSite=Strict"
                                             % token)])

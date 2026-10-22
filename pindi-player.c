@@ -543,6 +543,7 @@ struct output {
     int audio_delay_ms;  /* PINDI_OUT<n>_AUDIO_DELAY_MS: audio buffer = lip-sync delay */
     int standby_min;     /* PINDI_OUT<n>_STANDBY_MIN: display off after this long without video (0 = never) */
     bool cec;            /* PINDI_OUT<n>_CEC=1: also put the TV in standby / wake it over HDMI-CEC */
+    int brightness;      /* PINDI_OUT<n>_BRIGHTNESS: -50..50, 0 = unchanged (the display's gamma table) */
 
     /* Audio playback (receiver thread only). */
     struct {
@@ -743,6 +744,32 @@ static uint64_t rotation_value(struct output *o)
     else if (!strcasecmp(o->mirror_s, "vertical"))
         v |= DRM_MODE_REFLECT_Y;
     return v;
+}
+
+/* Brightness through the display's gamma table: free (the HVS applies it to every pixel) and black
+ * stays black. +50 lifts the mid-tones like a gamma of 2, -50 darkens them the same amount. Always
+ * set, so going back to 0 undoes an earlier setting. */
+static void set_brightness(struct output *o)
+{
+    drmModeCrtc *c = drmModeGetCrtc(drm_fd, o->crtc_id);
+    int size = c ? c->gamma_size : 0;
+    drmModeFreeCrtc(c);
+    if (size < 2) {
+        if (o->brightness)
+            LOG("display: output %d: no gamma table here, brightness ignored", o->n);
+        return;
+    }
+    uint16_t *lut = malloc(sizeof *lut * size);
+    if (!lut)
+        return;
+    double inv = pow(2.0, -o->brightness / 50.0);
+    for (int i = 0; i < size; i++)
+        lut[i] = (uint16_t)lround(pow((double)i / (size - 1), inv) * 65535.0);
+    if (drmModeCrtcSetGamma(drm_fd, o->crtc_id, size, lut, lut, lut))
+        LOG("display: output %d: brightness: %s", o->n, strerror(errno));
+    else if (o->brightness)
+        LOG("display: output %d: brightness %+d", o->n, o->brightness);
+    free(lut);
 }
 
 static void add_plane(drmModeAtomicReq *req, struct output *o, struct buf *b, int dx, int dy, int dw, int dh)
@@ -1062,6 +1089,7 @@ static bool output_enable(struct output *o)
     if (o->rotation != DRM_MODE_ROTATE_0)
         LOG("display: output %d: rotate %s, mirror %s", o->n, o->rot_s, o->mirror_s);
     LOG("display: output %d (%s): %dx%d@%d", o->n, o->conn_name, o->W, o->H, o->mode.vrefresh);
+    set_brightness(o);
     pthread_mutex_lock(&o->lock);
     o->on_splash = true;
     o->want_splash = false;
@@ -2997,6 +3025,11 @@ static void configure_output(struct output *o)
     o->audio_s = ocfg(o->n, "AUDIO", "hdmi");
     o->standby_min = atoi(ocfg(o->n, "STANDBY_MIN", "0"));
     o->cec = !strcmp(ocfg(o->n, "CEC", "0"), "1");
+    o->brightness = atoi(ocfg(o->n, "BRIGHTNESS", "0"));
+    if (o->brightness < -50)
+        o->brightness = -50;
+    if (o->brightness > 50)
+        o->brightness = 50;
     o->audio_delay_ms = atoi(ocfg(o->n, "AUDIO_DELAY_MS", "80"));
     if (o->audio_delay_ms < 20)
         o->audio_delay_ms = 20;
