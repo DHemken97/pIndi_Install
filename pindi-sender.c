@@ -167,6 +167,27 @@ static void packed_to_422p(const uint8_t *s, uint8_t *y, uint8_t *u, uint8_t *v,
     }
 }
 
+/* JPEG (capture cards, webcams) is full range, 0-255; NDI, the H.264 encoder and the display expect
+ * video range: black 16, white 235, colour 16-240. Without this, everything below 16 is shown black
+ * (in a dark scene from a capture card that was over half the picture). y' = 16 + y * 219/255,
+ * c' = 128 + (c - 128) * 224/255, in place, in 8.8 fixed point. */
+static void full_to_video(uint8_t *p, size_t n, bool chroma)
+{
+    const int mul = chroma ? 225 : 220, add = chroma ? 128 * 256 - 128 * 225 + 128 : 16 * 256 + 128;
+    size_t i = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    const uint8x8_t vm = vdup_n_u8((uint8_t)mul);
+    const uint16x8_t va = vdupq_n_u16((uint16_t)add);
+    for (; i + 16 <= n; i += 16) {
+        uint8x16_t v = vld1q_u8(p + i);
+        uint16x8_t lo = vmlal_u8(va, vget_low_u8(v), vm), hi = vmlal_u8(va, vget_high_u8(v), vm);
+        vst1q_u8(p + i, vcombine_u8(vshrn_n_u16(lo, 8), vshrn_n_u16(hi, 8)));
+    }
+#endif
+    for (; i < n; i++)
+        p[i] = (uint8_t)((p[i] * mul + add) >> 8);
+}
+
 /* ------------------------------------------------------------------ shared memory for pindi-player */
 
 /* Keep in sync with pindi-player.c. Frames: LOCAL_SLOTS slots of slot_size bytes from LOCAL_DATA,
@@ -278,6 +299,7 @@ struct input {
     char device[256], name[128], mode_s[64];
     bool audio_on;
     bool hx; /* PINDI_IN<n>_CODEC=hx: NDI|HX through the hardware H.264 encoder */
+    bool video_range; /* PINDI_IN<n>_RANGE=video: the device's JPEG is already 16-235 (else converted) */
     pthread_t thr, athr;
     NDIlib_send_instance_t send;
     int w, h, fps_n, fps_d; /* last capture mode, for the black "no signal" frames */
@@ -837,6 +859,10 @@ static void worker_frame(struct worker *wk)
             int strides[3] = { m->w, m->w / 2, m->w / 2 };
             rc = tjDecompressToYUVPlanes(wk->tj, wk->src, wk->len, dst, m->w, strides, m->h, TJFLAG_FASTDCT);
             fmt = sub == TJSAMP_420 ? LOCAL_420P : LOCAL_422P;
+            if (!in->video_range) {
+                full_to_video(dst[0], ysz, false);
+                full_to_video(dst[1], (size_t)m->w / 2 * ch * 2, true); /* U and V are adjacent */
+            }
         } else if (to_ndi && !pl->hx) {
             /* Other subsampling: RGB for NDI only (not for the H.264 encoder). */
             planar_ok = false;
@@ -1414,6 +1440,7 @@ int main(void)
         snprintf(in->mode_s, sizeof in->mode_s, "%s", icfg(n, "MODE", ""));
         in->audio_on = strcasecmp(icfg(n, "AUDIO", "auto"), "off") != 0;
         in->hx = !strcasecmp(icfg(n, "CODEC", "speedhq"), "hx");
+        in->video_range = !strcasecmp(icfg(n, "RANGE", "full"), "video");
         pthread_mutex_init(&in->lock, NULL);
     }
     if (!nin) {

@@ -426,6 +426,7 @@ def hx_send_available():
 
 
 CODECS = [("speedhq", "Full NDI (SpeedHQ)"), ("hx", "NDI|HX (H.264, hardware encoder)")]
+RANGES = [("full", "Normal (most capture cards and webcams)"), ("video", "Already video range (16-235)")]
 
 
 def ndi_info():
@@ -793,13 +794,13 @@ def inputs():
         s = conf.get(slot, {})
         out.append(dict(d, slot=slot, present=True, enabled=s.get("ENABLED") == "1",
                         name=s.get("NAME", ""), mode=s.get("MODE", ""), audio_setting=s.get("AUDIO", "auto"),
-                        codec=s.get("CODEC", "speedhq")))
+                        codec=s.get("CODEC", "speedhq"), range=s.get("RANGE", "full")))
     for dev, slot in by_dev.items():
         s = conf[slot]
         out.append({"dev": "", "id": dev, "label": os.path.basename(dev), "modes": [], "slot": slot,
                     "present": False, "enabled": s.get("ENABLED") == "1", "name": s.get("NAME", ""),
                     "mode": s.get("MODE", ""), "audio_setting": s.get("AUDIO", "auto"),
-                    "codec": s.get("CODEC", "speedhq")})
+                    "codec": s.get("CODEC", "speedhq"), "range": s.get("RANGE", "full")})
     for i in out:
         st = read_kv("%s/in%d.status" % (RUN_DIR, i["slot"])) if i["slot"] else {}
         i["state"] = st.get("state", "") if i["enabled"] else "off"
@@ -1220,14 +1221,17 @@ def dashboard(session):
             '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Send this input over NDI</label>'
             '<div class="row"><div><label>NDI stream name</label><input type="text" name="name" value="%s" '
             'placeholder="%s" maxlength="100"></div><div><label>Capture mode</label><select name="mode">%s</select>'
-            '</div>%s<div><label>Audio</label><select name="audio">%s</select></div></div>'
+            '</div>%s<div><label>Audio</label><select name="audio">%s</select></div>'
+            '<div><label>Picture levels</label><select name="range">%s</select><span class="hint block">Change '
+            'only if shadows look grey and washed out.</span></div></div>'
             '<button>Save</button> %s</form></div>' %
             (esc(i["label"]), " on" if i["present"] else "", "connected" if i["present"] else "not connected",
              esc(i["id"]), k, " onair" if "ON AIR" in state else " playing" if state.startswith("sending") else "",
              esc(state), live, hidden,
              esc(i["id"]), slot, " checked" if i["enabled"] else "", esc(i["name"]), esc(default_in_stream(slot)),
              options(cap_choices, i["mode"]), codec_field(i),
-             options([("auto", "From the device (USB audio)"), ("off", "Off")], i["audio_setting"]), remove))
+             options([("auto", "From the device (USB audio)"), ("off", "Off")], i["audio_setting"]),
+             options(RANGES, i["range"]), remove))
     body = "".join(cards) if cards else (
         '<p class="hint">No capture devices detected. Plug in a USB HDMI capture card and reload this page.</p>')
     parts.append('<section class="card" id="outgoing"><h2>Configure Outgoing Streams</h2>'
@@ -1486,7 +1490,7 @@ def act_outgoing(form):
         slot = inp["slot"]
     elif not 1 <= slot <= 8 or slot in configured_inputs(read_env()):
         return ("err", "No free slot for another outgoing stream.")
-    keys = ["PINDI_IN%d_%s" % (slot, k) for k in ("ENABLED", "DEVICE", "NAME", "MODE", "AUDIO", "CODEC")]
+    keys = ["PINDI_IN%d_%s" % (slot, k) for k in ("ENABLED", "DEVICE", "NAME", "MODE", "AUDIO", "CODEC", "RANGE")]
     if form.get("remove"):
         write_env({k: "" for k in keys})
         msg = "Forgot %s." % inp["label"]
@@ -1504,9 +1508,13 @@ def act_outgoing(form):
         codec = form.get("codec", "speedhq")
         if codec not in dict(CODECS) or (codec == "hx" and not hx_send_available()):
             return ("err", "Invalid codec.")
+        rng = form.get("range", "full")
+        if rng not in dict(RANGES):
+            return ("err", "Invalid picture levels.")
         write_env(dict(zip(keys, ["1" if enabled else "0", device,
                                   "" if name == default_in_stream(slot) else name, mode,
-                                  "" if audio == "auto" else audio, "" if codec == "speedhq" else codec])))
+                                  "" if audio == "auto" else audio, "" if codec == "speedhq" else codec,
+                                  "" if rng == "full" else rng])))
         msg = ("%s will be sent as \"%s\"." % (inp["label"], name or default_in_stream(slot))) if enabled \
             else ("%s is not sent." % inp["label"])
     log("outgoing: slot %d %s" % (slot, msg))

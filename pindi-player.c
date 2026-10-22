@@ -492,7 +492,8 @@ struct output {
     char conn_name[32];
     uint32_t conn_id, crtc_id, plane_id;
     bool has_uyvy, has_nv16, has_nv12;
-    struct { uint32_t fb, crtc, sx, sy, sw, sh, cx, cy, cw, ch, rot; } pp;
+    struct { uint32_t fb, crtc, sx, sy, sw, sh, cx, cy, cw, ch, rot, enc; } pp;
+    uint64_t enc_601, enc_709; /* COLOR_ENCODING values (pp.enc 0: not supported) */
     uint32_t p_mode, p_active, p_conn_crtc;
 
     /* Main thread only. */
@@ -592,6 +593,23 @@ static uint32_t prop_id(uint32_t obj, uint32_t type, const char *name)
     }
     drmModeFreeObjectProperties(props);
     return id;
+}
+
+/* The value of enum property name's entry val_name (0 if there is none). */
+static uint64_t prop_enum(uint32_t obj, uint32_t type, const char *name, const char *val_name)
+{
+    uint64_t val = 0;
+    drmModeObjectProperties *props = drmModeObjectGetProperties(drm_fd, obj, type);
+    for (uint32_t k = 0; props && k < props->count_props; k++) {
+        drmModePropertyRes *p = drmModeGetProperty(drm_fd, props->props[k]);
+        if (p && !strcmp(p->name, name))
+            for (int e = 0; e < p->count_enums; e++)
+                if (!strcmp(p->enums[e].name, val_name))
+                    val = p->enums[e].value;
+        drmModeFreeProperty(p);
+    }
+    drmModeFreeObjectProperties(props);
+    return val;
 }
 
 static uint64_t prop_value(uint32_t obj, uint32_t type, const char *name)
@@ -714,6 +732,9 @@ static void discover_outputs(void)
         o->pp.cw = prop_id(pl, DRM_MODE_OBJECT_PLANE, "CRTC_W");
         o->pp.ch = prop_id(pl, DRM_MODE_OBJECT_PLANE, "CRTC_H");
         o->pp.rot = prop_id(pl, DRM_MODE_OBJECT_PLANE, "rotation");
+        o->pp.enc = prop_id(pl, DRM_MODE_OBJECT_PLANE, "COLOR_ENCODING");
+        o->enc_601 = prop_enum(pl, DRM_MODE_OBJECT_PLANE, "COLOR_ENCODING", "ITU-R BT.601 YCbCr");
+        o->enc_709 = prop_enum(pl, DRM_MODE_OBJECT_PLANE, "COLOR_ENCODING", "ITU-R BT.709 YCbCr");
         o->p_mode = prop_id(o->crtc_id, DRM_MODE_OBJECT_CRTC, "MODE_ID");
         o->p_active = prop_id(o->crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
         o->p_conn_crtc = prop_id(o->conn_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
@@ -787,6 +808,9 @@ static void add_plane(drmModeAtomicReq *req, struct output *o, struct buf *b, in
     drmModeAtomicAddProperty(req, pl, o->pp.ch, dh);
     if (o->pp.rot && b)
         drmModeAtomicAddProperty(req, pl, o->pp.rot, o->rotation);
+    /* YCbCr: HD video (NDI, H.264) uses the BT.709 colours, SD BT.601; the plane's default is 601. */
+    if (o->pp.enc && b && (b->fmt == DRM_FORMAT_UYVY || b->fmt == DRM_FORMAT_NV16 || b->fmt == DRM_FORMAT_NV12))
+        drmModeAtomicAddProperty(req, pl, o->pp.enc, b->h >= 720 ? o->enc_709 : o->enc_601);
 }
 
 /* Show buffer b on output o, letterboxed to aspect ar (0 = fill). Non-blocking, page-flip event. */
