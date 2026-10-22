@@ -144,6 +144,20 @@ the H.264, so sending costs almost no CPU and a tenth of the bandwidth
 (about 16 Mbit/s at 1080p60). Receivers need NDI|HX support (NDI Tools, vMix,
 OBS and most NDI software have it).
 
+The Pi 3/4 encoder manages about 1080p30: a 1080p60 card is sent at 25-30 fps
+(frames the encoder has no room for are not even decoded). Encoder and HX
+decoder share one video unit, so a Pi 3B/3B+ that both sends and shows HX at
+1080p gets up to half a second of display delay. Measured with three Pis
+sending to and showing each other over HX:
+
+| Pi | Sends | Shows | CPU |
+|---|---|---|---|
+| 3B+, card at 1080p60 | 23 fps | 26 fps, 200-900 ms delay | 59% |
+| 3B+, card at **720p60** | **50 fps** | 28 fps, 57 ms delay | 49% |
+| 4B, card at 1080p60 | 28 fps | 2 streams, 0 drops, 33-40 ms | 86% |
+
+So on a Pi 3B/3B+ that shows a stream too, send at 720p.
+
 ## HTTP API
 
 The token is under **Device settings → HTTP API**. Send it as

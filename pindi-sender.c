@@ -822,7 +822,11 @@ static void worker_frame(struct worker *wk)
     };
     bool ok = true, planar_ok = true;
     uint32_t fmt = LOCAL_422P;
-    if (m->fourcc == V4L2_PIX_FMT_MJPEG) {
+    bool skip = !to_ndi && !local;
+    if (skip) {
+        /* Nobody takes this frame: the encoder is still busy (the Pi 3/4 H.264 encoder manages about
+         * 1080p30, so half of a 60 fps card's frames) and there is no local display. Don't decode it. */
+    } else if (m->fourcc == V4L2_PIX_FMT_MJPEG) {
         int jw, jh, sub, cs, rc = -1;
         if (!wk->len || tjDecompressHeader3(wk->tj, wk->src, wk->len, &jw, &jh, &sub, &cs) || jw != m->w ||
             jh != m->h) {
@@ -905,7 +909,7 @@ static void worker_frame(struct worker *wk)
             pl->pframe = f;
             ob = -1;
         }
-        pl->frames++;
+        pl->frames += !skip;
     } else {
         pl->damaged++;
     }

@@ -202,7 +202,9 @@ systemctl enable pindi.service pindi-web.service pindi-sender.service
 step "Optimising boot ($BOOT)"
 
 # config.txt: no rainbow, no delays, no Wi-Fi/Bluetooth (the overlays are named
-# differently on the Pi 5). The initramfs is skipped only when booting from the SD
+# differently on the Pi 5). Pi 3/4: 128 MB for the video unit (default 76), which
+# holds every hardware H.264 decoder and encoder: with 76 a fourth one (e.g. two
+# HX displays and two HX inputs) fails with "Not enough GPU mem". The initramfs is skipped only when booting from the SD
 # card, whose driver and ext4 are built into the kernel; USB/NVMe boot keeps it.
 CFG="$BOOT/config.txt"
 [ -f "$CFG.pindi-orig" ] || cp "$CFG" "$CFG.pindi-orig"
@@ -222,9 +224,11 @@ camera_auto_detect=0
 display_auto_detect=0
 auto_initramfs=$INITRAMFS
 [pi3]
+gpu_mem=128
 dtoverlay=disable-wifi
 dtoverlay=disable-bt
 [pi4]
+gpu_mem=128
 dtoverlay=disable-wifi
 dtoverlay=disable-bt
 [pi5]
