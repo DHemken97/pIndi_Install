@@ -76,9 +76,10 @@ brightness and audio settings.
 | --- | --- |
 | Device | Live network traffic, CPU temperature and load, under-voltage and throttling warnings, NDI SDK version, software version, clock |
 | Output *n* | Live preview of the screen, state, latency, format and audio. Settings: stream, source IP, backup stream, receive quality (full or low-bandwidth preview), display mode, rotation (0/180°), mirroring, display standby, audio output and delay. **Identify** shows "Output n" on that screen for 15 s. |
-| Outgoing streams | Each USB capture device: send on/off, NDI name, capture mode, audio on/off |
-| Device settings | Device name (NDI name and host name), NDI Discovery Server, NDI groups, time zone, daily reboot, splash options, HTTP API token |
+| Outgoing streams | Each USB capture device: send on/off, NDI name, capture mode, audio on/off, audio timing |
+| Device settings | Device name (NDI name and host name), NDI Discovery Server, NDI groups, NDI receive transport (TCP or UDP), large network buffers, NDI Advanced SDK licence (vendor name and ID), time zone, daily reboot, splash options, HTTP API token |
 | Network | DHCP or static IP, NTP servers. A change undoes itself after 2 minutes unless you press **Keep** at the new address. |
+| Wi-Fi | Off by default: the Wi-Fi hardware is switched off in `config.txt`, so the device starts faster. On: one network (name, password, country), address from DHCP, wired stays the preferred route. Switching it on the first time needs a reboot. Nearby networks are offered in the name field. |
 | System | Log viewer, diagnostics download, settings backup and restore, reset to defaults, restart video, identify all screens, reboot |
 
 ### How outputs behave
@@ -190,9 +191,12 @@ address is locked out for 10 minutes.
 | Path | Contents |
 | --- | --- |
 | `/etc/default/pindi` | Settings (`PINDI_*`), documented in `pindi.conf`. Normally edited through the web interface. |
-| `/etc/pindi/ndi-config.v1.json` | NDI Discovery Server, groups, machine name |
+| `/etc/pindi/ndi-config.v1.json` | NDI Discovery Server, groups, machine name, receive transport |
+| `/etc/sysctl.d/90-pindi-ndi.conf` | Large network buffers (Device settings) |
+| `/run/pindi/in<n>.levels` | The capture device's audio level, one line per second |
 | `/etc/pindi/api-token` | HTTP API token |
 | `/etc/systemd/network/20-pindi-wired.network` | Network settings |
+| `/etc/wpa_supplicant/wpa_supplicant-wlan0.conf`, `/etc/systemd/network/25-pindi-wifi.network` | Wi-Fi settings (the password is stored only as the derived WPA key) |
 | `/run/pindi/` | Live state for the web interface (status, previews) |
 
 Services: `pindi` (splash and receiver), `pindi-sender` (outgoing streams),
@@ -218,6 +222,19 @@ or **View logs** in the web interface.
   **Low-bandwidth preview** or send a smaller stream.
 - **Dropped frames on a Pi 3:** one Full NDI 1080p60 stream can use most of
   the Pi 3's 100 Mbit/s link; the Device card shows the traffic.
+- **Audio drops out for a second or two, worst in busy scenes:** Full NDI's
+  bitrate follows the picture and can pass 100 Mbit/s per receiver in action
+  scenes, more than a Pi 3's network port carries. Send the stream as
+  **NDI|HX** (about 10 Mbit/s). Keep **NDI receive transport** on TCP and
+  **Large network buffers** on (Device settings).
+- **The picture of an NDI|HX stream freezes after 30 minutes, the sound goes on:**
+  the NDI Advanced SDK is the evaluation build (no licence in Device settings);
+  the outgoing stream's status says so. Send Full NDI, or enter the vendor name
+  and ID of an NDI Advanced SDK licence (licensing@ndi.video).
+- **Audio drops out on every receiver at once:** check the sender's log
+  (`journalctl -u pindi-sender`). "the card sends silence" means the HDMI
+  source itself went quiet: set the source's audio to stereo PCM (on a Fire
+  TV: Surround Sound *Stereo*, Dolby Digital *Off*).
 - **The latency figure says the clocks disagree:** sync the sender's clock (on
   Windows: `w32tm /resync`) and check the Clock line on the Device card.
 - **Sending a problem report:** **Download diagnostics** collects the version,

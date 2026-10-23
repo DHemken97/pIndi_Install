@@ -520,7 +520,7 @@ struct output {
     struct buf vid[NBUF];
     int vstate[NBUF];
     double vaspect[NBUF];
-    int64_t vsent[NBUF];  /* sender's submit time, 100 ns UTC (NDI timestamp), or INT64_MAX */
+    int64_t vsent[NBUF];  /* when the frame was captured (or sent), 100 ns UTC, or INT64_MAX: frame_pts() */
     uint64_t vrecv[NBUF]; /* when this Pi got the frame from NDI, monotonic us */
     int pw, ph;
     uint32_t pfmt; /* format of the current buffer pool */
@@ -534,6 +534,8 @@ struct output {
     bool wake_request;    /* receiver: our stream is there, turn the display back on */
     const char *probe_codec; /* codec_name() the format check found for probe_src (lock) */
     char probe_src[256];
+    bool probing;            /* a format check is running (lock) */
+    uint64_t probe_ms;       /* when the last one started (lock) */
 
     /* Configuration. */
     bool disabled; /* PINDI_OUT<n>_ENABLED=0: no NDI, HDMI signal off (e.g. encoder-only units) */
@@ -542,6 +544,7 @@ struct output {
     const char *rot_s, *mirror_s;
     const char *audio_s; /* PINDI_OUT<n>_AUDIO: hdmi, analog or off */
     int audio_delay_ms;  /* PINDI_OUT<n>_AUDIO_DELAY_MS: audio buffer = lip-sync delay */
+    bool pacing;         /* PINDI_OUT<n>_PACING=smooth (experimental): frames on screen at an even cadence */
     int standby_min;     /* PINDI_OUT<n>_STANDBY_MIN: display off after this long without video (0 = never) */
     bool cec;            /* PINDI_OUT<n>_CEC=1: also put the TV in standby / wake it over HDMI-CEC */
     int brightness;      /* PINDI_OUT<n>_BRIGHTNESS: -50..50, 0 = unchanged (the display's gamma table) */
@@ -557,6 +560,7 @@ struct output {
         char info[160];
         uint64_t in, dropped, xruns, frames; /* samples received / not played, underruns, NDI frames */
         uint64_t max_gap, win_start;            /* longest wait between NDI audio frames (ms) */
+        int64_t last_sent;                      /* the previous frame's NDI timestamp (100 ns UTC) */
         int extra_ms;                           /* added after underruns (jittery sender), kept per source */
         int logged_rate;
         snd_pcm_uframes_t win_min, pending_drop; /* lowest queue level in this 2 s window */
@@ -564,6 +568,30 @@ struct output {
 
     /* Latency of frames that reached the screen (main thread), published every 5 s. */
     struct { double pi_sum, pi_min, pi_max, tot_sum, tot_min, tot_max; int n, tot_n; uint64_t since; } lat;
+    /* Frame pacing (o->lock): every frame goes on screen at its capture time + one delay, on the refresh
+     * that time falls before, so a 30 fps source on 60 Hz shows each frame for exactly two refreshes
+     * whatever the network and decoder jitter. The delay covers the slowest recent capture-to-ready time
+     * and puts the due times mid-refresh, away from the boundary where jitter would flip frames between
+     * neighbouring refreshes. It changes only when a frame was too slow (later), when a whole refresh is
+     * to spare (one refresh earlier: same position) and when the source's and the display's clocks have
+     * drifted the due times to a boundary (back to the middle: one planned 1- or 3-refresh frame). */
+    struct {
+        uint64_t vbl_us;  /* a recent vblank (monotonic us), from flips and vblank events */
+        bool vbl_wait;    /* a vblank event is requested (main thread) */
+        bool on;          /* timing known */
+        bool center;      /* put the due times mid-refresh at the next chance */
+        double lag_peak;  /* us: slowest recent capture -> ready time, decaying */
+        double delay;     /* us from capture to on screen */
+        double dev;       /* smoothed position of due times within a refresh, -0.5 .. 0.5 (0 = middle) */
+        double last_pts;  /* monotonic us */
+        uint64_t last_us;
+        uint32_t held, late, moves; /* refreshes a frame waited for its time, frames shown late, delay moves */
+        uint32_t full;                /* frames dropped because two were already waiting */
+        double gap_min, gap_max;      /* us between consecutive capture times */
+        double lag_min, lag_max;      /* us capture -> ready */
+    } pace;
+    /* How many refreshes each video frame stayed on screen (cadence; [4] = 4 or more), main thread. */
+    struct { uint64_t shown_us, log_since; uint32_t hist[5], log_hist[5]; } cad;
 
     /* Decode once (share_mu): outputs showing the same source use one receiver, the leader's, and put
      * its decoded buffers on their own planes - no copy; rotation, mirror, size and brightness stay
@@ -615,6 +643,7 @@ static void ready_push(struct output *o, int idx)
         o->vstate[o->ready] = B_FREE;
         o->ready = o->ready2;
         o->ready2 = idx;
+        o->pace.full++;
     }
     o->vstate[idx] = B_READY;
 }
@@ -1314,6 +1343,123 @@ static uint64_t clock_us(clockid_t id)
     return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
+/* The display's refresh period, from the mode's timings (exact, unlike vrefresh). */
+static double refresh_us(const struct output *o)
+{
+    return o->mode.clock && o->mode.htotal && o->mode.vtotal
+               ? (double)o->mode.htotal * o->mode.vtotal * 1000.0 / o->mode.clock
+               : 1e6 / 60;
+}
+
+#define PACE_MARGIN_US 4000.0 /* on top of the slowest recent frame */
+
+/* An NDI frame's capture time: PiNDI senders put it in the timecode (100 ns UTC); other senders'
+ * timecodes are not times, so then the time the frame was sent. */
+static int64_t frame_pts(const NDIlib_video_frame_v2_t *v)
+{
+    int64_t d = v->timecode - v->timestamp;
+    return v->timecode > 0 && d > -50000000 && d < 50000000 ? v->timecode : v->timestamp;
+}
+
+/* 100 ns UTC -> monotonic us (the realtime clock's offset now). */
+static double pts_mono_us(int64_t pts)
+{
+    struct timespec rt, mt;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    clock_gettime(CLOCK_MONOTONIC, &mt);
+    double off = (double)(rt.tv_sec - mt.tv_sec) * 1e6 + (double)(rt.tv_nsec - mt.tv_nsec) / 1e3;
+    return (double)pts / 10.0 - off;
+}
+
+/* o->lock held: frame idx just became ready to show - update the pacing delay. */
+static void pace_note(struct output *o, int idx)
+{
+    if (!o->pacing || o->vsent[idx] == INT64_MAX)
+        return;
+    uint64_t now = clock_us(CLOCK_MONOTONIC);
+    double pts = pts_mono_us(o->vsent[idx]), lag = (double)now - pts, per = refresh_us(o);
+    if (!o->pace.on || fabs(pts - o->pace.last_pts) > 1e6 || lag < -1e6 || lag > 5e6) {
+        o->pace.on = lag > -1e6 && lag < 5e6; /* a new stream, or the sender restarted */
+        o->pace.lag_peak = lag;
+        o->pace.delay = lag + PACE_MARGIN_US;
+        o->pace.dev = 0;
+        o->pace.center = true;
+    } else {
+        double gap = pts - o->pace.last_pts;
+        if (!o->pace.gap_max || gap < o->pace.gap_min)
+            o->pace.gap_min = gap;
+        if (gap > o->pace.gap_max)
+            o->pace.gap_max = gap;
+        if (!o->pace.lag_max || lag < o->pace.lag_min)
+            o->pace.lag_min = lag;
+        if (lag > o->pace.lag_max)
+            o->pace.lag_max = lag;
+        /* Slowly forget a slow frame (2 ms/s), at once take a slower one. */
+        o->pace.lag_peak -= (double)(now - o->pace.last_us) * 0.002;
+        if (lag > o->pace.lag_peak)
+            o->pace.lag_peak = lag;
+    }
+    o->pace.last_pts = pts;
+    o->pace.last_us = now;
+    double need = o->pace.lag_peak + PACE_MARGIN_US;
+    if (need > o->pace.delay) { /* this frame was too slow for the delay */
+        o->pace.delay = need;
+        o->pace.center = true;
+    } else if (need < o->pace.delay - per * 1.5) { /* a refresh to spare: one earlier, same position */
+        o->pace.delay -= per;
+        o->pace.moves++;
+    }
+    if (!o->pace.vbl_us)
+        return;
+    double x = (pts + o->pace.delay - (double)o->pace.vbl_us) / per;
+    double d = x - floor(x) - 0.5; /* where this due time falls in its refresh: 0 = the middle */
+    if (o->pace.center) {
+        o->pace.dev = d;
+    } else {
+        double step = d - o->pace.dev;
+        step -= floor(step + 0.5); /* the short way round (positions wrap at a refresh) */
+        o->pace.dev += step * 0.05;
+        o->pace.dev -= floor(o->pace.dev + 0.5);
+    }
+    if (o->pace.center || fabs(o->pace.dev) > 0.3) {
+        o->pace.delay -= o->pace.dev * per;
+        if (o->pace.delay < need)
+            o->pace.delay += per;
+        o->pace.dev = 0;
+        o->pace.moves += !o->pace.center;
+        o->pace.center = false;
+    }
+}
+
+/* o->lock held: when frame idx should be on screen (monotonic us). */
+static double pace_due(struct output *o, int idx)
+{
+    return pts_mono_us(o->vsent[idx]) + o->pace.delay;
+}
+
+/* A vblank without a flip (requested while a frame waits for its time). */
+static void on_vblank(int fd, uint64_t seq, uint64_t ns, uint64_t data)
+{
+    (void)fd; (void)seq;
+    struct output *o = (struct output *)(uintptr_t)data;
+    pthread_mutex_lock(&o->lock);
+    o->pace.vbl_us = ns / 1000;
+    pthread_mutex_unlock(&o->lock);
+    o->pace.vbl_wait = false;
+}
+
+/* A new video frame reached the screen at flip_us: count how long the one before it stayed up. */
+static void cadence_add(struct output *o, uint64_t flip_us)
+{
+    if (o->cad.shown_us) {
+        long k = lrint((double)(flip_us - o->cad.shown_us) / refresh_us(o));
+        k = k < 1 ? 1 : k > 4 ? 4 : k;
+        o->cad.hist[k]++;
+        o->cad.log_hist[k]++;
+    }
+    o->cad.shown_us = flip_us;
+}
+
 /* A video frame reached the screen at flip_us (monotonic, from the vblank event). */
 static void latency_add(struct output *o, int64_t sent, uint64_t recv_us, uint64_t flip_us)
 {
@@ -1342,7 +1488,7 @@ static void latency_publish(struct output *o, uint64_t now)
 {
     if (now - o->lat.since < 5000)
         return;
-    char path[64], buf[256] = "";
+    char path[64], buf[384] = "";
     snprintf(path, sizeof path, RUN_DIR "/out%d.latency", o->n);
     if (o->lat.n)
         snprintf(buf, sizeof buf, "pi_avg=%.1f\npi_min=%.1f\npi_max=%.1f\n", o->lat.pi_sum / o->lat.n,
@@ -1355,9 +1501,35 @@ static void latency_publish(struct output *o, uint64_t now)
     if (o->lat.n && o->lat.since) /* new video frames that reached the screen per second */
         snprintf(buf + strlen(buf), sizeof buf - strlen(buf), "fps=%.2f\n",
                  o->lat.n * 1000.0 / (double)(now - o->lat.since));
+    uint32_t *h = o->cad.hist;
+    if (h[1] + h[2] + h[3] + h[4]) /* frames on screen for 1, 2, 3, 4+ refreshes */
+        snprintf(buf + strlen(buf), sizeof buf - strlen(buf), "cadence=%u %u %u %u\nrefresh=%.3f\n", h[1], h[2],
+                 h[3], h[4], 1e6 / refresh_us(o));
     write_file_atomic(path, buf);
     memset(&o->lat, 0, sizeof o->lat);
+    memset(o->cad.hist, 0, sizeof o->cad.hist);
     o->lat.since = now;
+    h = o->cad.log_hist;
+    if (!o->cad.log_since)
+        o->cad.log_since = now;
+    if (now - o->cad.log_since >= 60000) {
+        if (h[1] + h[2] + h[3] + h[4])
+            LOG("video: output %d: frames on screen for 1/2/3/4+ refreshes: %u/%u/%u/%u (%.3f Hz)%s", o->n, h[1],
+                h[2], h[3], h[4], 1e6 / refresh_us(o), o->pacing ? "" : ", pacing off");
+        if (o->pacing && o->pace.on) {
+            pthread_mutex_lock(&o->lock);
+            LOG("video: output %d: pacing: on screen %.0f ms after capture, %u refreshes waited, %u frames late, "
+                "%u delay moves", o->n, o->pace.delay / 1000, o->pace.held, o->pace.late, o->pace.moves);
+            LOG("video: output %d: pacing: capture times %.1f-%.1f ms apart, ready %.0f-%.0f ms after capture, "
+                "%u dropped (queue full)", o->n, o->pace.gap_min / 1000, o->pace.gap_max / 1000,
+                o->pace.lag_min / 1000, o->pace.lag_max / 1000, o->pace.full);
+            o->pace.held = o->pace.late = o->pace.moves = o->pace.full = 0;
+            o->pace.gap_min = o->pace.gap_max = o->pace.lag_min = o->pace.lag_max = 0;
+            pthread_mutex_unlock(&o->lock);
+        }
+        memset(o->cad.log_hist, 0, sizeof o->cad.log_hist);
+        o->cad.log_since = now;
+    }
 }
 
 static void on_flip(int fd, unsigned seq, unsigned sec, unsigned usec, unsigned crtc, void *data)
@@ -1366,6 +1538,7 @@ static void on_flip(int fd, unsigned seq, unsigned sec, unsigned usec, unsigned 
     struct output *o = data;
     uint64_t flip_us = (uint64_t)sec * 1000000 + usec;
     pthread_mutex_lock(&o->lock);
+    o->pace.vbl_us = flip_us;
     /* Whatever is on screen now replaces a leader's buffer shown before. */
     pthread_mutex_lock(&share_mu);
     ext_release(o->ext_scanout_of, o->ext_scanout);
@@ -1392,8 +1565,10 @@ static void on_flip(int fd, unsigned seq, unsigned sec, unsigned usec, unsigned 
             o->last_video = o->scanout;
             o->vstate[o->scanout] = B_SCANOUT;
             latency_add(o, o->vsent[o->scanout], o->vrecv[o->scanout], flip_us);
+            cadence_add(o, flip_us);
         } else if (L) { /* the leader's buffer is held for us (vuse): its times stay put */
             latency_add(o, L->vsent[li], L->vrecv[li], flip_us);
+            cadence_add(o, flip_us);
         }
         o->queued = -1;
         o->on_splash = false;
@@ -1405,6 +1580,7 @@ static void on_flip(int fd, unsigned seq, unsigned sec, unsigned usec, unsigned 
             o->vstate[o->scanout] = B_FREE;
         o->scanout = -1;
         o->on_splash = true;
+        o->cad.shown_us = 0;
     }
     pthread_mutex_unlock(&o->lock);
     o->pending = P_NONE;
@@ -1526,6 +1702,31 @@ static void output_service(struct output *o)
         return;
     }
 
+    if (o->ready >= 0 && o->pacing && o->pace.on && o->pace.vbl_us && o->vsent[o->ready] != INT64_MAX) {
+        double per = refresh_us(o), now = (double)clock_us(CLOCK_MONOTONIC);
+        double next = (double)o->pace.vbl_us + per * (floor((now - (double)o->pace.vbl_us) / per) + 1);
+        if (o->ready2 >= 0 && pace_due(o, o->ready2) <= next) { /* both due: the older one is late */
+            o->vstate[o->ready] = B_FREE;
+            o->ready = o->ready2;
+            o->ready2 = -1;
+            o->pace.late++;
+        }
+        if (pace_due(o, o->ready) > next) { /* not yet: look again at the next refresh */
+            o->pace.held++;
+            pthread_mutex_unlock(&o->lock);
+            if (!o->pace.vbl_wait) {
+                if (drmCrtcQueueSequence(drm_fd, o->crtc_id,
+                                         DRM_CRTC_SEQUENCE_RELATIVE | DRM_CRTC_SEQUENCE_NEXT_ON_MISS, 1, NULL,
+                                         (uint64_t)(uintptr_t)o) == 0) {
+                    o->pace.vbl_wait = true;
+                } else {
+                    LOG("video: output %d: no vblank events (%s): frame pacing off", o->n, strerror(errno));
+                    o->pacing = false;
+                }
+            }
+            return;
+        }
+    }
     if (o->ready >= 0) {
         int idx = o->ready;
         double ar = o->vaspect[idx];
@@ -1610,6 +1811,7 @@ static void frame_end(struct output *o, int idx, double aspect, int64_t sent, ui
         o->vaspect[idx] = aspect;
         o->vsent[idx] = sent;
         o->vrecv[idx] = recv_us;
+        pace_note(o, idx);
     }
     pthread_mutex_unlock(&o->lock);
     wake();
@@ -1647,7 +1849,7 @@ static bool post_frame(struct output *o, const NDIlib_video_frame_v2_t *v, uint6
             memcpy(dst, src, (size_t)v->xres * (fmt == DRM_FORMAT_UYVY ? 2 : 4));
     }
     frame_end(o, idx, v->picture_aspect_ratio > 0 ? v->picture_aspect_ratio : (double)v->xres / v->yres,
-              v->timestamp, recv_us);
+              frame_pts(v), recv_us);
     return true;
 }
 
@@ -2035,6 +2237,7 @@ static void hwdec_poll(struct output *o, struct hwdec *d, int wait_ms)
                     o->vaspect[idx] = d->aspect > 0 ? d->aspect : (double)d->vw / d->vh;
                     o->vsent[idx] = d->meta[m].sent;
                     o->vrecv[idx] = d->meta[m].recv;
+                    pace_note(o, idx);
                     o->want_splash = false;
                 } else {
                     o->vstate[idx] = B_FREE;
@@ -2097,7 +2300,7 @@ static bool hwdec_feed(struct output *o, struct hwdec *d, const NDIlib_video_fra
     }
     memcpy(d->in[i].map + off, data, pk->data_size);
     uint32_t m = d->seq++ % 16;
-    d->meta[m].sent = v->timestamp;
+    d->meta[m].sent = frame_pts(v);
     d->meta[m].recv = recv_us;
     struct v4l2_plane pl = { .bytesused = (uint32_t)len, .length = (uint32_t)d->in[i].len };
     struct v4l2_buffer vb = { .index = i, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, .memory = V4L2_MEMORY_MMAP,
@@ -2324,6 +2527,12 @@ static void audio_play(struct output *o, const NDIlib_audio_frame_v3_t *a)
     uint64_t tnow = now_ms();
     if (o->au.last_frame && tnow - o->au.last_frame > o->au.max_gap && tnow - o->au.last_frame < 5000)
         o->au.max_gap = tnow - o->au.last_frame;
+    /* A long wait for audio: say whether the sender sent late too (its timestamps have the same gap)
+     * or sent on time and the audio was held up on the way (network, NDI). */
+    if (o->au.last_frame && tnow - o->au.last_frame > 150 && tnow - o->au.last_frame < 60000 && o->au.last_sent)
+        LOG("audio: output %d: no audio for %llu ms; the sender sent it %.0f ms apart", o->n,
+            (unsigned long long)(tnow - o->au.last_frame), (double)(a->timestamp - o->au.last_sent) / 1e4);
+    o->au.last_sent = a->timestamp;
     o->au.last_frame = tnow;
     o->au.frames++;
     o->au.in += a->no_samples > 0 ? a->no_samples : 0;
@@ -2780,33 +2989,56 @@ static void *codec_probe_thread(void *arg)
         snprintf(path, sizeof path, RUN_DIR "/out%d.codec", p->o->n);
         write_file_atomic(path, buf);
         LOG("ndi: output %d: %s sends %s", p->o->n, p->name, codec);
-        pthread_mutex_lock(&p->o->lock);
+    }
+    pthread_mutex_lock(&p->o->lock);
+    if (codec && *codec) {
         p->o->probe_codec = codec;
         snprintf(p->o->probe_src, sizeof p->o->probe_src, "%s", p->name);
-        pthread_mutex_unlock(&p->o->lock);
     }
+    p->o->probing = false;
+    pthread_mutex_unlock(&p->o->lock);
     free(p);
     return NULL;
 }
 
+/* One check at a time. min_gap_ms: skip it if the last one started more recently than that - the
+ * check's own connection to the sender briefly takes the receiver's down when it ends (the NDI library
+ * shares it), which would otherwise look like "the sender came back" and start the next one, endlessly,
+ * cutting the audio each time. */
 static void codec_probe_start(struct output *o, NDIlib_recv_bandwidth_e bandwidth, const char *name,
-                              const char *url)
+                              const char *url, uint64_t min_gap_ms)
 {
+    uint64_t now = now_ms();
+    pthread_mutex_lock(&o->lock);
+    bool skip = o->probing || (o->probe_ms && now - o->probe_ms < min_gap_ms);
+    if (!skip) {
+        o->probing = true;
+        o->probe_ms = now;
+        o->probe_codec = NULL;
+    }
+    pthread_mutex_unlock(&o->lock);
+    if (skip)
+        return;
     struct codec_probe *p = calloc(1, sizeof *p);
     pthread_t t;
-    if (!p)
+    if (!p) {
+        pthread_mutex_lock(&o->lock);
+        o->probing = false;
+        pthread_mutex_unlock(&o->lock);
         return;
-    pthread_mutex_lock(&o->lock);
-    o->probe_codec = NULL;
-    pthread_mutex_unlock(&o->lock);
+    }
     p->o = o;
     p->bandwidth = bandwidth;
     snprintf(p->name, sizeof p->name, "%s", name);
     snprintf(p->url, sizeof p->url, "%s", url);
-    if (pthread_create(&t, NULL, codec_probe_thread, p) == 0)
+    if (pthread_create(&t, NULL, codec_probe_thread, p) == 0) {
         pthread_detach(t);
-    else
+    } else {
         free(p);
+        pthread_mutex_lock(&o->lock);
+        o->probing = false;
+        pthread_mutex_unlock(&o->lock);
+    }
 }
 
 /* Leader thread: an audio frame for the outputs following o (each plays it with its own settings). */
@@ -3191,7 +3423,7 @@ static void *receiver(void *arg)
                 LOG("ndi: output %d: first frame after %llu ms (%dx%d)", o->n,
                     (unsigned long long)(now - recv_start), v.xres, v.yres);
                 if (hx_decode && !hx_mode)
-                    codec_probe_start(o, bandwidth, cur_src, cur_url);
+                    codec_probe_start(o, bandwidth, cur_src, cur_url, 0);
             }
             bool shown = true;
             if (!hx_mode) {
@@ -3271,7 +3503,7 @@ static void *receiver(void *arg)
                 }
                 last_alive = now + 5000;
                 if (!to_hx && hx_decode)
-                    codec_probe_start(o, bandwidth, cur_src, cur_url); /* which codec now? */
+                    codec_probe_start(o, bandwidth, cur_src, cur_url, 0); /* which codec now? */
             } else if (to_hx) {
                 hwdec_close(o, &hw);
             } else { /* no receiver for the NDI library's decoding: reconnect from scratch */
@@ -3292,7 +3524,7 @@ static void *receiver(void *arg)
         /* The sender came back (e.g. restarted with another codec): the NDI library reconnects by itself,
          * so check the codec again, or HX would stay decoded in software. */
         if (conns > 0 && prev_conns == 0 && got_frame && !hx_mode && hx_decode)
-            codec_probe_start(o, bandwidth, cur_src, cur_url);
+            codec_probe_start(o, bandwidth, cur_src, cur_url, 60000);
         prev_conns = conns;
 
         if (stats_ms > 0 && now - last_stats >= (uint64_t)stats_ms) {
@@ -3396,6 +3628,7 @@ static void configure_output(struct output *o)
         o->audio_delay_ms = 20;
     if (o->audio_delay_ms > 1000)
         o->audio_delay_ms = 1000;
+    o->pacing = !strcmp(ocfg(o->n, "PACING", "fast"), "smooth"); /* experimental: off unless chosen */
     o->disabled = !strcmp(ocfg(o->n, "ENABLED", "1"), "0");
     if (o->disabled)
         LOG("output %d: disabled", o->n);
@@ -3789,7 +4022,7 @@ int main(void)
     if (ndi_ok)
         start_receivers();
 
-    drmEventContext ev = { .version = 3, .page_flip_handler2 = on_flip };
+    drmEventContext ev = { .version = 4, .page_flip_handler2 = on_flip, .sequence_handler = on_vblank };
     uint64_t last_poll = now_ms(), last_ip = 0;
     char ip[64] = "";
 

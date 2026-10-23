@@ -195,13 +195,48 @@ install -m 644 "$SRC/pindi-web.service" /etc/systemd/system/pindi-web.service
 # Outgoing NDI streams from capture devices: does nothing until enabled in the web UI.
 install -m 644 "$SRC/pindi-sender.service" /etc/systemd/system/pindi-sender.service
 
+# NDI sends each video frame as a burst of UDP packets, one burst per receiver. The 208 KB default
+# socket buffer overflows with two receivers at 1080p: the kernel drops packets and every receiver's
+# audio stalls for a second or two while they are resent. Device settings can turn this off
+# (PINDI_NET_BUFFERS=0), which an update keeps.
+if ! grep -q '^PINDI_NET_BUFFERS="\?0' /etc/default/pindi 2>/dev/null; then
+    cat > /etc/sysctl.d/90-pindi-ndi.conf <<'EOF'
+# Written by the PiNDI installer (Device settings: Large network buffers).
+net.core.wmem_default = 4194304
+net.core.rmem_default = 4194304
+net.core.wmem_max = 8388608
+net.core.rmem_max = 8388608
+EOF
+    sysctl -q -p /etc/sysctl.d/90-pindi-ndi.conf || true
+fi
+
+# Receive NDI over TCP: reliable UDP stalls the audio for a second or more when packets are lost.
+# Only on devices that never chose a transport in Device settings (which writes both choices out).
+python3 - <<'EOF'
+import json, os
+p = "/etc/pindi/ndi-config.v1.json"
+try:
+    cfg = json.load(open(p))
+except (OSError, ValueError):
+    cfg = {}
+ndi = cfg.setdefault("ndi", {})
+if "rudp" not in ndi:
+    ndi["rudp"] = {"recv": {"enable": False}}
+    ndi["unicast"] = {"recv": {"enable": False}}
+    ndi["tcp"] = {"recv": {"enable": True}}
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+EOF
+
 systemctl daemon-reload
 systemctl enable pindi.service pindi-web.service pindi-sender.service
 
 # ---------------------------------------------------------------- boot speed
 step "Optimising boot ($BOOT)"
 
-# config.txt: no rainbow, no delays, no Wi-Fi/Bluetooth (the overlays are named
+# config.txt: no rainbow, no delays, no Wi-Fi (unless on in the web UI)/Bluetooth (the overlays are named
 # differently on the Pi 5). Pi 3/4: 128 MB for the video unit (default 76), which
 # holds every hardware H.264 decoder and encoder: with 76 a fourth one (e.g. two
 # HX displays and two HX inputs) fails with "Not enough GPU mem". The initramfs is skipped only when booting from the SD
@@ -212,6 +247,11 @@ INITRAMFS=1
 case "$(findmnt -no SOURCE /)" in
     /dev/mmcblk*) INITRAMFS=0 ;;
 esac
+# Wi-Fi stays switched on when it was turned on in the web UI (Wi-Fi card).
+WIFI="dtoverlay=disable-wifi"
+if [ -L /etc/systemd/system/sys-subsystem-net-devices-wlan0.device.wants/wpa_supplicant@wlan0.service ]; then
+    WIFI="#dtoverlay=disable-wifi"
+fi
 sed -i '/^# --- PiNDI begin ---$/,/^# --- PiNDI end ---$/d' "$CFG"
 sed -i -E 's/^(camera_auto_detect|display_auto_detect|auto_initramfs|disable_splash|boot_delay|initial_turbo)=/#&/' "$CFG"
 cat >> "$CFG" <<EOF
@@ -225,14 +265,14 @@ display_auto_detect=0
 auto_initramfs=$INITRAMFS
 [pi3]
 gpu_mem=128
-dtoverlay=disable-wifi
+$WIFI
 dtoverlay=disable-bt
 [pi4]
 gpu_mem=128
-dtoverlay=disable-wifi
+$WIFI
 dtoverlay=disable-bt
 [pi5]
-dtoverlay=disable-wifi-pi5
+$WIFI-pi5
 dtoverlay=disable-bt-pi5
 [all]
 # --- PiNDI end ---

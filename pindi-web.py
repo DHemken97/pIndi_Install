@@ -7,12 +7,14 @@ Small standard-library HTTP server (runs as root, port 80):
     (default OUT_<serial>[_n]), source IP (default any), rotation, mirror, status
   - "Configure Outgoing Streams": detected USB capture devices, off until enabled
   - network: DHCP or static IP, with automatic rollback unless confirmed
+  - Wi-Fi: off by default (hardware switched off in config.txt for a faster boot); on: one network, DHCP
   - change the login password, reboot
 """
 import base64
 import ctypes
 import ctypes.util
 import grp
+import hashlib
 import html
 import http.cookies
 import http.server
@@ -127,13 +129,15 @@ def run(*cmd, input=None):
 
 
 def write_atomic(path, text, mode=0o644):
-    """Replace path with text, safely even if the power is cut right after (synced to the SD card)."""
+    """Replace path with text, safely even if the power is cut right after (synced to the SD card).
+    mode None: leave it to the file system (the FAT boot partition has no permissions)."""
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
-    os.chmod(tmp, mode)
+    if mode is not None:
+        os.chmod(tmp, mode)
     os.replace(tmp, path)
     try:
         d = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
@@ -316,6 +320,170 @@ class NetworkChange:
 NET = NetworkChange()
 
 
+# ---------------------------------------------------------------- Wi-Fi (off by default: faster boot)
+
+WIFI_IFACE = "wlan0"
+WIFI_CONF = "/etc/wpa_supplicant/wpa_supplicant-%s.conf" % WIFI_IFACE
+WIFI_NETWORK_FILE = "/etc/systemd/network/25-pindi-wifi.network"
+WIFI_UNIT = "wpa_supplicant@%s.service" % WIFI_IFACE
+# wpa_supplicant starts when the interface appears, so a Pi without Wi-Fi never waits for it at boot.
+# install.sh checks this link too, to keep the Wi-Fi hardware switched on in config.txt.
+WIFI_WANTS = "/etc/systemd/system/sys-subsystem-net-devices-%s.device.wants/%s" % (WIFI_IFACE, WIFI_UNIT)
+WIFI_DROPIN = "/etc/systemd/system/%s.d/pindi.conf" % WIFI_UNIT
+CONFIG_TXT = "/boot/firmware/config.txt" if os.path.exists("/boot/firmware/config.txt") else "/boot/config.txt"
+_scan = {"t": 0, "ssids": []}
+
+
+def wifi_enabled():
+    return os.path.islink(WIFI_WANTS)
+
+
+def wifi_present():
+    return os.path.exists("/sys/class/net/" + WIFI_IFACE)
+
+
+def countries():
+    """[(code, name)] from tzdata."""
+    out = []
+    for line in read_text("/usr/share/zoneinfo/iso3166.tab").splitlines():
+        code, _, name = line.partition("\t")
+        if len(code) == 2 and not line.startswith("#"):
+            out.append((code, name))
+    return sorted(out, key=lambda c: c[1])
+
+
+def timezone_country():
+    """Country of the configured time zone: a good guess for the Wi-Fi regulatory domain."""
+    tz = current_timezone()
+    for line in read_text("/usr/share/zoneinfo/zone.tab").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[2] == tz:
+            return parts[0]
+    return ""
+
+
+def read_wifi_config():
+    cfg = {"ssid": "", "psk": "", "country": ""}
+    for line in read_text(WIFI_CONF).splitlines():
+        key, _, val = line.strip().partition("=")
+        if key == "country":
+            cfg["country"] = val
+        elif key == "ssid":
+            try:
+                cfg["ssid"] = bytes.fromhex(val).decode("utf-8", "replace")
+            except ValueError:
+                cfg["ssid"] = val.strip('"')
+        elif key == "psk":
+            cfg["psk"] = val
+    return cfg
+
+
+def wifi_psk(ssid, passphrase):
+    """The 256-bit WPA key (what wpa_passphrase computes), so the passphrase itself is not stored."""
+    if re.match(r"^[0-9a-fA-F]{64}$", passphrase):
+        return passphrase.lower()
+    return hashlib.pbkdf2_hmac("sha1", passphrase.encode(), ssid.encode(), 4096, 32).hex()
+
+
+def render_wifi_config(ssid, psk, country):
+    text = ("# Written by the PiNDI web interface.\nctrl_interface=DIR=/run/wpa_supplicant GROUP=netdev\n"
+            "update_config=0\ncountry=%s\n\nnetwork={\n\tssid=%s\n\tscan_ssid=1\n" % (country, ssid.encode().hex()))
+    if psk:
+        return text + "\tkey_mgmt=WPA-PSK\n\tpsk=%s\n}\n" % psk
+    return text + "\tkey_mgmt=NONE\n}\n"
+
+
+def set_wifi_overlay(on):
+    """Comment the disable-wifi overlays in config.txt in or out; takes effect at the next boot."""
+    text = read_text(CONFIG_TXT)
+    new = re.sub(r"^#?(dtoverlay=disable-wifi(-pi5)?)$", ("#" if on else "") + r"\1", text, flags=re.M)
+    if new != text:
+        write_atomic(CONFIG_TXT, new, None)
+    return new != text
+
+
+def iw_text(s):
+    """iw prints the non-ASCII bytes of a network name as \\xNN."""
+    return re.sub(rb"\\x([0-9a-fA-F]{2})", lambda m: bytes([int(m.group(1), 16)]), s.encode()).decode(
+        "utf-8", "replace")
+
+
+def wifi_status():
+    """{"ssid", "signal", "address"} of the live connection, or None when not connected."""
+    if not wifi_present():
+        return None
+    link = run("iw", "dev", WIFI_IFACE, "link").stdout if shutil.which("iw") else ""
+    ssid = re.search(r"^\s*SSID: (.*)$", link, re.M)
+    if not ssid:
+        return None
+    signal = re.search(r"signal: (-?\d+) dBm", link)
+    m = re.search(r"inet (\S+)/", run("ip", "-4", "-o", "addr", "show", "dev", WIFI_IFACE).stdout)
+    return {"ssid": iw_text(ssid.group(1)), "signal": int(signal.group(1)) if signal else None,
+            "address": m.group(1) if m else ""}
+
+
+def wifi_needs_reboot():
+    """Switched on since the last boot, and the hardware is still off."""
+    if not wifi_enabled() or wifi_present():
+        return False
+    try:
+        boot = time.time() - float(read_text("/proc/uptime").split()[0])
+        return os.lstat(WIFI_WANTS).st_mtime >= boot
+    except (OSError, ValueError, IndexError):
+        return True
+
+
+def wifi_state_text():
+    if not wifi_enabled():
+        return "Off"
+    if wifi_needs_reboot():
+        return '<span class="warn">Switches on at the next reboot</span>'
+    if not wifi_present():
+        return '<span class="warn">No Wi-Fi hardware found on this device</span>'
+    st = wifi_status()
+    if not st:
+        return '<span class="warn">Not connected</span>'
+    text = "Connected to %s" % esc(st["ssid"])
+    if st["signal"] is not None:
+        quality = "good" if st["signal"] >= -60 else "fair" if st["signal"] >= -70 else "weak"
+        text += " &middot; signal %d dBm (%s)" % (st["signal"], quality)
+    return text + " &middot; IP %s" % esc(st["address"] or "waiting for DHCP")
+
+
+def wifi_scan():
+    """Network names nearby, from the last scan (only while the Wi-Fi hardware is on). A scan takes a few
+    seconds, so it runs in the background and the page shows the previous one."""
+    if wifi_present() and shutil.which("iw") and time.time() - _scan["t"] > 60:
+        _scan["t"] = time.time()
+        threading.Thread(target=_wifi_scan, daemon=True).start()
+    return _scan["ssids"]
+
+
+def _wifi_scan():
+    run("ip", "link", "set", WIFI_IFACE, "up")
+    out = run("iw", "dev", WIFI_IFACE, "scan").stdout or run("iw", "dev", WIFI_IFACE, "scan", "dump").stdout
+    found = {}
+    for block in re.split(r"(?m)^BSS ", out)[1:]:
+        ssid = re.search(r"^\s*SSID: (.+)$", block, re.M)
+        signal = re.search(r"signal: (-?[\d.]+) dBm", block)
+        if ssid and "\\x00" not in ssid.group(1):  # hidden networks
+            name, level = iw_text(ssid.group(1)), float(signal.group(1)) if signal else -100
+            found[name] = max(level, found.get(name, -100))
+    _scan["ssids"] = sorted(found, key=lambda s: -found[s])
+
+
+def apply_wifi(on):
+    if on:
+        run("rfkill", "unblock", "wifi")
+        run("systemctl", "daemon-reload")
+        run("systemctl", "restart", WIFI_UNIT)
+        run("networkctl", "reload")
+        run("networkctl", "reconfigure", WIFI_IFACE)
+    else:
+        run("systemctl", "stop", WIFI_UNIT)
+        run("ip", "link", "set", WIFI_IFACE, "down")
+
+
 # ---------------------------------------------------------------- outputs (displays)
 
 def read_kv(path):
@@ -426,6 +594,7 @@ def hx_send_available():
 
 
 CODECS = [("speedhq", "Full NDI (SpeedHQ)"), ("hx", "NDI|HX (H.264, hardware encoder)")]
+AUDIO_SYNCS = [("on", "In step with this Pi's clock (recommended)"), ("off", "As the device delivers it")]
 RANGES = [("full", "Normal (most capture cards and webcams)"), ("video", "Already video range (16-235)")]
 
 
@@ -505,17 +674,54 @@ def read_ndi_config():
         return {}
 
 
+TRANSPORTS = [("tcp", "TCP (recommended)"), ("udp", "UDP (the NDI default)")]
+
+
+def ndi_transport(ndi):
+    """How this device receives NDI: "tcp" when reliable UDP is switched off in favour of TCP."""
+    rudp_off = ndi.get("rudp", {}).get("recv", {}).get("enable") is False
+    return "tcp" if rudp_off and ndi.get("tcp", {}).get("recv", {}).get("enable") else "udp"
+
+
+def set_ndi_transport(ndi, transport):
+    # NDI's reliable UDP stalls every receiver for a second or more when packets are lost, then resets
+    # the connection; TCP rides it out. Both choices are written out, so install.sh can tell a device
+    # that never chose (and gets TCP) from one that chose UDP.
+    on = transport == "tcp"
+    ndi["rudp"] = {"recv": {"enable": not on}}
+    ndi["unicast"] = {"recv": {"enable": not on}}
+    ndi["tcp"] = {"recv": {"enable": on}}
+
+
 def ndi_settings():
     ndi = read_ndi_config().get("ndi", {})
-    nets, groups = ndi.get("networks", {}), ndi.get("groups", {})
+    nets, groups, vendor = ndi.get("networks", {}), ndi.get("groups", {}), ndi.get("vendor", {})
     return {"discovery": nets.get("discovery", "") or "", "send_groups": groups.get("send", "") or "",
-            "recv_groups": groups.get("recv", "") or "", "machinename": ndi.get("machinename", "") or ""}
+            "recv_groups": groups.get("recv", "") or "", "machinename": ndi.get("machinename", "") or "",
+            "transport": ndi_transport(ndi), "vendor_name": vendor.get("name", "") or "",
+            "vendor_id": vendor.get("id", "") or ""}
 
 
-def write_ndi_settings(discovery, send_groups, recv_groups, machinename):
+def ndi_advanced():
+    """The NDI Advanced SDK is installed (needed to send NDI|HX)."""
+    return os.path.exists("/usr/local/lib/libndi_advanced.so")
+
+
+def ndi_evaluation():
+    """The Advanced SDK runs as its evaluation build: no vendor licence in the NDI config. It then stops a
+    stream's NDI|HX video after 30 minutes (sound and Full NDI go on)."""
+    return ndi_advanced() and not ndi_settings()["vendor_id"]
+
+
+def write_ndi_settings(discovery, send_groups, recv_groups, machinename, transport, vendor_name="", vendor_id=""):
     """Update our keys in ndi-config.v1.json, keeping anything else that is in there."""
     cfg = read_ndi_config()
     ndi = cfg.setdefault("ndi", {})
+    set_ndi_transport(ndi, transport)
+    if vendor_id:  # an NDI Advanced SDK licence (from licensing@ndi.video)
+        ndi["vendor"] = {"name": vendor_name, "id": vendor_id}
+    else:
+        ndi.pop("vendor", None)
     for section, key, val in (("networks", "discovery", discovery), ("groups", "send", send_groups),
                               ("groups", "recv", recv_groups)):
         sec = ndi.setdefault(section, {})
@@ -683,6 +889,7 @@ def outputs():
             "cec": out_setting(env, n, "CEC", "0") == "1",
             "rotate": out_setting(env, n, "ROTATE", "0"), "mirror": out_setting(env, n, "MIRROR", "none"),
             "brightness": out_setting(env, n, "BRIGHTNESS", "0"),
+            "pacing": out_setting(env, n, "PACING", "fast"),
             "bandwidth": "lowest" if bandwidth == "lowest" else "highest", "format": fmt,
             "mode_setting": out_setting(env, n, "MODE"),
             "audio_out": out_setting(env, n, "AUDIO", "hdmi").lower(),
@@ -794,13 +1001,15 @@ def inputs():
         s = conf.get(slot, {})
         out.append(dict(d, slot=slot, present=True, enabled=s.get("ENABLED") == "1",
                         name=s.get("NAME", ""), mode=s.get("MODE", ""), audio_setting=s.get("AUDIO", "auto"),
-                        codec=s.get("CODEC", "speedhq"), range=s.get("RANGE", "full")))
+                        audio_sync=s.get("AUDIO_SYNC", "on"), codec=s.get("CODEC", "speedhq"),
+                        range=s.get("RANGE", "full")))
     for dev, slot in by_dev.items():
         s = conf[slot]
         out.append({"dev": "", "id": dev, "label": os.path.basename(dev), "modes": [], "slot": slot,
                     "present": False, "enabled": s.get("ENABLED") == "1", "name": s.get("NAME", ""),
                     "mode": s.get("MODE", ""), "audio_setting": s.get("AUDIO", "auto"),
-                    "codec": s.get("CODEC", "speedhq"), "range": s.get("RANGE", "full")})
+                    "audio_sync": s.get("AUDIO_SYNC", "on"), "codec": s.get("CODEC", "speedhq"),
+                    "range": s.get("RANGE", "full")})
     for i in out:
         st = read_kv("%s/in%d.status" % (RUN_DIR, i["slot"])) if i["slot"] else {}
         i["state"] = st.get("state", "") if i["enabled"] else "off"
@@ -1055,7 +1264,7 @@ def dashboard(session):
     # Section menu
     links = [("#out%d" % o["n"], "Output %d" % o["n"]) for o in outs] + [
         ("#sources", "Sources"), ("#outgoing", "Outgoing"), ("#settings", "Settings"), ("#network", "Network"),
-        ("#system", "System")]
+        ("#wifi", "Wi-Fi"), ("#system", "System")]
     parts.append('<nav class="sections">%s</nav>' % "".join('<a href="%s">%s</a>' % l for l in links))
 
     # Device
@@ -1071,6 +1280,7 @@ def dashboard(session):
                      'only send HX will not show a picture.</span>')
     rows = [
         ("IP address", '<span data-k="ip">%s</span>' % esc(net["address"] or "-")),
+    ] + ([("Wi-Fi", wifi_state_text())] if wifi_enabled() else []) + [
         ("Network traffic", '<span data-k="net">%s</span><span class="hint block">Everything this device '
                             'receives and sends on the wired network. A Full NDI 1080p60 stream takes up to about '
                             '130 Mbit/s, depending on the picture (still images far less).</span>' %
@@ -1140,12 +1350,15 @@ def dashboard(session):
             '<div><label>Rotation</label><select name="rotate">%s</select></div>'
             '<div><label>Mirror</label><select name="mirror">%s</select></div>'
             '<div><label>Brightness</label><select name="brightness">%s</select></div>'
+            '<div><label>Frame pacing</label><select name="pacing">%s</select></div>'
             '<div><label>Display off without video</label><select name="standby">%s</select>'
             '<label class="check"><input type="checkbox" name="cec" value="1"%s> Also switch the TV off '
             'and on (HDMI-CEC)</label></div></div>'
             '<p class="hint">180&deg; is for ceiling mounting, mirror for rear projection. With the display '
             'switched off the monitor goes to sleep; it comes back on as soon as the stream appears. Brightness '
-            'lightens or darkens the mid-tones; black and white stay as they are.</p>'
+            'lightens or darkens the mid-tones; black and white stay as they are. Smooth frame pacing shows '
+            'every frame for the same number of refreshes, timed by when the sender captured it, so motion '
+            'does not judder (experimental: it can drop frames on a Pi 3).</p>'
             '<h3 class="group">Sound</h3><div class="row">'
             '<div><label>Audio output</label><select name="audio">%s</select></div>'
             '<div><label>Audio delay (ms)</label><input type="number" name="audio_delay" min="20" max="1000" '
@@ -1160,7 +1373,8 @@ def dashboard(session):
              options(BANDWIDTHS, o["bandwidth"]), esc(default_out_stream(n)),
              options(mode_choices(o), o["mode_setting"]),
              options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]),
-             options(BRIGHTNESSES, o["brightness"]), options(STANDBYS, o["standby"]), " checked" if o["cec"] else "",
+             options(BRIGHTNESSES, o["brightness"]), options(PACINGS, o["pacing"]),
+             options(STANDBYS, o["standby"]), " checked" if o["cec"] else "",
              options(audio_choices(), o["audio_out"]), esc(o["audio_delay"]), n))
 
     # NDI sources on the network
@@ -1186,9 +1400,11 @@ def dashboard(session):
         """Codec choice, only where NDI|HX can be sent (else Full NDI, nothing to choose)."""
         if not hx_ok:
             return ""
+        warn = (' <strong>Without an NDI Advanced SDK licence (Device settings) the video of an NDI|HX stream '
+                'stops after 30 minutes; the sound goes on.</strong>' if ndi_evaluation() else "")
         return ('<div><label>Codec</label><select name="codec">%s</select><span class="hint block">NDI|HX: '
                 'H.264 from the Pi&#39;s hardware encoder &ndash; far less CPU and bandwidth; receivers need NDI|HX '
-                'support (NDI Tools, vMix, OBS...).</span></div>' % options(CODECS, i.get("codec", "speedhq")))
+                'support (NDI Tools, vMix, OBS...).%s</span></div>' % (options(CODECS, i.get("codec", "speedhq")), warn))
 
     cards = []
     for i in ins:
@@ -1222,6 +1438,9 @@ def dashboard(session):
             '<div class="row"><div><label>NDI stream name</label><input type="text" name="name" value="%s" '
             'placeholder="%s" maxlength="100"></div><div><label>Capture mode</label><select name="mode">%s</select>'
             '</div>%s<div><label>Audio</label><select name="audio">%s</select></div>'
+            '<div><label>Audio timing</label><select name="audio_sync">%s</select><span class="hint block">'
+            'Capture cards\' audio clocks run a little fast or slow, which receivers eventually catch up on '
+            'by dropping audio.</span></div>'
             '<div><label>Picture levels</label><select name="range">%s</select><span class="hint block">Change '
             'only if shadows look grey and washed out.</span></div></div>'
             '<button>Save</button> %s</form></div>' %
@@ -1231,6 +1450,7 @@ def dashboard(session):
              esc(i["id"]), slot, " checked" if i["enabled"] else "", esc(i["name"]), esc(default_in_stream(slot)),
              options(cap_choices, i["mode"]), codec_field(i),
              options([("auto", "From the device (USB audio)"), ("off", "Off")], i["audio_setting"]),
+             options(AUDIO_SYNCS, i["audio_sync"]),
              options(RANGES, i["range"]), remove))
     body = "".join(cards) if cards else (
         '<p class="hint">No capture devices detected. Plug in a USB HDMI capture card and reload this page.</p>')
@@ -1241,6 +1461,15 @@ def dashboard(session):
     # Device settings
     env = read_env()
     ns = ndi_settings()
+    licence_fields = ""
+    if ndi_advanced():
+        licence_fields = (
+            '<div class="row"><div><label>NDI Advanced SDK licence: vendor name</label><input type="text" '
+            'name="vendor_name" value="%s" maxlength="200"></div><div><label>Vendor ID</label><input type="text" '
+            'name="vendor_id" value="%s" maxlength="200"><span class="hint block">%s</span></div></div>' %
+            (esc(ns["vendor_name"]), esc(ns["vendor_id"]),
+             "From NDI (licensing@ndi.video). Without it the Advanced SDK is the evaluation: NDI|HX video stops "
+             "after 30 minutes." if not ns["vendor_id"] else "Licensed: NDI|HX runs without a time limit."))
     parts.append(
         '<section class="card" id="settings"><h2>Device settings</h2><form method="post" action="/device">%s'
         '<div class="row"><div><label>Device name</label><input type="text" name="name" value="%s" maxlength="63" '
@@ -1253,6 +1482,13 @@ def dashboard(session):
         'placeholder="Public" maxlength="200"></div>'
         '<div><label>NDI groups to send to</label><input type="text" name="send_groups" value="%s" '
         'placeholder="Public" maxlength="200"></div></div>'
+        '<div class="row"><div><label>NDI receive transport</label><select name="transport">%s</select>'
+        '<span class="hint block">TCP rides out lost packets; with UDP a busy network can stall the '
+        'audio for a second or more.</span></div></div>'
+        '%s'
+        '<label class="check"><input type="checkbox" name="net_buffers" value="1"%s> Large network buffers '
+        '<span class="hint">(off: the system\'s own 208 KB, which drops video and audio packets when sending '
+        '1080p to more than one receiver)</span></label>'
         '<div class="row"><div><label>Time zone</label><select name="timezone">%s</select></div>'
         '<div><label>Reboot every day at (optional)</label><input type="time" name="reboot_at" value="%s">'
         '<span class="hint block">Empty = never. A daily reboot clears any slow build-up on '
@@ -1272,7 +1508,9 @@ def dashboard(session):
         '</dl><form method="post" action="/api-token" data-confirm="Generate a new API token? The current one '
         'stops working.">%s<button class="secondary">New token</button></form></section>' %
         (hidden, esc(device_name()), esc(socket.gethostname()), esc(ns["discovery"]), esc(ns["recv_groups"]),
-         esc(ns["send_groups"]), options([(z, esc(z)) for z in timezones()], current_timezone()),
+         esc(ns["send_groups"]), options(TRANSPORTS, ns["transport"]), licence_fields,
+         "" if env.get("PINDI_NET_BUFFERS") == "0" else " checked",
+         options([(z, esc(z)) for z in timezones()], current_timezone()),
          esc(reboot_time()), "" if env.get("PINDI_SPLASH_INFO") == "0" else " checked",
          " checked" if (env.get("PINDI_FRAME_TIMEOUT_MS") or "0") not in ("", "0") else "",
          esc(api_token()), hidden))
@@ -1307,6 +1545,36 @@ def dashboard(session):
         (hidden, "checked" if cfg["dhcp"] else "", "" if cfg["dhcp"] else "checked",
          esc(fill["address"]), esc(mask), esc(fill["gateway"]), esc(", ".join(fill["dns"])),
          esc(", ".join(cfg["ntp"])), ROLLBACK_SECONDS))
+
+    # Wi-Fi
+    wifi = read_wifi_config()
+    wifi_on = wifi_enabled()
+    country = wifi["country"] or timezone_country()
+    ssids = wifi_scan() if wifi_on else []
+    reboot = ""
+    if wifi_needs_reboot():
+        reboot = ('<form method="post" action="/reboot" data-confirm="Reboot the device now?">%s'
+                  '<button class="secondary">Reboot now</button></form>' % hidden)
+    parts.append(
+        '<section class="card" id="wifi"><h2>Wi-Fi</h2><dl><dt>Status</dt><dd>%s</dd></dl>'
+        '<form method="post" action="/wifi">%s'
+        '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Wi-Fi on <span class="hint">'
+        '(off: the Wi-Fi hardware is switched off, so the device starts faster)</span></label>'
+        '<div class="row"><div><label>Network name (SSID)</label><input type="text" name="ssid" value="%s" '
+        'maxlength="32" list="wifi-ssids" autocomplete="off"><datalist id="wifi-ssids">%s</datalist></div>'
+        '<div><label>Password</label><input type="password" name="password" autocomplete="new-password" '
+        'maxlength="64" placeholder="%s"></div>'
+        '<div><label>Country</label><select name="country">%s</select></div></div>'
+        '<label class="check"><input type="checkbox" name="open" value="1"%s> Open network (no password)</label>'
+        '<p class="hint">The address comes from DHCP. When both are connected the wired network is preferred. '
+        'NDI video over Wi-Fi is unreliable: use it for this page, or where no cable reaches. Switching Wi-Fi on '
+        'for the first time needs a reboot.%s</p><button>Save Wi-Fi settings</button></form>%s</section>' %
+        (wifi_state_text(), hidden, " checked" if wifi_on else "", esc(wifi["ssid"]),
+         "".join('<option value="%s">' % esc(s) for s in ssids),
+         "Saved &ndash; leave empty to keep it" if wifi["psk"] else "",
+         options(([] if country else [("", "Choose...")]) + countries(), country),
+         " checked" if wifi_on and wifi["ssid"] and not wifi["psk"] else "",
+         " Networks nearby are offered in the name field." if ssids else "", reboot))
 
     # Password
     parts.append(
@@ -1357,6 +1625,7 @@ ROTATIONS = [("0", "0&deg; (normal)"), ("180", "180&deg; (upside down)")]
 BRIGHTNESSES = [(str(v), "Normal" if v == 0 else "%+d" % v) for v in range(-50, 51, 10)]
 MIRRORS = [("none", "None"), ("horizontal", "Horizontal (left/right)"), ("vertical", "Vertical (top/bottom)")]
 BANDWIDTHS = [("highest", "Full quality"), ("lowest", "Low-bandwidth preview")]
+PACINGS = [("fast", "Lowest delay"), ("smooth", "Smooth (experimental)")]
 STANDBYS = [("0", "Never (always show the splash)"), ("1", "After 1 minute"), ("5", "After 5 minutes"),
             ("15", "After 15 minutes"), ("30", "After 30 minutes"), ("60", "After 1 hour")]
 LEGACY_OUT1 = ("STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "MODE")
@@ -1395,7 +1664,7 @@ def act_output(form):
     if n not in [o["n"] for o in outputs()]:
         return ("err", "Unknown output.")
     keys = ("ENABLED", "STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "BANDWIDTH", "MODE", "AUDIO", "AUDIO_DELAY_MS",
-            "BACKUP_STREAM", "STANDBY_MIN", "CEC", "BRIGHTNESS")
+            "BACKUP_STREAM", "STANDBY_MIN", "CEC", "BRIGHTNESS", "PACING")
     updates = {"PINDI_OUT%d_%s" % (n, k): "" for k in keys}
     if n == 1:  # settings from before multi-output support
         updates.update({"PINDI_" + k: "" for k in LEGACY_OUT1})
@@ -1429,8 +1698,9 @@ def act_output(form):
             except ValueError:
                 return ("err", "Source IP must be an IPv4 address, or empty for any host.")
         brightness = form.get("brightness", "0")
+        pacing = form.get("pacing", "fast")
         if (rotate not in dict(ROTATIONS) or mirror not in dict(MIRRORS) or bandwidth not in dict(BANDWIDTHS) or
-                brightness not in dict(BRIGHTNESSES)):
+                brightness not in dict(BRIGHTNESSES) or pacing not in dict(PACINGS)):
             return ("err", "Invalid display setting.")
         # Explicit per output, so the shared PINDI_BANDWIDTH default of other outputs is left alone.
         default_bw = (read_env().get("PINDI_BANDWIDTH") or "highest").lower()
@@ -1441,6 +1711,7 @@ def act_output(form):
             "PINDI_OUT%d_ROTATE" % n: "" if rotate == "0" else rotate,
             "PINDI_OUT%d_MIRROR" % n: "" if mirror == "none" else mirror,
             "PINDI_OUT%d_BRIGHTNESS" % n: "" if brightness == "0" else brightness,
+            "PINDI_OUT%d_PACING" % n: "" if pacing == "fast" else pacing,
             "PINDI_OUT%d_BANDWIDTH" % n: "" if bandwidth == default_bw else bandwidth,
             "PINDI_OUT%d_MODE" % n: mode,
             "PINDI_OUT%d_BACKUP_STREAM" % n: backup,
@@ -1490,7 +1761,8 @@ def act_outgoing(form):
         slot = inp["slot"]
     elif not 1 <= slot <= 8 or slot in configured_inputs(read_env()):
         return ("err", "No free slot for another outgoing stream.")
-    keys = ["PINDI_IN%d_%s" % (slot, k) for k in ("ENABLED", "DEVICE", "NAME", "MODE", "AUDIO", "CODEC", "RANGE")]
+    keys = ["PINDI_IN%d_%s" % (slot, k) for k in ("ENABLED", "DEVICE", "NAME", "MODE", "AUDIO", "CODEC", "RANGE",
+                                                   "AUDIO_SYNC")]
     if form.get("remove"):
         write_env({k: "" for k in keys})
         msg = "Forgot %s." % inp["label"]
@@ -1511,10 +1783,13 @@ def act_outgoing(form):
         rng = form.get("range", "full")
         if rng not in dict(RANGES):
             return ("err", "Invalid picture levels.")
+        audio_sync = form.get("audio_sync", "on")
+        if audio_sync not in dict(AUDIO_SYNCS):
+            return ("err", "Invalid audio timing.")
         write_env(dict(zip(keys, ["1" if enabled else "0", device,
                                   "" if name == default_in_stream(slot) else name, mode,
                                   "" if audio == "auto" else audio, "" if codec == "speedhq" else codec,
-                                  "" if rng == "full" else rng])))
+                                  "" if rng == "full" else rng, "" if audio_sync == "on" else audio_sync])))
         msg = ("%s will be sent as \"%s\"." % (inp["label"], name or default_in_stream(slot))) if enabled \
             else ("%s is not sent." % inp["label"])
     log("outgoing: slot %d %s" % (slot, msg))
@@ -1564,6 +1839,59 @@ def act_network(form):
     where = ("http://%s/" % target) if target != "DHCP" else "the address shown on the splash screen"
     return ("warn", "Applying new network settings. Open %s within %d seconds, sign in and press Keep." %
             (where, ROLLBACK_SECONDS))
+
+
+def act_wifi(form):
+    on = form.get("enabled") == "1"
+    if not on:
+        if not wifi_enabled():
+            return ("ok", "Wi-Fi is off.")
+        os.remove(WIFI_WANTS)
+        set_wifi_overlay(False)
+        if wifi_present():
+            later(0.5, apply_wifi, False)
+        log("wifi: off")
+        return ("ok", "Wi-Fi is off. The Wi-Fi hardware is switched off completely at the next reboot.")
+    ssid, passphrase = form.get("ssid", "").strip(), form.get("password", "")
+    country = form.get("country", "")
+    if not 1 <= len(ssid.encode()) <= 32 or any(ord(c) < 32 for c in ssid):
+        return ("err", "Enter the Wi-Fi network name (at most 32 characters).")
+    if country not in dict(countries()):
+        return ("err", "Choose the country the device is used in (it sets the allowed Wi-Fi channels).")
+    old = read_wifi_config()
+    if form.get("open"):
+        psk = ""
+    elif passphrase:
+        if not (8 <= len(passphrase) <= 63 and all(32 <= ord(c) < 127 for c in passphrase)) and \
+                not re.match(r"^[0-9a-fA-F]{64}$", passphrase):
+            return ("err", "A Wi-Fi password has 8 to 63 characters (letters, digits and symbols).")
+        psk = wifi_psk(ssid, passphrase)
+    elif ssid == old["ssid"] and old["psk"]:
+        psk = old["psk"]  # empty password field: keep the stored key
+    else:
+        return ("err", "Enter the password of %s (or tick \"Open network\" if it has none)." % ssid)
+    write_atomic(WIFI_CONF, render_wifi_config(ssid, psk, country), 0o600)
+    write_atomic(WIFI_NETWORK_FILE, "# Written by the PiNDI web interface.\n[Match]\nName=%s\n\n[Network]\n"
+                                    "DHCP=yes\n\n[DHCPv4]\nClientIdentifier=mac\n# Wired stays the preferred "
+                                    "route.\nRouteMetric=2048\n\n[IPv6AcceptRA]\nRouteMetric=2048\n" % WIFI_IFACE)
+    # The Pi OS image keeps Wi-Fi blocked until a country is set; systemd-rfkill restores that block at boot.
+    os.makedirs(os.path.dirname(WIFI_DROPIN), exist_ok=True)
+    write_atomic(WIFI_DROPIN, "# Written by the PiNDI web interface.\n[Service]\n"
+                              "ExecStartPre=-/usr/sbin/rfkill unblock wifi\n")
+    for name in os.listdir("/var/lib/systemd/rfkill") if os.path.isdir("/var/lib/systemd/rfkill") else []:
+        if name.endswith(":wlan"):
+            write_atomic("/var/lib/systemd/rfkill/" + name, "0\n")
+    if not wifi_enabled():
+        os.makedirs(os.path.dirname(WIFI_WANTS), exist_ok=True)
+        os.symlink("/lib/systemd/system/wpa_supplicant@.service", WIFI_WANTS)
+    set_wifi_overlay(True)
+    log("wifi: on, network %s, country %s%s" % (ssid, country, "" if psk else ", open"))
+    if not wifi_present():
+        return ("warn", "Wi-Fi settings saved. Reboot the device to switch the Wi-Fi hardware on; it then "
+                        "connects to %s." % ssid)
+    later(0.5, apply_wifi, True)
+    return ("ok", "Connecting to %s. The status below shows the result after a few seconds (reload the page)."
+            % ssid)
 
 
 def act_password(session, form):
@@ -1693,6 +2021,28 @@ def act_identify(form):
     return ("ok", "%s shows its name for 15 seconds." % ("Output %d" % n if n else "Every output"))
 
 
+SYSCTL_FILE = "/etc/sysctl.d/90-pindi-ndi.conf"
+NET_BUFFERS = ("net.core.wmem_default = 4194304\nnet.core.rmem_default = 4194304\n"
+               "net.core.wmem_max = 8388608\nnet.core.rmem_max = 8388608\n")
+
+
+def set_net_buffers(large):
+    """NDI sends each video frame as a burst of UDP packets per receiver; the kernel's 208 KB default
+    socket buffer overflows with two receivers at 1080p and the packets are dropped. Large buffers
+    (the default, PINDI_NET_BUFFERS unset) avoid that; off restores the system's own sizes."""
+    if large:
+        write_atomic(SYSCTL_FILE, "# Written by the PiNDI web interface (Device settings).\n" + NET_BUFFERS)
+    else:
+        try:
+            os.remove(SYSCTL_FILE)
+        except FileNotFoundError:
+            pass
+        for k in ("wmem_default", "rmem_default", "wmem_max", "rmem_max"):
+            with open("/proc/sys/net/core/" + k, "w") as f:
+                f.write("212992\n")
+    run("sysctl", "-q", "--system")
+
+
 def restart_media():
     run("systemctl", "restart", "pindi.service", "pindi-sender.service")
 
@@ -1720,9 +2070,19 @@ def act_device(form):
     reboot_at = form.get("reboot_at", "")
     if reboot_at and not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", reboot_at):
         return ("err", "The daily reboot time must look like 04:30.")
+    transport = form.get("transport", "tcp")
+    if transport not in dict(TRANSPORTS):
+        return ("err", "Unknown NDI transport.")
+    current = ndi_settings()
+    vendor_name = form.get("vendor_name", current["vendor_name"]).strip()
+    vendor_id = form.get("vendor_id", current["vendor_id"]).strip()
+    if len(vendor_name) > 200 or len(vendor_id) > 200 or not valid_name(vendor_name) or not valid_name(vendor_id):
+        return ("err", "Invalid NDI licence vendor name or ID.")
+    if vendor_id and not vendor_name:
+        return ("err", "Enter the vendor name that came with the NDI licence ID.")
 
     # Everything is valid: apply. Video restarts only if something it uses changed.
-    media_keys = ("PINDI_SPLASH_INFO", "PINDI_FRAME_TIMEOUT_MS")
+    media_keys = ("PINDI_SPLASH_INFO", "PINDI_FRAME_TIMEOUT_MS", "PINDI_NET_BUFFERS")
     env = read_env()
     before = (ndi_settings(), [env.get(k, "") for k in media_keys])
     host = hostname_for(name)
@@ -1733,17 +2093,21 @@ def act_device(form):
     # A name that is a valid host name is used as is (NDI shows it in capitals, as usual); anything
     # else ("Lobby left") also becomes the NDI machine name, so sources show it exactly as typed.
     write_ndi_settings(lists["discovery"], lists["send_groups"], lists["recv_groups"],
-                       "" if name == host else name)
+                       "" if name == host else name, transport, vendor_name, vendor_id)
     if tz and tz != current_timezone():
         run("timedatectl", "set-timezone", tz)
         log("time zone: %s" % tz)
     set_reboot_time(reboot_at)
     write_env({"PINDI_SPLASH_INFO": "" if form.get("splash_info") == "1" else "0",
-               "PINDI_FRAME_TIMEOUT_MS": "10000" if form.get("frame_timeout") == "1" else ""})
+               "PINDI_FRAME_TIMEOUT_MS": "10000" if form.get("frame_timeout") == "1" else "",
+               "PINDI_NET_BUFFERS": "" if form.get("net_buffers") == "1" else "0"})
+    if env.get("PINDI_NET_BUFFERS", "") != read_env().get("PINDI_NET_BUFFERS", ""):
+        set_net_buffers(form.get("net_buffers") == "1")
     env = read_env()
     restart = renamed or before != (ndi_settings(), [env.get(k, "") for k in media_keys])
-    log("device settings: name=%s host=%s discovery=%s recv=%s send=%s" % (
-        name, host, lists["discovery"] or "-", lists["recv_groups"] or "-", lists["send_groups"] or "-"))
+    log("device settings: name=%s host=%s discovery=%s recv=%s send=%s transport=%s buffers=%s" % (
+        name, host, lists["discovery"] or "-", lists["recv_groups"] or "-", lists["send_groups"] or "-", transport,
+        "large" if form.get("net_buffers") == "1" else "system"))
     if not restart:
         return ("ok", "Device settings saved.")
 
@@ -1861,6 +2225,10 @@ def diagnostics_text():
                 out += ["---- " + name, read_text(os.path.join(RUN_DIR, name)).rstrip(), ""]
     except OSError:
         pass
+    wifi = read_wifi_config()
+    out += ["---- Wi-Fi", "%s; network %s, country %s, %s" % (
+        re.sub(r"<[^>]+>", "", html.unescape(wifi_state_text())), wifi["ssid"] or "-", wifi["country"] or "-",
+        "password set" if wifi["psk"] else "no password"), ""]
     out += ["---- ip addr", run("ip", "addr").stdout, "---- services",
             run("systemctl", "status", "--no-pager", "-n", "0", "pindi", "pindi-sender", "pindi-web").stdout,
             "---- log (last 2000 lines)", journal(2000), "---- kernel (last 200 lines)",
@@ -2135,6 +2503,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             s["flash"] = act_outgoing(form)
         elif path == "/network":
             s["flash"] = act_network(form)
+        elif path == "/wifi":
+            s["flash"] = act_wifi(form)
         elif path == "/network/confirm":
             NET.confirm()
             s["flash"] = ("ok", "Network settings kept.")

@@ -7,6 +7,8 @@
  *   PINDI_IN<n>_NAME=IN_<serial>               NDI stream name (default IN_<serial>[_n])
  *   PINDI_IN<n>_MODE="MJPG 1920x1080@30"       optional, else the best mode up to 1080p30
  *   PINDI_IN<n>_AUDIO=auto                     the device's own USB audio (default), or off
+ *   PINDI_IN<n>_AUDIO_SYNC=off                 send the audio as the device's clock delivers it (default:
+ *                                              kept in step with this Pi's clock)
  *
  * One thread per input: V4L2 capture -> decode workers (MJPEG decode straight to YUV, two threads
  * at HD) -> NDI send, and one for its audio: ALSA capture (48 kHz stereo) -> NDI send.
@@ -57,6 +59,9 @@
 
 static const NDIlib_v6 *ndi;
 static volatile sig_atomic_t running = 1;
+/* The NDI Advanced SDK's evaluation build said its 30 minutes are up: NDI|HX video stops (audio and
+ * Full NDI go on). Only the library's own message tells, so its output is watched (watch_output). */
+static volatile sig_atomic_t ndi_eval_over;
 static void on_signal(int sig) { (void)sig; running = 0; }
 static char serial[64];
 
@@ -65,6 +70,13 @@ static uint64_t now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static uint64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
 static const char *icfg(int n, const char *key, const char *def)
@@ -298,6 +310,7 @@ struct input {
     int n;
     char device[256], name[128], mode_s[64];
     bool audio_on;
+    bool audio_sync; /* keep the audio in step with this Pi's clock (PINDI_IN<n>_AUDIO_SYNC) */
     bool hx; /* PINDI_IN<n>_CODEC=hx: NDI|HX through the hardware H.264 encoder */
     bool video_range; /* PINDI_IN<n>_RANGE=video: the device's JPEG is already 16-235 (else converted) */
     pthread_t thr, athr;
@@ -305,7 +318,7 @@ struct input {
     int w, h, fps_n, fps_d; /* last capture mode, for the black "no signal" frames */
     uint8_t *black;
     pthread_mutex_t lock;
-    char audio[128]; /* audio status line (lock) */
+    char audio[256]; /* audio status line (lock) */
     struct local_feed *lf; /* header of in<n>.local (fixed mapping, the audio thread uses it too) */
     int lf_fd;
     uint8_t *lf_frames;    /* its frame slots (remapped when the capture mode changes) */
@@ -591,7 +604,7 @@ fail:
 
 /* One encoded frame -> NDI: H.264 Annex B, with SPS/PPS moved to the packet's extra data. */
 static void hwenc_send(struct hwenc *e, NDIlib_send_instance_t send, const struct mode *m, const uint8_t *data,
-                       size_t len, bool key)
+                       size_t len, bool key, int64_t timecode)
 {
     if (e->pkt_cap < PKT_HDR + len * 2) {
         free(e->pkt);
@@ -646,7 +659,7 @@ static void hwenc_send(struct hwenc *e, NDIlib_send_instance_t send, const struc
         .FourCC = (NDIlib_FourCC_video_type_e)NDI_LIB_FOURCC('H', '2', '6', '4'),
         .frame_rate_N = (int)m->den, .frame_rate_D = (int)m->num,
         .frame_format_type = NDIlib_frame_format_type_progressive,
-        .timecode = NDIlib_send_timecode_synthesize,
+        .timecode = timecode,
         .p_data = e->pkt,
         .data_size_in_bytes = (int)(PKT_HDR + flen + es),
     };
@@ -664,6 +677,7 @@ struct worker {
     uint8_t *src;
     size_t len, cap;
     int64_t time;
+    bool dark;  /* the decoded picture is black */
     tjhandle tj;
     double warn_rate; /* share of recent frames the JPEG decoder warned about */
     uint8_t *planes;  /* planar picture when there is no shared memory */
@@ -682,6 +696,8 @@ struct pipeline {
     uint8_t *out[NOUT];
     int ostate[NOUT];
     int pending; /* out[] index waiting for the encoder, -1 = none */
+    int64_t out_time[NOUT]; /* capture time of the picture in out[] (100 ns UTC: NDI timecode) */
+    int64_t black_since;    /* capture time the picture went black (mu), 0 = it isn't */
     bool flush;  /* ndi_wait_idle: make NDI let go of the last frame */
     NDIlib_video_frame_v2_t pframe;
     pthread_t ndi_thr;
@@ -708,6 +724,11 @@ static void hx_step(struct pipeline *pl, int i, int wait_ms)
         struct v4l2_plane p = { .bytesused = (uint32_t)e->in_len[i], .length = (uint32_t)e->in_len[i] };
         struct v4l2_buffer b = { .index = i, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, .memory = V4L2_MEMORY_MMAP,
                                  .m.planes = &p, .length = 1 };
+        pthread_mutex_lock(&pl->mu);
+        int64_t t = pl->out_time[i];
+        pthread_mutex_unlock(&pl->mu);
+        b.timestamp.tv_sec = t / 10000000;
+        b.timestamp.tv_usec = t % 10000000 / 10;
         if (xioctl(e->fd, VIDIOC_QBUF, &b)) {
             pthread_mutex_lock(&pl->mu);
             pl->ostate[i] = O_FREE;
@@ -736,8 +757,9 @@ static void hx_step(struct pipeline *pl, int i, int wait_ms)
             if (xioctl(e->fd, VIDIOC_DQBUF, &b))
                 break;
             if (p.bytesused && b.index < ENC_OUT_BUFS) {
+                int64_t tc = ((int64_t)b.timestamp.tv_sec * 1000000 + b.timestamp.tv_usec) * 10;
                 hwenc_send(e, pl->send, &pl->m, e->out_map[b.index] + p.data_offset, p.bytesused - p.data_offset,
-                           b.flags & V4L2_BUF_FLAG_KEYFRAME);
+                           b.flags & V4L2_BUF_FLAG_KEYFRAME, tc ? tc : NDIlib_send_timecode_synthesize);
                 pthread_mutex_lock(&pl->mu);
                 pl->ndi_sent++;
                 pthread_mutex_unlock(&pl->mu);
@@ -790,7 +812,10 @@ static void *ndi_thread(void *arg)
         if (i >= 0)
             pl->ostate[i] = O_SENDING;
         pthread_mutex_unlock(&pl->mu);
+        uint64_t t = now_ms();
         ndi->send_send_video_async_v2(pl->send, i >= 0 ? &f : NULL); /* waits for the previous frame */
+        if (now_ms() - t > 200)
+            LOG("NDI took %llu ms to take a video frame", (unsigned long long)(now_ms() - t));
         pthread_mutex_lock(&pl->mu);
         if (prev >= 0)
             pl->ostate[prev] = O_FREE;
@@ -832,6 +857,7 @@ static void worker_frame(struct worker *wk)
     size_t ysz = (size_t)m->w * m->h;
     bool local = wk->local && lf && in->lf_frames;
     uint8_t *base = local ? in->lf_frames + (size_t)slot * lf->slot_size : wk->planes;
+    wk->dark = false;
     if (local)
         STORE(lf->slot_seq[slot], 0);
     int ob = -1; /* NDI buffer for this frame: only if one is free (else the encoder is busy: skip NDI) */
@@ -851,7 +877,8 @@ static void worker_frame(struct worker *wk)
         .frame_rate_N = (int)m->den, .frame_rate_D = (int)m->num,
         .picture_aspect_ratio = 0,
         .frame_format_type = NDIlib_frame_format_type_progressive,
-        .timecode = NDIlib_send_timecode_synthesize,
+        /* When the picture was captured: receivers pace frames by it (PINDI_OUT<n>_PACING). */
+        .timecode = wk->time ? wk->time : NDIlib_send_timecode_synthesize,
         .p_data = out,
     };
     bool ok = true, planar_ok = true;
@@ -891,6 +918,18 @@ static void worker_frame(struct worker *wk)
             bool warn = rc && tjGetErrorCode(wk->tj) == TJERR_WARNING;
             ok = !rc || (warn && wk->warn_rate > 0.8);
             wk->warn_rate = wk->warn_rate * 0.95 + (warn ? 0.05 : 0);
+        }
+        if (ok && planar_ok) {
+            /* How dark the picture is (a sparse sample of the luma): a black picture together with silence
+             * is a break in the programme (e.g. before an ad), not an audio fault - logged at publishing. */
+            unsigned sum = 0, mx = 0, n = 0;
+            for (int row = m->h / 32; row < m->h; row += m->h / 16)
+                for (int x = 16; x < m->w; x += 64, n++) {
+                    unsigned l = base[(size_t)row * m->w + x];
+                    sum += l;
+                    mx = l > mx ? l : mx;
+                }
+            wk->dark = n && sum / n < 24 && mx < 48;
         }
         if (ok && planar_ok && to_ndi) {
             if (fmt == LOCAL_420P && !pl->hx) { /* NDI's I420 is this very layout */
@@ -932,6 +971,16 @@ static void worker_frame(struct worker *wk)
     pthread_mutex_lock(&pl->mu);
     while (pl->next != s && !pl->quit)
         pthread_cond_wait(&pl->cv, &pl->mu);
+    if (ok && planar_ok) {
+        if (wk->dark && !pl->black_since) {
+            pl->black_since = wk->time;
+        } else if (!wk->dark && pl->black_since) {
+            double secs = (wk->time - pl->black_since) / 1e7;
+            if (secs >= 0.5)
+                LOG("input %d: video: picture black for %.2f s", in->n, secs);
+            pl->black_since = 0;
+        }
+    }
     if (ok) {
         if (local && planar_ok) {
             lf->slot_time[slot] = wk->time;
@@ -944,6 +993,7 @@ static void worker_frame(struct worker *wk)
                 pl->ostate[pl->pending] = O_FREE;
             pl->pending = ob;
             pl->ostate[ob] = O_PENDING;
+            pl->out_time[ob] = wk->time;
             pl->pframe = f;
             ob = -1;
         }
@@ -1192,7 +1242,10 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
             double secs = (now - t0) / 1000.0;
             if (conns)
                 ndi->send_get_tally(send, &tally, 0); /* a switcher (vMix, TriCaster...) has it on program/preview */
-            if (conns)
+            if (in->hx && ndi_eval_over)
+                snprintf(st, sizeof st, "NDI|HX video stopped: 30-minute limit of the NDI Advanced SDK evaluation "
+                                        "(sound goes on)");
+            else if (conns)
                 snprintf(st, sizeof st, "sending (%d receiver%s, %.0f fps over NDI)%s%s", conns, conns == 1 ? "" : "s",
                          sent / secs, local ? ", also shown on this device" : "",
                          tally.on_program ? " - ON AIR" : tally.on_preview ? " - on preview" : "");
@@ -1285,14 +1338,15 @@ static int audio_card_for(const char *video_dev)
 #define AUDIO_RATE 48000
 #define AUDIO_PERIOD 960 /* 20 ms */
 
-/* 48 kHz stereo, 20 ms periods, 100 ms buffer. Set explicitly: with snd_pcm_set_params()'s choice
- * (25 ms periods) the MS2109 capture cards fail every read with an I/O error. */
+/* 48 kHz stereo, 20 ms periods, 500 ms buffer. Set explicitly: with snd_pcm_set_params()'s choice
+ * (25 ms periods) the MS2109 capture cards fail every read with an I/O error. The long buffer rides
+ * out the thread being held off by video decoding instead of overrunning (lost audio). */
 static int audio_params(snd_pcm_t *pcm)
 {
     snd_pcm_hw_params_t *hw;
     snd_pcm_hw_params_alloca(&hw);
     unsigned rate = AUDIO_RATE;
-    snd_pcm_uframes_t period = AUDIO_PERIOD, buffer = AUDIO_PERIOD * 5;
+    snd_pcm_uframes_t period = AUDIO_PERIOD, buffer = AUDIO_PERIOD * 25;
     int err = snd_pcm_hw_params_any(pcm, hw);
     if (!err)
         err = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
@@ -1311,10 +1365,79 @@ static int audio_params(snd_pcm_t *pcm)
     return err;
 }
 
+/* One line per second of audio: wall-clock time, peak and RMS in dBFS. Kept to about 10000 lines. */
+static void levels_append(struct input *in, int peak, double rms)
+{
+    char path[64];
+    snprintf(path, sizeof path, RUN_DIR "/in%d.levels", in->n);
+    struct stat sb;
+    if (!stat(path, &sb) && sb.st_size > 512 * 1024) {
+        char old[72];
+        snprintf(old, sizeof old, "%s.old", path);
+        rename(path, old);
+    }
+    FILE *f = fopen(path, "a");
+    if (!f)
+        return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    fprintf(f, "%02d:%02d:%02d.%03ld peak %6.1f rms %6.1f\n", tm.tm_hour, tm.tm_min, tm.tm_sec,
+            ts.tv_nsec / 1000000, peak ? 20 * log10(peak / 32768.0) : -99.0,
+            rms > 0 ? 20 * log10(rms / 32768.0) : -99.0);
+    fclose(f);
+}
+
+/* Hand n frames to this device's own display and to NDI. */
+static void audio_out(struct input *in, const int16_t *s, int n)
+{
+    struct local_feed *lf = in->lf;
+    if (local_wanted(lf)) { /* this device's own display */
+        uint64_t wr = lf->audio_wr;
+        for (int i = 0; i < n; i++) {
+            size_t at = (size_t)((wr + (uint64_t)i) % LOCAL_AUDIO) * 2;
+            lf->audio[at] = s[i * 2];
+            lf->audio[at + 1] = s[i * 2 + 1];
+        }
+        STORE(lf->audio_wr, wr + (uint64_t)n);
+    }
+    /* Nobody listening: drop, as for the video. */
+    if (!ndi->send_get_no_connections(in->send, 0))
+        return;
+    NDIlib_audio_frame_interleaved_16s_t a = {
+        .sample_rate = AUDIO_RATE, .no_channels = 2, .no_samples = n,
+        .timecode = NDIlib_send_timecode_synthesize, .reference_level = 0, .p_data = (int16_t *)s,
+    };
+    uint64_t t = now_us();
+    ndi->util_send_send_audio_interleaved_16s(in->send, &a);
+    t = now_us() - t;
+    if (t > 50000)
+        LOG("input %d: audio: NDI took %llu ms to take 20 ms of audio", in->n, (unsigned long long)t / 1000);
+}
+
+/* Stereo frames s[0..r) resampled to d[0..n) (linear; n is r +- 1 for drift). */
+static void audio_stretch(const int16_t *s, int r, int16_t *d, int n)
+{
+    for (int i = 0; i < n; i++) {
+        double pos = (double)i * (r - 1) / (n - 1);
+        int j = (int)pos, k = j + 1 < r ? j + 1 : j;
+        double f = pos - j;
+        for (int c = 0; c < 2; c++)
+            d[i * 2 + c] = (int16_t)lrint(s[j * 2 + c] * (1 - f) + s[k * 2 + c] * f);
+    }
+}
+
 static void *audio_thread(void *arg)
 {
     struct input *in = arg;
     int16_t *buf = malloc(AUDIO_PERIOD * 2 * sizeof(int16_t));
+    int16_t stretched[(AUDIO_PERIOD + 1) * 2];
+    static const int16_t silence[AUDIO_PERIOD * 2];
+    /* Ahead of the video decoding: a busy CPU then delays a picture rather than losing audio. */
+    struct sched_param sp = { .sched_priority = 10 };
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp))
+        LOG("input %d: audio runs without real-time priority", in->n);
     bool logged_none = false;
     while (running && buf) {
         int card = audio_card_for(in->device);
@@ -1354,38 +1477,127 @@ static void *audio_thread(void *arg)
             continue;
         }
         LOG("input %d: audio from %s (%s), 48 kHz stereo", in->n, name ? name : "?", dev);
-        char st[128];
-        snprintf(st, sizeof st, "48 kHz stereo from %s", name ? name : dev);
+        char src[64];
+        snprintf(src, sizeof src, "%s", name ? name : dev);
+        char st[256];
+        snprintf(st, sizeof st, "48 kHz stereo from %s", src);
         set_audio_status(in, st);
         free(name);
+
+        /* NDI's synthesized timecodes count samples, but the card's audio clock is not the Pi's: a
+         * card running a little fast or slow, or audio lost to an overrun, leaves the audio drifting
+         * from real time (and the video) until receivers drop it for a few seconds to resync. So the
+         * samples sent are kept in step with the Pi's clock: a read stretched by one sample either
+         * way for drift, silence for audio that was lost. */
+        int warm = 0, xruns = 0, log_xruns = 0;
+        uint64_t t_start = 0, t_stat = now_ms(), t_log = t_stat, sent = 0;
+        int64_t adjusted = 0, log_lost = 0; /* samples added (+) or removed (-) for drift; filled with silence */
+        double base = 0, drift = 0;
+        uint64_t quiet = 0; /* frames of silence from the card in a row (logged from 500 ms) */
+        int lv_peak = 0, lv_n = 0;
+        double lv_sum = 0;
         while (running) {
             snd_pcm_sframes_t r = snd_pcm_readi(pcm, buf, AUDIO_PERIOD);
             if (r == -EPIPE || r == -ESTRPIPE || r == -EINTR) {
-                snd_pcm_recover(pcm, (int)r, 1);
+                if (r == -EPIPE) {
+                    xruns++;
+                    log_xruns++;
+                }
+                if (snd_pcm_recover(pcm, (int)r, 1) < 0)
+                    break;
                 continue;
             }
             if (r < 0) {
                 LOG("input %d: audio read: %s", in->n, snd_strerror((int)r));
                 break; /* device gone: look for it again */
             }
-            struct local_feed *lf = in->lf;
-            if (local_wanted(lf)) { /* this device's own display */
-                uint64_t wr = lf->audio_wr;
-                for (snd_pcm_sframes_t i = 0; i < r; i++) {
-                    size_t at = (size_t)((wr + (uint64_t)i) % LOCAL_AUDIO) * 2;
-                    lf->audio[at] = buf[i * 2];
-                    lf->audio[at + 1] = buf[i * 2 + 1];
+            /* The card itself going silent (its HDMI audio dropping) looks like a network dropout at the
+             * receivers, so say when it happens (under -60 dBFS for half a second), and keep each second's
+             * level in in<n>.levels to look back at. */
+            for (snd_pcm_sframes_t i = 0; i < r; i++) {
+                int a = abs(buf[i * 2]), b = abs(buf[i * 2 + 1]), m = a > b ? a : b;
+                if (m > lv_peak)
+                    lv_peak = m;
+                lv_sum += (double)buf[i * 2] * buf[i * 2] + (double)buf[i * 2 + 1] * buf[i * 2 + 1];
+                if (++lv_n == AUDIO_RATE) {
+                    levels_append(in, lv_peak, sqrt(lv_sum / (2.0 * lv_n)));
+                    lv_peak = lv_n = 0;
+                    lv_sum = 0;
                 }
-                STORE(lf->audio_wr, wr + (uint64_t)r);
+                if (m <= 32) {
+                    if (++quiet == AUDIO_RATE / 2)
+                        LOG("input %d: audio: the card sends silence", in->n);
+                } else {
+                    if (quiet >= AUDIO_RATE / 2)
+                        LOG("input %d: audio: sound again after %.2f s of silence from the card", in->n,
+                            quiet / (double)AUDIO_RATE);
+                    quiet = 0;
+                }
             }
-            /* Nobody listening: read and drop, as for the video. */
-            if (!ndi->send_get_no_connections(in->send, 0))
-                continue;
-            NDIlib_audio_frame_interleaved_16s_t a = {
-                .sample_rate = AUDIO_RATE, .no_channels = 2, .no_samples = (int)r,
-                .timecode = NDIlib_send_timecode_synthesize, .reference_level = 0, .p_data = buf,
-            };
-            ndi->util_send_send_audio_interleaved_16s(in->send, &a);
+            uint64_t now = now_us();
+            snd_pcm_sframes_t avail = snd_pcm_avail_update(pcm);
+            if (avail < 0)
+                avail = 0;
+            /* Samples captured (this read and those still waiting) ahead of the Pi's clock. */
+            double ahead = (double)(sent + (uint64_t)r + (uint64_t)avail) - base -
+                           (double)(now - t_start) * AUDIO_RATE / 1e6;
+            if (warm < 50) { /* the first second: let the capture settle, then start the clock */
+                warm++;
+                t_start = now;
+                base = (double)(sent + (uint64_t)r + (uint64_t)avail);
+                ahead = 0;
+            }
+            drift += (ahead - drift) * 0.01;
+            const int16_t *out = buf;
+            int n = (int)r;
+            if (!in->audio_sync) {
+                /* sent as the card delivers it */
+            } else if (ahead < -AUDIO_RATE / 10) { /* over 100 ms lost (an overrun): silence in its place */
+                int gap = (int)-ahead;
+                log_lost += gap;
+                while (gap > 0) {
+                    int k = gap < AUDIO_PERIOD ? gap : AUDIO_PERIOD;
+                    audio_out(in, silence, k);
+                    sent += (uint64_t)k;
+                    gap -= k;
+                }
+                drift = 0;
+            } else if (ahead > AUDIO_RATE / 10) { /* card far faster than one sample per read can fix */
+                base += ahead;
+                drift = 0;
+            } else if (n > 2 && (drift > AUDIO_RATE / 200 || drift < -AUDIO_RATE / 200)) { /* 5 ms */
+                int m = drift > 0 ? n - 1 : n + 1;
+                audio_stretch(buf, n, stretched, m);
+                adjusted += m - n;
+                out = stretched;
+                n = m;
+            }
+            audio_out(in, out, n);
+            sent += (uint64_t)n;
+
+            uint64_t ms = now_ms();
+            double secs = warm < 50 ? 0 : (now - t_start) / 1e6;
+            double ppm = secs > 10 ? -(double)adjusted / (secs * AUDIO_RATE) * 1e6 : 0;
+            if (ms - t_stat >= 2000) {
+                if (in->audio_sync)
+                    snprintf(st, sizeof st, "48 kHz stereo from %s (clock %+d ppm, %d overrun%s)", src,
+                             (int)lrint(ppm), xruns, xruns == 1 ? "" : "s");
+                else
+                    snprintf(st, sizeof st, "48 kHz stereo from %s (device timing, %d overrun%s)", src, xruns,
+                             xruns == 1 ? "" : "s");
+                set_audio_status(in, st);
+                t_stat = ms;
+            }
+            if (ms - t_log >= 60000) {
+                if (in->audio_sync)
+                    LOG("input %d: audio: card clock %+.0f ppm, %d overrun%s, %.2f s of lost audio filled", in->n,
+                        ppm, log_xruns, log_xruns == 1 ? "" : "s", log_lost / (double)AUDIO_RATE);
+                else
+                    LOG("input %d: audio: device timing, %d overrun%s", in->n, log_xruns, log_xruns == 1 ? "" : "s");
+                log_xruns = 0;
+                log_lost = 0;
+                t_log = ms;
+            }
         }
         snd_pcm_close(pcm);
         if (running) {
@@ -1427,9 +1639,56 @@ static void *input_thread(void *arg)
     return NULL;
 }
 
+#define NDI_EVAL_MSG "designed for development use and will run on a stream for 30 minutes"
+
+static int output_fd = -1; /* the original stderr (the journal) */
+
+static void *output_thread(void *arg)
+{
+    int fd = (int)(intptr_t)arg, out = output_fd;
+    char line[4096];
+    size_t n = 0;
+    for (;;) {
+        ssize_t r = read(fd, line + n, sizeof line - 1 - n);
+        if (r <= 0)
+            break;
+        n += (size_t)r;
+        line[n] = 0;
+        if (!ndi_eval_over && strstr(line, NDI_EVAL_MSG))
+            ndi_eval_over = 1;
+        char *nl = strrchr(line, '\n');
+        size_t keep = nl ? (size_t)(line + n - (nl + 1)) : (n == sizeof line - 1 ? 0 : n);
+        if (write(out, line, n - keep) < 0) { }
+        memmove(line, line + n - keep, keep);
+        n = keep;
+    }
+    return NULL;
+}
+
+/* Our stdout and stderr (the journal) through a pipe, to notice the NDI library's evaluation message. */
+static void watch_output(void)
+{
+    int p[2];
+    pthread_t t;
+    int saved = dup(STDERR_FILENO);
+    if (saved < 0 || pipe(p))
+        return;
+    fflush(stdout);
+    output_fd = saved; /* output_thread writes the lines on to the original stderr */
+    if (dup2(p[1], STDOUT_FILENO) < 0 || dup2(p[1], STDERR_FILENO) < 0 ||
+        pthread_create(&t, NULL, output_thread, (void *)(intptr_t)p[0])) {
+        dup2(saved, STDOUT_FILENO);
+        dup2(saved, STDERR_FILENO);
+        return;
+    }
+    pthread_detach(t);
+    close(p[1]);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    watch_output();
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
     read_serial();
@@ -1455,6 +1714,7 @@ int main(void)
         snprintf(in->name, sizeof in->name, "%s", icfg(n, "NAME", def));
         snprintf(in->mode_s, sizeof in->mode_s, "%s", icfg(n, "MODE", ""));
         in->audio_on = strcasecmp(icfg(n, "AUDIO", "auto"), "off") != 0;
+        in->audio_sync = strcasecmp(icfg(n, "AUDIO_SYNC", "on"), "off") != 0;
         in->hx = !strcasecmp(icfg(n, "CODEC", "speedhq"), "hx");
         in->video_range = !strcasecmp(icfg(n, "RANGE", "full"), "video");
         pthread_mutex_init(&in->lock, NULL);
