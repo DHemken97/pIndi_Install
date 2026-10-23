@@ -40,26 +40,53 @@ or 5 has two HDMI outputs and Gigabit Ethernet.
 - `--no-reboot` skips the reboot at the end. Without a reboot, restart the
   services yourself: `sudo systemctl restart pindi pindi-sender pindi-web`.
 
+The NDI SDK archive is downloaded by hand, and NDI publishes no checksums.
+`install.sh` prints the archive's SHA-256. If a checksum file
+`Install_NDI_..._Linux.tar.gz.sha256` (from `sha256sum`) is next to the
+archive, an archive that doesn't match it is refused, so every device gets
+the same SDK.
+
+To remove PiNDI again, run `bash uninstall.sh`. It deletes PiNDI and its
+settings, and gives the system back its own boot settings, console, services
+and NetworkManager.
+
 ## Updating
 
 Run `bash make-update.sh` in this folder. It builds
-`pindi-update-<version>.tar.gz`, about 100 KB because the NDI SDK isn't
+`pindi-update-<version>.tar.gz`, about 160 KB because the NDI SDK isn't
 included; devices keep the SDK they have.
+
+The package is **signed**. Devices only install packages signed with the
+private key that matches the `update-key.pub` they were installed with:
+
+- The private key stays on the computer that makes updates, at
+  `~/.pindi/update-signing-key.pem` (or the path in `PINDI_SIGNING_KEY`). The
+  first run of `make-update.sh` creates it, together with `update-key.pub`.
+  Commit `update-key.pub`; never commit or share the private key.
+- **Back up the private key.** Without it, devices that have the matching
+  `update-key.pub` can only be updated by running `install.sh` over SSH.
 
 Install the package on a device under **System → Software update**:
 
+- The signature and every file's hash are checked first. Unsigned, changed or
+  differently signed packages are refused, and so are older versions unless
+  **Allow an older version** is ticked.
 - It installs offline, keeps all settings, shows the log live, and reboots when
   it's done (about 2 minutes on a Pi 3).
-- If the install fails, the previous version keeps running and the log shows
-  why.
+- If the install fails, the files it already replaced are put back and the
+  previous version keeps running; the log shows why. The previous version's
+  files are also kept in `/var/lib/pindi/previous`.
 
 Running `install.sh` again over SSH also works.
 
 ## First steps
 
-Open `http://<IP shown on the splash>/` and sign in with the Pi's own user (a
+Open `https://<IP shown on the splash>/` and sign in with the Pi's own user (a
 member of the `sudo` group, e.g. the user from step 1). If you signed in with a
 well-known default password, the page reminds you to change it.
+
+The device makes its own certificate, so the browser warns the first time:
+accept it for this device. `http://` addresses are redirected to `https://`.
 
 Out of the box, output 1 shows the stream `OUT_<serial>` and output 2 shows
 `OUT_<serial>_2`, from any host. Either name your sender like that, or pick a
@@ -77,7 +104,7 @@ brightness and audio settings.
 | Device | Live network traffic, CPU temperature and load, under-voltage and throttling warnings, NDI SDK version, software version, clock |
 | Output *n* | Live preview of the screen, state, latency, format and audio. Settings: stream, source IP, backup stream, receive quality (full or low-bandwidth preview), display mode, rotation (0/180°), mirroring, display standby, audio output and delay. **Identify** shows "Output n" on that screen for 15 s. |
 | Outgoing streams | Each USB capture device: send on/off, NDI name, capture mode, audio on/off, audio timing |
-| Device settings | Device name (NDI name and host name), NDI Discovery Server, NDI groups, NDI receive transport (TCP or UDP), large network buffers, NDI Advanced SDK licence (vendor name and ID), time zone, daily reboot, splash options, HTTP API token |
+| Device settings | Device name (NDI name and host name), NDI Discovery Server, NDI groups, NDI receive transport (TCP or UDP), large network buffers, NDI Advanced SDK licence (vendor name and ID), time zone, daily reboot, daily OS updates (off by default), splash options, HTTP API token |
 | Network | DHCP or static IP, NTP servers. A change undoes itself after 2 minutes unless you press **Keep** at the new address. |
 | Wi-Fi | Off by default: the Wi-Fi hardware is switched off in `config.txt`, so the device starts faster. On: one network (name, password, country), address from DHCP, wired stays the preferred route. Switching it on the first time needs a reboot. Nearby networks are offered in the name field. |
 | System | Log viewer, diagnostics download, settings backup and restore, reset to defaults, restart video, identify all screens, reboot |
@@ -167,8 +194,13 @@ So on a Pi 3B/3B+ that shows a stream too, send at 720p.
 ## HTTP API
 
 The token is under **Device settings → HTTP API**. Send it as
-`Authorization: Bearer <token>`; `X-API-Key: <token>` or `?token=<token>` also
-work. Request bodies can be JSON or form data.
+`Authorization: Bearer <token>` or `X-API-Key: <token>`. Tokens in the URL
+(`?token=`) are not accepted: URLs end up in logs and browser histories.
+Request bodies can be JSON or form data.
+
+The API is served over HTTPS only, with the device's own certificate. Tell the
+client to accept it: `curl -k`, or in Bitfocus Companion's generic HTTP module
+turn off certificate checking.
 
 | Request | Body | Does |
 | --- | --- | --- |
@@ -180,7 +212,7 @@ work. Request bodies can be JSON or form data.
 Example:
 
 ```sh
-curl -H "Authorization: Bearer $TOKEN" -d stream="CAM 2" http://192.168.1.50/api/v1/outputs/1/source
+curl -k -H "Authorization: Bearer $TOKEN" -d stream="CAM 2" https://192.168.1.50/api/v1/outputs/1/source
 ```
 
 Wrong tokens count as failed sign-ins: after 5 failures in 10 minutes, the
@@ -191,7 +223,11 @@ address is locked out for 10 minutes.
 | Path | Contents |
 | --- | --- |
 | `/etc/default/pindi` | Settings (`PINDI_*`), documented in `pindi.conf`. Normally edited through the web interface. |
-| `/etc/pindi/ndi-config.v1.json` | NDI Discovery Server, groups, machine name, receive transport |
+| `/etc/pindi/ndi-config.v1.json` | NDI Discovery Server, groups, machine name, receive transport, NDI licence (readable by root and `pindi-media` only) |
+| `/etc/pindi/tls/` | The web interface's certificate and key (delete both and restart `pindi-web` to make new ones) |
+| `/usr/share/pindi/update-key.pub` | Public key that software updates must be signed with |
+| `/var/lib/pindi/previous/` | Files the last installation replaced (for a manual rollback) |
+| `/var/log/pindi-os-update.log` | Last operating-system update |
 | `/etc/sysctl.d/90-pindi-ndi.conf` | Large network buffers (Device settings) |
 | `/run/pindi/in<n>.levels` | The capture device's audio level, one line per second |
 | `/etc/pindi/api-token` | HTTP API token |
@@ -200,8 +236,41 @@ address is locked out for 10 minutes.
 | `/run/pindi/` | Live state for the web interface (status, previews) |
 
 Services: `pindi` (splash and receiver), `pindi-sender` (outgoing streams),
-`pindi-web` (web interface). Logs: `journalctl -u pindi -u pindi-sender -u pindi-web`,
-or **View logs** in the web interface.
+`pindi-web` (web interface), `pindi-os-update` (operating-system updates).
+Logs: `journalctl -u pindi -u pindi-sender -u pindi-web`, or **View logs** in
+the web interface.
+
+## Security
+
+- **Web interface:** HTTPS only (TLS 1.2 or later). Sign-in uses the Pi's own
+  accounts and is limited to the `sudo` group. Session cookies are `Secure`,
+  `HttpOnly` and `SameSite=Strict`, and every change needs the page's CSRF
+  token.
+- **Sessions:** changing a password signs that user out everywhere else.
+- **Lockout:** after 5 failed sign-ins (or wrong API tokens) in 10 minutes, an
+  address is locked out for 10 minutes.
+- **Request limits:** requests are size-checked before they are read, and idle
+  connections are closed after 20 s. At most 8 connections from one address
+  are handled at a time (64 in all), so one misbehaving client can't lock
+  everyone out.
+- **Privileges:** the player and sender run as the unprivileged `pindi-media`
+  user (groups `video`, `audio`, `render`), in a systemd sandbox with a
+  read-only system. The web interface has to run as root, because it changes
+  passwords, the host name, the network and the boot configuration. It still
+  runs with the systemd restrictions that don't get in the way of that.
+- **Software updates** must be signed (see Updating).
+- **Operating-system updates are off by default,** so nothing downloads or
+  upgrades during a show. Under **Device settings**, set a daily time for them,
+  ideally just before the daily reboot. You can also press **Install OS updates
+  now** under System. Either needs internet access. Devices that never get OS
+  updates miss security fixes: turn it on, or re-run `install.sh` (which runs
+  `apt full-upgrade`) now and then.
+- **Network exposure:** the device listens on 80/443 (web interface), 22 (SSH),
+  5353 (mDNS) and the NDI ports (5960 and up). LLMNR is switched off. SSH
+  accepts the Pi user's password. Use a strong password, or SSH keys with
+  `PasswordAuthentication no`, and keep the devices on a network you trust.
+- **Diagnostics** leave out the NDI licence. Settings backups include it, so
+  keep them private. Wi-Fi passwords and the API token are in neither.
 
 ## Built for unattended use
 

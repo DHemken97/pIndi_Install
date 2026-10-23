@@ -1,19 +1,39 @@
 [Unit]
 Description=PiNDI splash screen and NDI receiver
-# Start as early as possible: the player loads the display driver itself and
-# waits for the network and avahi on its own.
+# Start as early as possible: the player waits for the network and avahi on its own.
 DefaultDependencies=no
 Conflicts=getty@tty1.service shutdown.target
 Before=shutdown.target
+# Never give up restarting (the default stops after 5 quick failures, leaving the screen dark until a reboot).
+StartLimitIntervalSec=0
+# Loads the display drivers as root, alongside (not before) the unprivileged player.
+Wants=pindi-drivers.service
 
 [Service]
 Type=simple
+# Unprivileged: the display, decoder, CEC and sound devices are open to the video/audio/render groups.
+User=pindi-media
+Group=pindi-media
 EnvironmentFile=-/etc/default/pindi
-Environment=HOME=/root NDI_CONFIG_DIR=/etc/pindi
+Environment=HOME=/var/lib/pindi-media NDI_CONFIG_DIR=/etc/pindi
 ExecStart=/usr/local/bin/pindi-player
+RuntimeDirectory=pindi
+RuntimeDirectoryPreserve=yes
+StateDirectory=pindi-media
 Restart=always
 RestartSec=1
+RestartSteps=5
+RestartMaxDelaySec=30
 Nice=-10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=sysinit.target

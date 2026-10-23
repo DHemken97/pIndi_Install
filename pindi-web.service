@@ -2,13 +2,26 @@
 Description=PiNDI web administration
 # Not needed for the picture: start after the player so it never delays it.
 After=network.target pindi.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# Root: it administers the device (passwords, host name, network, boot configuration, updates). What it
+# never needs is taken away.
 ExecStart=/usr/bin/python3 /usr/local/lib/pindi/pindi-web.py
 Restart=always
 RestartSec=2
+RestartSteps=5
+RestartMaxDelaySec=30
 Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

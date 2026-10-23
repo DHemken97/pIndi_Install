@@ -9,7 +9,7 @@ if grep -q $'\r' "$0"; then sed -i 's/\r$//' "$0"; exec bash "$0" "$@"; fi #
 # --offline: no apt at all (the packages must already be installed); used by the web
 # interface's software update. Without Install_NDI_SDK_v6_Linux.tar.gz next to this
 # script, the NDI SDK that is already installed is kept.
-set -euo pipefail
+set -Eeuo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -32,6 +32,37 @@ for arg in "$@"; do
 done
 
 step() { echo; echo "==> $*"; }
+
+# Every program, script and unit file is replaced through put: atomically (a power cut leaves the old or
+# the new file, never half of one), keeping the old one in $PREV. If the installation fails, the previous
+# version's files come back; after a successful one they stay in /var/lib/pindi/previous.
+PREV=/var/lib/pindi/previous.new
+rm -rf "$PREV"
+install -d -m 700 "$PREV"
+put() { # put SRC DEST MODE
+    local dest=$2
+    if [ -e "$dest" ] && [ ! -e "$PREV$dest" ]; then
+        install -d "$PREV$(dirname "$dest")"
+        cp -a "$dest" "$PREV$dest"
+    elif [ ! -e "$dest" ]; then
+        echo "$dest" >> "$PREV/.added"
+    fi
+    install -m "$3" "$1" "$dest.pindi-new"
+    mv -f "$dest.pindi-new" "$dest"
+}
+rollback() {
+    trap - ERR
+    echo "Installation failed: putting the previous version's files back." >&2
+    (cd "$PREV" && find . -type f ! -name .added) | while IFS= read -r f; do
+        f=${f#.}
+        cp -a "$PREV$f" "$f.pindi-new" && mv -f "$f.pindi-new" "$f"
+    done
+    if [ -f "$PREV/.added" ]; then
+        while IFS= read -r f; do rm -f "$f"; done < "$PREV/.added"
+    fi
+    systemctl daemon-reload || true
+}
+trap rollback ERR
 
 # Files edited on Windows get CRLF line endings; normalise the ones we use.
 sed -i 's/\r$//' "$SRC/pindi-player.c" "$SRC/pindi.service" "$SRC/pindi.conf" \
@@ -59,7 +90,8 @@ PACKAGES=(gcc libc6-dev pkg-config
     fonts-dejavu-core
     avahi-daemon libavahi-client3
     systemd-resolved
-    python3 libpam-runtime)
+    python3 libpam-runtime
+    openssl)  # web interface: HTTPS certificate, update signatures
 # The NDI Advanced SDK decodes NDI|HX (H.264/HEVC) with FFmpeg 7's libavcodec, loaded at run time.
 if [ -f "$SRC/Install_NDI_Advanced_SDK_v6_Linux.tar.gz" ]; then
     PACKAGES+=(libavcodec61)
@@ -119,6 +151,13 @@ if [ "$NDI_KIND" = Advanced_SDK ]; then
 else
     NDI_DIR="NDI SDK for Linux"; NDI_LICENSE="NDI SDK License Agreement.txt"
 fi
+# NDI publishes no checksums. Its SHA-256 is shown so it can be compared with a known-good copy; with
+# <archive>.sha256 next to it (from "sha256sum <archive>"), a different file is refused.
+echo "SDK archive SHA-256: $(sha256sum "$NDI_TGZ" | cut -d' ' -f1)"
+if [ -f "$NDI_TGZ.sha256" ]; then
+    (cd "$SRC" && sha256sum -c --status "$NDI_TGZ.sha256") ||
+        { echo "$NDI_TGZ does not match $NDI_TGZ.sha256" >&2; exit 1; }
+fi
 # The vendor script is an interactive self-extractor; unpack its payload directly. It is
 # streamed from the archive, not written out: /tmp is in RAM and the Advanced one is 350 MB.
 LINE=$( (tar xzOf "$NDI_TGZ" || true) | awk '/^__NDI_ARCHIVE_BEGIN__/ { print NR + 1; exit 0; }')
@@ -155,20 +194,29 @@ CPU_FLAGS=""
 case "$NDI_ARCH" in
     arm-rpi3-linux-gnueabihf|arm-rpi4-linux-gnueabihf) CPU_FLAGS="-march=armv7-a -mfpu=neon-vfpv4" ;;
 esac
-gcc -O2 -Wall $CPU_FLAGS -pthread -o "$TMP/pindi-player" "$SRC/pindi-player.c" \
+# Both handle data from the network and from USB devices: buffer overflows abort instead of running on.
+HARDEN="-D_FORTIFY_SOURCE=2 -fstack-protector-strong -Wformat -Werror=format-security -Wl,-z,relro,-z,now"
+gcc -O2 -Wall $HARDEN $CPU_FLAGS -pthread -o "$TMP/pindi-player" "$SRC/pindi-player.c" \
     -I/usr/local/include/ndi $(pkg-config --cflags libdrm freetype2) \
     $(pkg-config --libs libdrm freetype2) -ljpeg -lasound -lm -ldl
-gcc -O2 -Wall $CPU_FLAGS -pthread -o "$TMP/pindi-sender" "$SRC/pindi-sender.c" \
+gcc -O2 -Wall $HARDEN $CPU_FLAGS -pthread -o "$TMP/pindi-sender" "$SRC/pindi-sender.c" \
     -I/usr/local/include/ndi -lturbojpeg -lasound -lm -ldl
-install -m 755 "$TMP/pindi-player" /usr/local/bin/pindi-player
-install -m 755 "$TMP/pindi-sender" /usr/local/bin/pindi-sender
+put "$TMP/pindi-player" /usr/local/bin/pindi-player 755
+put "$TMP/pindi-sender" /usr/local/bin/pindi-sender 755
 
 install -d /usr/share/pindi /etc/pindi
-install -m 644 "$SRC/Splash.jpg" /usr/share/pindi/splash.jpg
+put "$SRC/Splash.jpg" /usr/share/pindi/splash.jpg 644
 # Defaults for "Reset settings" in the web UI, and the version it shows.
-install -m 644 "$SRC/pindi.conf" /usr/share/pindi/pindi.conf
+put "$SRC/pindi.conf" /usr/share/pindi/pindi.conf 644
 echo "$(tr -d '\r\n' < "$SRC/VERSION" 2>/dev/null || echo unknown) (installed $(date +%Y-%m-%d))" \
-    > /usr/share/pindi/version
+    > "$TMP/version"
+put "$TMP/version" /usr/share/pindi/version 644
+# Software updates from the web interface must be signed with this key's pair (make-update.sh).
+if [ -f "$SRC/update-key.pub" ]; then
+    put "$SRC/update-key.pub" /usr/share/pindi/update-key.pub 644
+else
+    echo "Warning: update-key.pub is missing: the web interface will refuse every software update." >&2
+fi
 if [ ! -f /etc/default/pindi ]; then
     install -m 644 "$SRC/pindi.conf" /etc/default/pindi
 fi
@@ -180,20 +228,42 @@ if [ -f /etc/systemd/system/pindi-splash.service ]; then
 fi
 rm -f /usr/local/bin/pindi-splash-render /usr/share/pindi/splash-live.jpg
 
-install -m 644 "$SRC/pindi.service" /etc/systemd/system/pindi.service
+put "$SRC/pindi.service" /etc/systemd/system/pindi.service 644
+# The player runs unprivileged: this loads the display drivers (and the I2C drivers HDMI needs for EDID:
+# Pi 3 i2c_bcm2835, Pi 4/5 i2c_brcmstb) as root at the same moment, instead of waiting for udev.
+cat > "$TMP/pindi-drivers.service" <<'EOF'
+[Unit]
+Description=PiNDI: load the display drivers early
+DefaultDependencies=no
 
-# Web administration (port 80). Logins are the Pi's own users in the sudo group.
+[Service]
+Type=oneshot
+ExecStart=-/sbin/modprobe -q -a i2c_bcm2835 i2c_brcmstb vc4
+EOF
+put "$TMP/pindi-drivers.service" /etc/systemd/system/pindi-drivers.service 644
+
+# The player and sender run as this unprivileged user; the display, decoder, capture, CEC and sound
+# devices are open to these groups.
+if ! id pindi-media >/dev/null 2>&1; then
+    useradd --system --user-group --home-dir /var/lib/pindi-media --no-create-home \
+        --shell /usr/sbin/nologin pindi-media
+fi
+for g in video audio render; do
+    if getent group "$g" >/dev/null; then usermod -aG "$g" pindi-media; fi
+done
+
+# Web administration (HTTPS on port 443; port 80 redirects). Logins are the Pi's own users in the sudo group.
 install -d /usr/local/lib/pindi
-install -m 755 "$SRC/pindi-web.py" /usr/local/lib/pindi/pindi-web.py
+put "$SRC/pindi-web.py" /usr/local/lib/pindi/pindi-web.py 755
 cat > /etc/pam.d/pindi-web <<'EOF'
 # PiNDI web interface: same password check as a normal login / SSH.
 @include common-auth
 @include common-account
 EOF
-install -m 644 "$SRC/pindi-web.service" /etc/systemd/system/pindi-web.service
+put "$SRC/pindi-web.service" /etc/systemd/system/pindi-web.service 644
 
 # Outgoing NDI streams from capture devices: does nothing until enabled in the web UI.
-install -m 644 "$SRC/pindi-sender.service" /etc/systemd/system/pindi-sender.service
+put "$SRC/pindi-sender.service" /etc/systemd/system/pindi-sender.service 644
 
 # NDI sends each video frame as a burst of UDP packets, one burst per receiver. The 208 KB default
 # socket buffer overflows with two receivers at 1080p: the kernel drops packets and every receiver's
@@ -229,6 +299,44 @@ if "rudp" not in ndi:
         json.dump(cfg, f, indent=2)
         f.write("\n")
 EOF
+# It holds the NDI licence (vendor ID): readable by the media services, not by every user.
+chown root:pindi-media /etc/pindi/ndi-config.v1.json
+chmod 640 /etc/pindi/ndi-config.v1.json
+chmod 755 /etc/pindi
+# Left over from running as root (systemd hands it to pindi-media at the next start anyway).
+if [ -d /run/pindi ]; then chown -R pindi-media:pindi-media /run/pindi; fi
+
+# Operating-system updates: off unless a daily time is set (or "Install OS updates now") in the web
+# interface. apt's own daily timers stay off (below), so nothing downloads or upgrades during a show.
+cat > "$TMP/pindi-os-update.service" <<'EOF'
+[Unit]
+Description=PiNDI operating-system updates (web interface: Device settings / System)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=10
+TimeoutStartSec=2h
+StandardOutput=truncate:/var/log/pindi-os-update.log
+StandardError=inherit
+Environment=DEBIAN_FRONTEND=noninteractive
+ExecStart=/bin/sh -c 'echo "Operating-system update, $$(date)"; if apt-get update && apt-get -y \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade; then \
+    echo PINDI-OS-UPDATE-OK; else echo PINDI-OS-UPDATE-FAILED; exit 1; fi'
+EOF
+put "$TMP/pindi-os-update.service" /etc/systemd/system/pindi-os-update.service 644
+
+# Name lookups by LLMNR (systemd-resolved, port 5355 on every interface) are not needed: NDI and
+# <name>.local use mDNS (avahi).
+install -d /etc/systemd/resolved.conf.d
+cat > /etc/systemd/resolved.conf.d/pindi.conf <<'EOF'
+# Written by the PiNDI installer.
+[Resolve]
+LLMNR=no
+EOF
+systemctl try-restart systemd-resolved.service || true
 
 systemctl daemon-reload
 systemctl enable pindi.service pindi-web.service pindi-sender.service
@@ -290,9 +398,14 @@ for tok in $(tr -d '\r\n' < "$CMDLINE"); do
     esac
 done
 set +f
-echo "${NEW# } console=tty3 quiet loglevel=3 logo.nologo vt.global_cursor_default=0 consoleblank=0" > "$CMDLINE"
+# Written next to it and renamed: a power cut must never leave an empty kernel command line (no boot).
+echo "${NEW# } console=tty3 quiet loglevel=3 logo.nologo vt.global_cursor_default=0 consoleblank=0" \
+    > "$CMDLINE.pindi-new"
+sync "$CMDLINE.pindi-new"
+mv -f "$CMDLINE.pindi-new" "$CMDLINE"
 
-# Services not needed on a wired NDI display.
+# Services not needed on a wired NDI display. apt's daily timers would download and upgrade at random
+# times, during a show; OS updates run at a time set in the web interface instead (pindi-os-update).
 unit_exists() { [ -n "$(systemctl list-unit-files --no-legend "$1" 2>/dev/null)" ]; }
 for u in \
     getty@tty1.service \
@@ -379,6 +492,8 @@ ClientIdentifier=mac
 EOF
 fi
 systemctl enable systemd-networkd.service systemd-resolved.service
+# Enabling networkd also enables its wait-online service (disabled above): nothing here waits for it.
+systemctl disable systemd-networkd-wait-online.service >/dev/null 2>&1 || true
 
 # Clock: the Pi has no RTC. Public NTP servers in addition to any from DHCP or the
 # web UI: timesyncd rotates through all of them, so a DHCP-advertised server that
@@ -395,12 +510,19 @@ for u in NetworkManager.service NetworkManager-dispatcher.service; do
     fi
 done
 
+# Installed: the files this run replaced become the "previous version" (kept for a manual rollback).
+sync
+trap - ERR
+rm -rf /var/lib/pindi/previous
+mv "$PREV" /var/lib/pindi/previous
+
 step "Done"
 echo "Serial: $(tr -d '\0' < /sys/firmware/devicetree/base/serial-number)"
 echo "NDI stream to send: OUT_$(tr -d '\0' < /sys/firmware/devicetree/base/serial-number)"
 echo "Settings: /etc/default/pindi   Logs: journalctl -u pindi -f"
-echo "Web admin: http://<this device's IP>/ (log in as a sudo user, e.g. the SSH user)"
-echo "Original boot files saved as $CFG.pindi-orig and $CMDLINE.pindi-orig"
+echo "Web admin: https://<this device's IP>/ (log in as a sudo user, e.g. the SSH user; the browser warns"
+echo "  about the device's own certificate the first time)"
+echo "Original boot files saved as $CFG.pindi-orig and $CMDLINE.pindi-orig; undo everything: uninstall.sh"
 if [ "$REBOOT" -eq 1 ]; then
     echo "Rebooting in 5 seconds (Ctrl+C to cancel)..."
     sleep 5

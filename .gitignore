@@ -1,3 +1,4 @@
 pindi-update-*.tar.gz
 # NDI SDK archives may not be redistributed: download them from ndi.video
 Install_NDI_*.tar.gz
+__pycache__/

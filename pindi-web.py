@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """PiNDI web administration.
 
-Small standard-library HTTP server (runs as root, port 80):
+Small standard-library HTTPS server (runs as root, port 443, self-signed certificate; port 80 redirects):
   - login with the Pi's own user accounts (PAM, members of the sudo group)
   - per display output (detected by the player): enable/disable, NDI stream
     (default OUT_<serial>[_n]), source IP (default any), rotation, mirror, status
@@ -26,13 +26,20 @@ import re
 import secrets
 import socket
 import shutil
+import ssl
 import subprocess
 import tarfile
 import threading
 import time
 import urllib.parse
 
-PORT = int(os.environ.get("PINDI_WEB_PORT", "80"))
+PORT = int(os.environ.get("PINDI_WEB_PORT", "443"))  # HTTPS
+HTTP_PORT = int(os.environ.get("PINDI_WEB_HTTP_PORT", "80"))  # only redirects to HTTPS
+TLS_DIR = "/etc/pindi/tls"
+MAX_CONNECTIONS = 64  # at once; more are closed straight away
+MAX_PER_ADDRESS = 8  # from one address: one misbehaving client can't lock everyone else out
+REQUEST_TIMEOUT = 20  # seconds a connection may sit idle (TLS handshake, headers, body)
+BODY_MAX = 65536
 ENV_FILE = "/etc/default/pindi"
 ENV_DEFAULTS = "/usr/share/pindi/pindi.conf"
 VERSION_FILE = "/usr/share/pindi/version"
@@ -40,6 +47,7 @@ NDI_CONFIG = "/etc/pindi/ndi-config.v1.json"  # NDI_CONFIG_DIR=/etc/pindi in the
 NETWORK_FILE = "/etc/systemd/network/20-pindi-wired.network"
 RUN_DIR = "/run/pindi"
 ADMIN_GROUP = "sudo"
+MEDIA_GROUP = "pindi-media"  # pindi-player and pindi-sender run as this user
 SESSION_TTL = 8 * 3600
 ROLLBACK_SECONDS = 120
 
@@ -128,7 +136,7 @@ def run(*cmd, input=None):
     return subprocess.run(cmd, input=input, capture_output=True, text=True, timeout=30)
 
 
-def write_atomic(path, text, mode=0o644):
+def write_atomic(path, text, mode=0o644, group=None):
     """Replace path with text, safely even if the power is cut right after (synced to the SD card).
     mode None: leave it to the file system (the FAT boot partition has no permissions)."""
     tmp = path + ".tmp"
@@ -138,6 +146,11 @@ def write_atomic(path, text, mode=0o644):
         os.fsync(f.fileno())
     if mode is not None:
         os.chmod(tmp, mode)
+    if group:
+        try:
+            os.chown(tmp, 0, grp.getgrnam(group).gr_gid)
+        except KeyError:
+            pass  # not installed yet
     os.replace(tmp, path)
     try:
         d = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
@@ -666,6 +679,12 @@ def duration(sec):
 
 # ---------------------------------------------------------------- device name, NDI network settings
 
+def write_ndi_config(cfg):
+    """The NDI config holds the vendor licence ID: readable by the media services' user, not by everyone."""
+    os.makedirs(os.path.dirname(NDI_CONFIG), exist_ok=True)
+    write_atomic(NDI_CONFIG, json.dumps(cfg, indent=2) + "\n", 0o640, MEDIA_GROUP)
+
+
 def read_ndi_config():
     try:
         cfg = json.loads(read_text(NDI_CONFIG) or "{}")
@@ -737,8 +756,7 @@ def write_ndi_settings(discovery, send_groups, recv_groups, machinename, transpo
         ndi.pop("machinename", None)
     if not ndi:
         cfg.pop("ndi")
-    os.makedirs(os.path.dirname(NDI_CONFIG), exist_ok=True)
-    write_atomic(NDI_CONFIG, json.dumps(cfg, indent=2) + "\n")
+    write_ndi_config(cfg)
 
 
 _tz_cache = []
@@ -784,6 +802,66 @@ def set_reboot_time(hhmm):
     run("systemctl", "daemon-reload")
     run("systemctl", "enable", "--now", "pindi-reboot.timer")
     log("daily reboot: %s" % hhmm)
+
+
+OS_UPDATE_UNIT = "pindi-os-update"  # the .service is installed by install.sh
+OS_UPDATE_TIMER = "/etc/systemd/system/pindi-os-update.timer"
+OS_UPDATE_LOG = "/var/log/pindi-os-update.log"
+
+
+def os_update_time():
+    """"HH:MM" of the daily operating-system update, or "" (off, the default: apt never runs on its own)."""
+    m = re.search(r"^OnCalendar=\*-\*-\* (\d\d:\d\d):00$", read_text(OS_UPDATE_TIMER), re.M)
+    return m.group(1) if m else ""
+
+
+def set_os_update_time(hhmm):
+    if hhmm == os_update_time():
+        return
+    if not hhmm:
+        run("systemctl", "disable", "--now", OS_UPDATE_UNIT + ".timer")
+        try:
+            os.remove(OS_UPDATE_TIMER)
+        except OSError:
+            pass
+        run("systemctl", "daemon-reload")
+        log("os updates: off")
+        return
+    # Not Persistent: a run missed while switched off must not start in the middle of a show at power-on.
+    write_atomic(OS_UPDATE_TIMER, "[Unit]\nDescription=PiNDI daily operating-system updates\n\n[Timer]\n"
+                                  "OnCalendar=*-*-* %s:00\n\n[Install]\nWantedBy=timers.target\n" % hhmm)
+    run("systemctl", "daemon-reload")
+    run("systemctl", "enable", "--now", OS_UPDATE_UNIT + ".timer")
+    log("os updates: daily at %s" % hhmm)
+
+
+def os_update_text():
+    """Last operating-system update, for the Device card."""
+    if run("systemctl", "is-active", OS_UPDATE_UNIT + ".service").stdout.strip() in ("activating", "active"):
+        return "installing now"
+    try:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(OS_UPDATE_LOG)))
+    except OSError:
+        return "never installed from this device" + (" (daily at %s)" % os_update_time() if os_update_time() else
+                                                      " (off)")
+    text = read_text(OS_UPDATE_LOG)
+    state = "OK" if "PINDI-OS-UPDATE-OK" in text else '<span class="warn">failed (see the log)</span>'
+    out = "last run %s, %s" % (when, state)
+    out += " &middot; daily at %s" % os_update_time() if os_update_time() else " &middot; automatic: off"
+    if os.path.exists("/run/reboot-required"):
+        out += ' &middot; <span class="warn">reboot needed to finish</span>'
+    return out
+
+
+def act_os_update_now():
+    if run("systemctl", "is-active", OS_UPDATE_UNIT + ".service").stdout.strip() in ("activating", "active"):
+        return ("err", "Operating-system updates are already being installed.")
+    r = run("systemctl", "start", "--no-block", OS_UPDATE_UNIT + ".service")
+    if r.returncode:
+        return ("err", "Could not start the update: %s" % (r.stderr.strip() or "run install.sh again"))
+    log("os updates: started by hand")
+    return ("ok", "Installing operating-system updates in the background (needs internet; a few minutes). "
+                  "Video keeps running; see the OS update log.")
 
 
 def device_name():
@@ -1042,6 +1120,9 @@ class Sessions:
     def create(self, user):
         token = secrets.token_urlsafe(32)
         with self.lock:
+            now = time.time()
+            for t in [t for t, s in self.items.items() if s["expires"] <= now]:
+                del self.items[t]
             self.items[token] = {"user": user, "csrf": secrets.token_urlsafe(24),
                                  "expires": time.time() + SESSION_TTL, "flash": None}
         return token
@@ -1058,6 +1139,12 @@ class Sessions:
     def drop(self, token):
         with self.lock:
             self.items.pop(token or "", None)
+
+    def drop_user(self, user, keep=None):
+        """Sign user out everywhere except the session keep (after a password change)."""
+        with self.lock:
+            for t in [t for t, s in self.items.items() if s["user"] == user and s is not keep]:
+                del self.items[t]
 
 
 SESSIONS = Sessions()
@@ -1081,6 +1168,8 @@ class Lockout:
     def failure(self, ip):
         now = time.time()
         with self.lock:
+            for old in [a for a, t in self.until.items() if t < now]:  # forget served lockouts
+                del self.until[old]
             recent = [t for t in self.fails.get(ip, []) if now - t < self.WINDOW] + [now]
             self.fails[ip] = recent
             if len(recent) >= self.LIMIT:
@@ -1293,6 +1382,7 @@ def dashboard(session):
         ("Serial", esc(SERIAL)),
         ("Model", esc(MODEL)),
         ("Software", "PiNDI %s" % esc(version())),
+        ("OS updates", os_update_text()),
         ("Clock", clock_text()),
         ("Outputs", "%d display output%s" % (len(outs), "" if len(outs) == 1 else "s")),
         ("Inputs", "%d capture device%s" % (len(ins), "" if len(ins) == 1 else "s")),
@@ -1492,7 +1582,11 @@ def dashboard(session):
         '<div class="row"><div><label>Time zone</label><select name="timezone">%s</select></div>'
         '<div><label>Reboot every day at (optional)</label><input type="time" name="reboot_at" value="%s">'
         '<span class="hint block">Empty = never. A daily reboot clears any slow build-up on '
-        'installations that run for months.</span></div></div>'
+        'installations that run for months.</span></div>'
+        '<div><label>Install OS updates every day at (optional)</label><input type="time" name="os_update_at" '
+        'value="%s"><span class="hint block">Empty = never (the default). Security fixes for Raspberry Pi OS, '
+        'from the internet; set it before the daily reboot, outside show times. Needs internet access.</span>'
+        '</div></div>'
         '<label class="check"><input type="checkbox" name="splash_info" value="1"%s> Show IP address, serial '
         'and status on the splash screen</label>'
         '<label class="check"><input type="checkbox" name="frame_timeout" value="1"%s> Show the splash when a '
@@ -1511,7 +1605,7 @@ def dashboard(session):
          esc(ns["send_groups"]), options(TRANSPORTS, ns["transport"]), licence_fields,
          "" if env.get("PINDI_NET_BUFFERS") == "0" else " checked",
          options([(z, esc(z)) for z in timezones()], current_timezone()),
-         esc(reboot_time()), "" if env.get("PINDI_SPLASH_INFO") == "0" else " checked",
+         esc(reboot_time()), esc(os_update_time()), "" if env.get("PINDI_SPLASH_INFO") == "0" else " checked",
          " checked" if (env.get("PINDI_FRAME_TIMEOUT_MS") or "0") not in ("", "0") else "",
          esc(api_token()), hidden))
 
@@ -1572,7 +1666,7 @@ def dashboard(session):
         (wifi_state_text(), hidden, " checked" if wifi_on else "", esc(wifi["ssid"]),
          "".join('<option value="%s">' % esc(s) for s in ssids),
          "Saved &ndash; leave empty to keep it" if wifi["psk"] else "",
-         options(([] if country else [("", "Choose...")]) + countries(), country),
+         options(([] if country else [("", "Choose...")]) + [(c, esc(n)) for c, n in countries()], country),
          " checked" if wifi_on and wifi["ssid"] and not wifi["psk"] else "",
          " Networks nearby are offered in the name field." if ssids else "", reboot))
 
@@ -1597,24 +1691,31 @@ def dashboard(session):
         '<input type="hidden" name="backup" id="restore-data"><p class="hint">Restores outputs, outgoing '
         'streams, device and NDI settings. Network settings are restored too, with the usual automatic '
         'rollback. A backup from another device is used as a template: this device keeps its own name and '
-        'network settings.</p><button class="secondary" id="restore-button" disabled>Restore</button></form>'
+        'network settings. A backup contains the NDI licence (vendor ID) if one is set: keep it private. '
+        'Wi-Fi passwords and the API token are not in it.</p><button class="secondary" id="restore-button" disabled>Restore</button></form>'
         '<form method="post" action="/update" id="update-form" data-confirm="Install this update? Video '
         'stops and the device reboots when it is done.">%s<label>Software update (PiNDI %s)</label>'
         '<input type="file" id="update-file" accept=".tar.gz,.tgz,application/gzip">'
-        '<input type="hidden" name="package" id="update-data"><p class="hint">An update package is made '
-        'with <code>make-update.sh</code>. Settings are kept.</p>'
+        '<input type="hidden" name="package" id="update-data"><label class="check"><input type="checkbox" '
+        'name="downgrade" value="1"> Allow an older version</label><p class="hint">An update package is made '
+        'and signed with <code>make-update.sh</code>; packages without a valid signature are refused. Settings '
+        'are kept.</p>'
         '<button class="secondary" id="update-button" disabled>Install update</button> '
         '<a href="/update">Last update log</a></form>'
         '<div class="buttons"><form class="inline" method="post" action="/identify">%s'
         '<input type="hidden" name="n" value="0"><button class="secondary">Identify all screens</button></form>'
         '<form class="inline" method="post" action="/restart">%s'
         '<button class="secondary">Restart video</button></form>'
+        '<form class="inline" method="post" action="/os-update" data-confirm="Download and install operating-'
+        'system updates now? Video keeps running; it needs internet access.">%s'
+        '<button class="secondary">Install OS updates now</button></form>'
+        '<a class="button secondary" href="/os-update">OS update log</a>'
         '<form class="inline" method="post" action="/reset" data-confirm="Reset all PiNDI settings (outputs, '
         'outgoing streams, device and NDI settings) to the defaults? Network settings and passwords are kept.">'
         '%s<button class="danger">Reset settings</button></form>'
         '<form class="inline" method="post" action="/reboot" data-confirm="Reboot the device now?">%s'
         '<button class="danger">Reboot</button></form></div></section>' %
-        (hidden, hidden, esc(version()), hidden, hidden, hidden, hidden))
+        (hidden, hidden, esc(version()), hidden, hidden, hidden, hidden, hidden))
 
     return page("PiNDI", "".join(parts), session["user"], csrf)
 
@@ -1908,8 +2009,9 @@ def act_password(session, form):
     r = run("chpasswd", input="%s:%s\n" % (session["user"], new))
     if r.returncode:
         return ("err", "Could not change the password: %s" % r.stderr.strip())
+    SESSIONS.drop_user(session["user"], keep=session)
     log("password changed for %s" % session["user"])
-    return ("ok", "Password changed.")
+    return ("ok", "Password changed. Other sign-ins of %s were signed out." % session["user"])
 
 
 def write_switch(n, stream, source_ip, backup):
@@ -2070,6 +2172,9 @@ def act_device(form):
     reboot_at = form.get("reboot_at", "")
     if reboot_at and not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", reboot_at):
         return ("err", "The daily reboot time must look like 04:30.")
+    os_update_at = form.get("os_update_at", "")
+    if os_update_at and not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", os_update_at):
+        return ("err", "The OS update time must look like 03:30.")
     transport = form.get("transport", "tcp")
     if transport not in dict(TRANSPORTS):
         return ("err", "Unknown NDI transport.")
@@ -2098,6 +2203,7 @@ def act_device(form):
         run("timedatectl", "set-timezone", tz)
         log("time zone: %s" % tz)
     set_reboot_time(reboot_at)
+    set_os_update_time(os_update_at)
     write_env({"PINDI_SPLASH_INFO": "" if form.get("splash_info") == "1" else "0",
                "PINDI_FRAME_TIMEOUT_MS": "10000" if form.get("frame_timeout") == "1" else "",
                "PINDI_NET_BUFFERS": "" if form.get("net_buffers") == "1" else "0"})
@@ -2127,7 +2233,8 @@ def backup_json():
                        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "device_name": device_name(),
                        "settings": {k: v for k, v in read_env().items() if k.startswith("PINDI_")},
                        "ndi": read_ndi_config(), "network": read_text(NETWORK_FILE),
-                       "timezone": current_timezone(), "reboot_at": reboot_time()}, indent=2) + "\n"
+                       "timezone": current_timezone(), "reboot_at": reboot_time(),
+                       "os_update_at": os_update_time()}, indent=2) + "\n"
 
 
 def act_restore(form):
@@ -2159,8 +2266,7 @@ def act_restore(form):
     current = {k: "" for k in read_env() if k.startswith("PINDI_")}
     current.update(settings)
     write_env(current)
-    os.makedirs(os.path.dirname(NDI_CONFIG), exist_ok=True)
-    write_atomic(NDI_CONFIG, json.dumps(ndi, indent=2) + "\n")
+    write_ndi_config(ndi)
     name = "" if other else str(data.get("device_name", "")).strip()
     if name and valid_name(name):
         try:
@@ -2174,6 +2280,9 @@ def act_restore(form):
     reboot_at = str(data.get("reboot_at", ""))
     if re.match(r"^(([01]\d|2[0-3]):[0-5]\d)?$", reboot_at):
         set_reboot_time(reboot_at)
+    os_update_at = str(data.get("os_update_at", ""))
+    if re.match(r"^(([01]\d|2[0-3]):[0-5]\d)?$", os_update_at):
+        set_os_update_time(os_update_at)
     later(0.5, restart_media)
     log("settings restored from backup of %s (%s)" % (data.get("serial", "?"), data.get("created", "?")))
     if network and network != read_text(NETWORK_FILE):
@@ -2215,7 +2324,11 @@ def diagnostics_text():
             "Kernel: %s" % " ".join(os.uname()), "NDI: %s" % (read_text(RUN_DIR + "/ndi").replace("\n", " ")),
             "Health: %s" % hl, "Power/cooling: %s" % hw, "Throttled: 0x%x" % throttled(),
             "Network traffic: %s" % TRAFFIC.text(), ""]
-    for title, path in (("Settings (%s)" % ENV_FILE, ENV_FILE), ("NDI config", NDI_CONFIG),
+    # Diagnostics get sent to others: no NDI licence (vendor ID) in them. The API token and passwords are
+    # never in these files.
+    ndi_cfg = re.sub(r'("id"\s*:\s*")[^"]*"', r'\1(removed)"', read_text(NDI_CONFIG))
+    out += ["---- NDI config", ndi_cfg.rstrip() or "(empty)", ""]
+    for title, path in (("Settings (%s)" % ENV_FILE, ENV_FILE),
                         ("Network", NETWORK_FILE), ("Outputs", RUN_DIR + "/outputs"),
                         ("Visible NDI sources", RUN_DIR + "/sources")):
         out += ["---- " + title, read_text(path).rstrip() or "(empty)", ""]
@@ -2241,6 +2354,81 @@ UPDATE_LOG = "/var/log/pindi-update.log"
 UPDATE_UNIT = "pindi-update"
 UPDATE_MAX = 32 * 1024 * 1024
 UPDATE_NEEDS = ("install.sh", "pindi-player.c", "pindi-sender.c", "pindi-web.py", "VERSION")
+UPDATE_KEY = "/usr/share/pindi/update-key.pub"  # installed from update-key.pub; make-update.sh signs with its pair
+UPDATE_MEMBERS = 200
+UPDATE_UNPACKED_MAX = 96 * 1024 * 1024
+
+
+def unpack_update(pkg, dest):
+    """Extract an update archive: regular files and folders only, nothing outside dest, bounded in count and
+    size. Done by hand (not extractall) so it is the same on every Python version. Returns the package folder."""
+    total = 0
+    with tarfile.open(pkg, "r:gz") as t:
+        members = []
+        for m in t:
+            members.append(m)
+            if len(members) > UPDATE_MEMBERS:
+                raise ValueError("more than %d files" % UPDATE_MEMBERS)
+            parts = m.name.replace("\\", "/").split("/")
+            if m.name.startswith("/") or ".." in parts or (not m.name.strip("./") and not m.isdir()):
+                raise ValueError("unsafe path %r" % m.name)
+            if not (m.isfile() or m.isdir()):
+                raise ValueError("%s is not a plain file" % m.name)
+            total += m.size
+            if total > UPDATE_UNPACKED_MAX:
+                raise ValueError("more than %d MB unpacked" % (UPDATE_UNPACKED_MAX >> 20))
+        for m in members:
+            path = os.path.join(dest, *[p for p in m.name.split("/") if p not in ("", ".")])
+            if m.isdir():
+                os.makedirs(path, mode=0o700, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            with t.extractfile(m) as f, open(path, "wb") as out:
+                shutil.copyfileobj(f, out)
+    entries = os.listdir(dest)
+    if len(entries) == 1 and os.path.isdir(os.path.join(dest, entries[0])):
+        return os.path.join(dest, entries[0])  # packaged inside one folder
+    return dest
+
+
+def verify_update(src):
+    """"" if src is a package signed with this device's update key, else why not. SHA256SUMS lists every file
+    with its hash; SHA256SUMS.sig is its Ed25519 signature."""
+    if not os.path.exists(UPDATE_KEY):
+        return "this device has no update key (%s); run install.sh again" % UPDATE_KEY
+    sums, sig = os.path.join(src, "SHA256SUMS"), os.path.join(src, "SHA256SUMS.sig")
+    if not (os.path.isfile(sums) and os.path.isfile(sig)):
+        return "the package is not signed (make it with make-update.sh)"
+    r = run("openssl", "pkeyutl", "-verify", "-pubin", "-inkey", UPDATE_KEY, "-rawin", "-in", sums, "-sigfile", sig)
+    if r.returncode:
+        return "its signature is not valid for this device's update key"
+    listed = {}
+    for line in read_text(sums).splitlines():
+        m = re.match(r"^([0-9a-f]{64}) [ *](.+)$", line)
+        if not m:
+            return "SHA256SUMS is malformed"
+        listed[os.path.normpath(m.group(2))] = m.group(1)
+    found = set()
+    for root, _dirs, files in os.walk(src):
+        for name in files:
+            rel = os.path.relpath(os.path.join(root, name), src)
+            if rel not in ("SHA256SUMS", "SHA256SUMS.sig"):
+                found.add(rel)
+    if found != set(listed):
+        return "its files do not match the signed list (%s)" % ", ".join(sorted(found ^ set(listed))[:5])
+    for rel, digest in listed.items():
+        h = hashlib.sha256()
+        with open(os.path.join(src, rel), "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != digest:
+            return "%s was changed after signing" % rel
+    return ""
+
+
+def version_key(v):
+    """"1.10.2" > "1.9" (numbers compared as numbers)."""
+    return [(0, int(p), "") if p.isdigit() else (1, 0, p) for p in re.split(r"[.+~-]", v)]
 
 
 def update_state():
@@ -2273,36 +2461,46 @@ def act_update(form):
     if not blob or len(blob) > UPDATE_MAX:
         return ("err", "Choose an update package (.tar.gz, at most 32 MB).")
     shutil.rmtree(UPDATE_DIR, ignore_errors=True)
-    os.makedirs(UPDATE_DIR)
+    os.makedirs(UPDATE_DIR, mode=0o700)
     pkg = UPDATE_DIR + ".tar.gz"
     with open(pkg, "wb") as f:
         f.write(blob)
     try:
-        with tarfile.open(pkg, "r:gz") as t:
-            t.extractall(UPDATE_DIR, filter="data")  # no absolute paths, "..", devices or links outside
-    except (tarfile.TarError, OSError, ValueError) as e:
+        src = unpack_update(pkg, UPDATE_DIR)
+    except (tarfile.TarError, OSError, ValueError, EOFError) as e:
+        shutil.rmtree(UPDATE_DIR, ignore_errors=True)
         return ("err", "That is not a valid update package: %s" % e)
     finally:
         os.remove(pkg)
-    src = UPDATE_DIR
-    entries = os.listdir(src)
-    if len(entries) == 1 and os.path.isdir(os.path.join(src, entries[0])):
-        src = os.path.join(src, entries[0])  # packaged inside one folder
-    missing = [n for n in UPDATE_NEEDS if not os.path.isfile(os.path.join(src, n))]
-    if missing:
-        return ("err", "That is not a PiNDI update package (missing %s)." % ", ".join(missing))
+    problem = verify_update(src)
+    if not problem:
+        missing = [n for n in UPDATE_NEEDS if not os.path.isfile(os.path.join(src, n))]
+        problem = "not a PiNDI update package (missing %s)" % ", ".join(missing) if missing else ""
     new_version = read_text(os.path.join(src, "VERSION")).strip()
+    if not problem and not re.match(r"^[0-9][0-9A-Za-z.+~-]{0,31}$", new_version):
+        problem = "its VERSION is not a version number"
+    current = version().split()[0]
+    if not problem and current[:1].isdigit() and version_key(new_version) < version_key(current) and \
+            form.get("downgrade") != "1":
+        problem = ("it is PiNDI %s, older than the installed %s. Tick \"Allow an older version\" to install "
+                   "it anyway" % (new_version, version().split()[0]))
+    if problem:
+        shutil.rmtree(UPDATE_DIR, ignore_errors=True)
+        log("software update refused: %s" % problem)
+        return ("err", "Update refused: %s." % problem)
     # A separate unit: it keeps running while this web interface is replaced, and reboots when done.
-    script = ('echo "PiNDI update %s -> %s, $(date)"; if cd "%s" && bash install.sh --accept-ndi-license '
+    # The versions and folder are arguments, never part of the script text.
+    script = ('echo "PiNDI update $1 -> $2, $(date)"; if cd "$3" && bash install.sh --accept-ndi-license '
               '--skip-upgrade --offline --no-reboot; then echo "Update installed, rebooting."; sleep 3; '
-              'systemctl reboot; else echo "PINDI-UPDATE-FAILED"; exit 1; fi' % (version(), new_version, src))
+              'systemctl reboot; else echo "PINDI-UPDATE-FAILED"; exit 1; fi')
     run("systemctl", "reset-failed", UPDATE_UNIT + ".service")
     try:
         os.remove(UPDATE_LOG)  # file: output doesn't truncate
     except OSError:
         pass
     r = run("systemd-run", "--unit", UPDATE_UNIT, "--collect", "--property", "StandardOutput=file:" + UPDATE_LOG,
-            "--property", "StandardError=file:" + UPDATE_LOG, "/bin/bash", "-c", script)
+            "--property", "StandardError=file:" + UPDATE_LOG, "/bin/bash", "-c", script, "pindi-update",
+            version().split()[0], new_version, src)
     if r.returncode:
         return ("err", "Could not start the update: %s" % (r.stderr.strip() or r.stdout.strip()))
     log("software update to %s started" % new_version)
@@ -2321,6 +2519,13 @@ def update_page(session):
     return page("Update", body, session["user"], session["csrf"])
 
 
+def os_update_page(session):
+    body = ('<section class="card"><nav class="top"><a href="/">&larr; Back</a></nav><h2>OS update log</h2>'
+            '<p>%s</p><pre class="log">%s</pre></section>' %
+            (os_update_text(), esc(read_text(OS_UPDATE_LOG)[-20000:] or "No OS update has run from this device.")))
+    return page("OS updates", body, session["user"], session["csrf"])
+
+
 def logs_page(session):
     body = ('<section class="card"><nav class="top"><a href="/">&larr; Back</a><a href="/diagnostics">Download '
             'diagnostics</a></nav><h2>Log (last 400 lines)</h2><pre class="log">%s</pre></section>' %
@@ -2333,6 +2538,7 @@ def logs_page(session):
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "PiNDI"
     sys_version = ""
+    timeout = REQUEST_TIMEOUT
 
     def log_message(self, fmt, *args):
         pass
@@ -2368,13 +2574,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
 
-    def form(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        limit = UPDATE_MAX * 4 // 3 + 65536 if urllib.parse.urlparse(self.path).path == "/update" else 65536
-        if length > limit:
-            return {}
-        raw = self.rfile.read(length).decode("utf-8", "replace")
-        return {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
+    def body(self, limit=BODY_MAX):
+        """The request body, or None (and an error sent) when its length is missing, invalid or over limit.
+        The connection's timeout bounds how long a slow sender can take."""
+        length = self.headers.get("Content-Length", "0").strip()
+        if not length.isdigit():  # also refuses negative lengths, which would read until the client closes
+            self.send(400, "Bad Content-Length", "text/plain")
+            return None
+        if int(length) > limit:
+            self.send(413, "Request too large", "text/plain")
+            return None
+        try:
+            return self.rfile.read(int(length))
+        except OSError:  # timed out or dropped
+            self.close_connection = True
+            return None
+
+    def form(self, limit=BODY_MAX):
+        raw = self.body(limit)
+        if raw is None:
+            return None
+        return {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode("utf-8", "replace"),
+                                                           keep_blank_values=True).items()}
 
     # --- routes
     def do_GET(self):
@@ -2400,6 +2621,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, dashboard(s))
         if path == "/logs":
             return self.send(200, logs_page(s))
+        if path == "/os-update":
+            return self.send(200, os_update_page(s))
         if path == "/update":
             return self.send(200, update_page(s))
         if path == "/update/log":
@@ -2439,15 +2662,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send(404, "Not found", "text/plain")
 
     def api_authorised(self):
-        """API token as "Authorization: Bearer <token>", "X-API-Key: <token>" or ?token=<token>."""
+        """API token as "Authorization: Bearer <token>" or "X-API-Key: <token>". Not in the URL: links end
+        up in browser histories, proxy logs and bookmarks."""
         token = api_token()
         given = self.headers.get("X-API-Key", "")
         auth = self.headers.get("Authorization", "")
         if auth.lower().startswith("bearer "):
             given = auth[7:].strip()
-        if not given:
-            given = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("token", [""])[0]
-        ok = bool(given) and secrets.compare_digest(given, token)
+        ok = bool(given) and secrets.compare_digest(given.encode(), token.encode())
         if not ok:
             LOCKOUT.failure(self.client_address[0])
         return ok and not LOCKOUT.blocked(self.client_address[0])
@@ -2455,10 +2677,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
         if path.startswith("/api/v1/"):
-            length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length).decode("utf-8", "replace") if 0 < length <= 65536 else ""
             if not self.api_authorised():
                 return self.send(401, json.dumps({"error": "missing or wrong API token"}), "application/json")
+            raw = self.body()
+            if raw is None:
+                return
+            raw = raw.decode("utf-8", "replace")
             try:
                 data = json.loads(raw) if raw.strip().startswith("{") else {
                     k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
@@ -2466,7 +2690,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(400, json.dumps({"error": "body must be JSON or form data"}), "application/json")
             code, result = api_post(path, data if isinstance(data, dict) else {})
             return self.send(code, json.dumps(result), "application/json")
-        form = self.form()
+        if path == "/update" and not self.session():
+            return self.redirect("/login")  # the one large body: only read for a signed-in user
+        form = self.form(UPDATE_MAX * 4 // 3 + BODY_MAX if path == "/update" else BODY_MAX)
+        if form is None:
+            return
         if path == "/login":
             user = form.get("user", "").strip()
             password = form.get("password", "")
@@ -2483,8 +2711,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     SESSIONS.get(token)["flash"] = ("warn", "You signed in with a well-known default password. "
                                                     "Please change it below.")
                 log("login: %s from %s" % (user, ip))
-                return self.redirect("/", [("Set-Cookie", "pindi_session=%s; Path=/; HttpOnly; SameSite=Strict"
-                                            % token)])
+                return self.redirect("/", [("Set-Cookie", "pindi_session=%s; Path=/; Secure; HttpOnly; "
+                                                          "SameSite=Strict" % token)])
             LOCKOUT.failure(ip)
             log("login failed: %r from %s" % (user, ip))
             time.sleep(2)
@@ -2496,7 +2724,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/logout":
             SESSIONS.drop(self.cookie_token())
-            return self.redirect("/login", [("Set-Cookie", "pindi_session=; Path=/; Max-Age=0")])
+            return self.redirect("/login", [("Set-Cookie", "pindi_session=; Path=/; Secure; Max-Age=0")])
         if path == "/output":
             s["flash"] = act_output(form)
         elif path == "/outgoing":
@@ -2525,6 +2753,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             s["flash"] = act_update(form)
             if s["flash"][0] == "ok":
                 return self.redirect("/update")
+        elif path == "/os-update":
+            s["flash"] = act_os_update_now()
         elif path == "/api-token":
             s["flash"] = act_api_token()
         elif path == "/restart":
@@ -2541,17 +2771,120 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.redirect("/")
 
 
+class RedirectHandler(http.server.BaseHTTPRequestHandler):
+    """Plain HTTP (port 80): everything is sent to the same address over HTTPS."""
+    server_version = "PiNDI"
+    sys_version = ""
+    timeout = REQUEST_TIMEOUT
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def redirect(self):
+        host = self.headers.get("Host", "")
+        if not re.match(r"^[A-Za-z0-9.-]{1,253}(:\d{1,5})?$", host):
+            host = self.connection.getsockname()[0]  # no usable Host header: the address it came in on
+        host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        if PORT != 443:
+            host += ":%d" % PORT
+        self.send_response(301 if self.command in ("GET", "HEAD") else 308)
+        self.send_header("Location", "https://%s%s" % (host, self.path if self.path.startswith("/") else "/"))
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = redirect
+
+
 class Server(http.server.ThreadingHTTPServer):
+    """At most MAX_CONNECTIONS handled at once (shared by both ports), MAX_PER_ADDRESS from one address. With
+    tls, the handshake runs in the connection's own thread under REQUEST_TIMEOUT, so a slow client can't
+    hold up the others."""
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64
+    conn_lock = threading.Lock()
+    conns = {}  # address -> connections being handled
+
+    def __init__(self, addr, handler, tls=None):
+        self.tls = tls
+        super().__init__(addr, handler)
+
+    def _release(self, ip):
+        with self.conn_lock:
+            self.conns[ip] -= 1
+            if not self.conns[ip]:
+                del self.conns[ip]
+
+    def process_request(self, request, client_address):
+        ip = client_address[0]
+        with self.conn_lock:
+            busy = sum(self.conns.values()) >= MAX_CONNECTIONS or self.conns.get(ip, 0) >= MAX_PER_ADDRESS
+            if not busy:
+                self.conns[ip] = self.conns.get(ip, 0) + 1
+        if busy:
+            self.shutdown_request(request)  # too many at once: drop this one
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._release(ip)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release(client_address[0])
+
+    def finish_request(self, request, client_address):
+        request.settimeout(REQUEST_TIMEOUT)
+        if not self.tls:
+            return super().finish_request(request, client_address)
+        try:
+            conn = self.tls.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError):
+            return  # not TLS, a refused certificate, or too slow
+        try:
+            self.RequestHandlerClass(conn, client_address, self)
+        finally:
+            conn.close()
+
+    def handle_error(self, request, client_address):
+        pass  # broken connections are normal (browsers, port scans)
+
+
+def tls_context():
+    """The device's own self-signed certificate (made once, ten years). Browsers warn about it the first
+    time; it still encrypts the sign-in, the session and API tokens."""
+    cert, key = TLS_DIR + "/cert.pem", TLS_DIR + "/key.pem"
+    if not (os.path.exists(cert) and os.path.exists(key)):
+        os.makedirs(TLS_DIR, mode=0o700, exist_ok=True)
+        host = socket.gethostname()
+        names = ["DNS:%s" % host, "DNS:%s.local" % host] + ["IP:%s" % a for a in (live_network()["address"],) if a]
+        r = run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                "-days", "3650", "-subj", "/CN=%s" % host, "-addext", "subjectAltName=" + ",".join(names),
+                "-keyout", key + ".tmp", "-out", cert + ".tmp")
+        if r.returncode:
+            raise RuntimeError("cannot create the TLS certificate: %s" % r.stderr.strip())
+        os.chmod(key + ".tmp", 0o600)
+        os.replace(key + ".tmp", key)
+        os.replace(cert + ".tmp", cert)
+        log("tls: new self-signed certificate for %s" % host)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(cert, key)
+    return ctx
 
 
 def main():
     TRAFFIC.start()
     if update_state() != "running":
         shutil.rmtree(UPDATE_DIR, ignore_errors=True)  # an earlier update's unpacked files
-    srv = Server(("", PORT), Handler)
-    log("PiNDI web interface on port %d" % PORT)
+    srv = Server(("", PORT), Handler, tls_context())
+    if HTTP_PORT:
+        threading.Thread(target=Server(("", HTTP_PORT), RedirectHandler).serve_forever, daemon=True).start()
+    log("PiNDI web interface on https port %d%s" % (PORT, " (http %d redirects)" % HTTP_PORT if HTTP_PORT else ""))
     srv.serve_forever()
 
 

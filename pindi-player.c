@@ -206,7 +206,13 @@ static bool load_jpeg(const char *path, struct image *im)
     jpeg_start_decompress(&cinfo);
     im->w = cinfo.output_width;
     im->h = cinfo.output_height;
-    im->px = malloc((size_t)im->w * im->h * 4);
+    im->px = im->w <= 16384 && im->h <= 16384 ? malloc((size_t)im->w * im->h * 4) : NULL;
+    if (!im->px) {
+        LOG("splash: %s is too big (%dx%d)", path, im->w, im->h);
+        jpeg_destroy_decompress(&cinfo);
+        fclose(f);
+        return false;
+    }
     while (cinfo.output_scanline < cinfo.output_height) {
         JSAMPROW row = (JSAMPROW)(im->px + (size_t)cinfo.output_scanline * im->w);
         jpeg_read_scanlines(&cinfo, &row, 1);
@@ -2891,7 +2897,8 @@ static int local_play(struct output *o, const char *path, uint64_t *switch_seen,
             uint32_t ssz = LOAD(lf->slot_size);
             int w = lf->w, h = lf->h;
             bool is420 = lf->fmt == LOCAL_420P;
-            if (LOAD(lf->slot_seq[slot]) == s && w > 0 && h > 0 && ssz >= (uint32_t)w * h * 2 &&
+            if (LOAD(lf->slot_seq[slot]) == s && w > 0 && h > 0 && w <= 8192 && h <= 8192 &&
+                ssz >= (uint32_t)w * h * 2 &&
                 LOCAL_DATA + (size_t)ssz * LOCAL_SLOTS <= len) {
                 const uint8_t *base = map + LOCAL_DATA + (size_t)slot * ssz;
                 size_t ysz = (size_t)w * h, csz = is420 ? ysz / 4 : ysz / 2;
@@ -3976,14 +3983,8 @@ int main(void)
         return 1;
     }
 
-    /* Splash first - everything else can wait. Load the display drivers (and the I2C
-     * drivers HDMI needs for EDID: Pi 3 i2c_bcm2835, Pi 4/5 i2c_brcmstb) now instead of
-     * waiting for udev to get round to it. */
-    if (fork() == 0) {
-        execl("/bin/sh", "sh", "-c",
-              "modprobe -q i2c_bcm2835; modprobe -q i2c_brcmstb; modprobe -q vc4", (char *)NULL);
-        _exit(1);
-    }
+    /* Splash first - everything else can wait. (pindi.service loads the display drivers early,
+     * as root: the player itself runs unprivileged.) */
     if (load_jpeg(cfg("PINDI_SPLASH", "/usr/share/pindi/splash.jpg"), &splash_img))
         trim_edges(&splash_img, image_bg(&splash_img));
     splash_info = strcmp(cfg("PINDI_SPLASH_INFO", "1"), "0") != 0;

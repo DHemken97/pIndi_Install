@@ -947,6 +947,8 @@ static void worker_frame(struct worker *wk)
                 f.line_stride_in_bytes = pl->out_stride;
             }
         }
+    } else if (wk->len < (size_t)m->w * m->h * 2) {
+        ok = false; /* a short (damaged) raw frame: its rows would be read past the end of the data */
     } else {
         bool uyvy = m->fourcc == V4L2_PIX_FMT_UYVY;
         if (local)
