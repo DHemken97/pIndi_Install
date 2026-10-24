@@ -536,6 +536,7 @@ struct output {
     uint32_t wfmt; /* format the receiver needs */
     bool want_realloc, want_splash, on_splash;
     int ready, ready2, queued, scanout; /* ready, ready2: the next frames to show, oldest first */
+    int backlog;          /* refreshes in a row that found two frames waiting (lock) */
     char splash_msg[192]; /* what the receiver is doing, shown on the splash */
     bool thumb_reading;   /* the preview thread is reading a buffer: don't free any */
     bool cant_display;    /* no buffers for the current frame size (pw x ph) */
@@ -638,6 +639,10 @@ static void ext_release(struct output *owner, int idx)
     if (owner && idx >= 0 && owner->vuse[idx] > 0)
         owner->vuse[idx]--;
 }
+
+/* Two frames waiting at this many refreshes in a row is not a burst but a standing backlog (a sender
+ * at exactly the display rate never drains it): one frame is skipped, saving a refresh of delay. */
+#define BACKLOG_DROP 30
 
 /* o->lock held: frame idx is complete. Up to two frames wait to be shown, so a frame that arrives
  * right after another (decoders work in bursts) waits one refresh instead of replacing it; with
@@ -1680,6 +1685,16 @@ static void output_service(struct output *o)
         ext_clear_ready(o);
         L = NULL;
     } else if (L && o->ready < 0 && !o->identify) {
+        if (o->ext_ready2 < 0) {
+            o->backlog = 0;
+        } else if (++o->backlog >= BACKLOG_DROP) { /* a standing backlog: skip a frame to lose it */
+            ext_release(L, li);
+            L = o->ext_ready2_of;
+            li = o->ext_ready2;
+            o->ext_ready2 = -1;
+            o->ext_ready2_of = NULL;
+            o->backlog = 0;
+        }
         o->ext_queued = li;
         o->ext_queued_of = L;
         o->ext_ready = o->ext_ready2;
@@ -1737,6 +1752,14 @@ static void output_service(struct output *o)
         }
     }
     if (o->ready >= 0) {
+        if (o->ready2 < 0 || (o->pacing && o->pace.on)) {
+            o->backlog = 0;
+        } else if (++o->backlog >= BACKLOG_DROP) { /* a standing backlog: skip a frame to lose it */
+            o->vstate[o->ready] = B_FREE;
+            o->ready = o->ready2;
+            o->ready2 = -1;
+            o->backlog = 0;
+        }
         int idx = o->ready;
         double ar = o->vaspect[idx];
         o->ready = o->ready2;
@@ -3105,7 +3128,11 @@ static void *receiver(void *arg)
     uint64_t key_asked = 0;
     int prev_conns = -1; /* connections to the sender at the last check; -1: none yet */
     bool recheck = false; /* the sender reconnected: check its codec once the last check is a minute old */
+    uint64_t drop_check = 0;  /* when the dropped-frame count was last looked at (0: not yet) */
+    int64_t drops_seen = 0;   /* the receiver's dropped video frames then */
     bool following = false; /* showing another output's receiver (decode once) */
+    uint64_t codec_copy_at = 0;
+    char codec_copied[512] = ""; /* the leader's out<n>.codec as last copied to ours */
 
     while (running) {
         uint64_t now = now_ms();
@@ -3120,9 +3147,11 @@ static void *receiver(void *arg)
          * Stop when it stops receiving, this display goes away or this output gets another stream. */
         if (following) {
             char src[256] = "", url[128] = "", vid[64] = "";
+            int lead_n = 0;
             pthread_mutex_lock(&share_mu);
             struct output *L = o->leader;
             if (L) {
+                lead_n = L->n;
                 snprintf(src, sizeof src, "%s", L->share_src);
                 snprintf(url, sizeof url, "%s", L->share_url);
                 snprintf(vid, sizeof vid, "%s", L->share_video);
@@ -3138,11 +3167,27 @@ static void *receiver(void *arg)
             }
             if (L && use && !sw) {
                 status_set(o, on_backup ? "playing (backup)" : "playing", src, url, vid);
+                if (now - codec_copy_at >= 1000) { /* the leader checks the codec: show its answer here too */
+                    codec_copy_at = now;
+                    char path[64], buf[512] = "";
+                    snprintf(path, sizeof path, RUN_DIR "/out%d.codec", lead_n);
+                    FILE *f = fopen(path, "r");
+                    if (f) {
+                        buf[fread(buf, 1, sizeof buf - 1, f)] = 0;
+                        fclose(f);
+                    }
+                    if (*buf && strcmp(buf, codec_copied)) {
+                        snprintf(path, sizeof path, RUN_DIR "/out%d.codec", o->n);
+                        write_file_atomic(path, buf);
+                        snprintf(codec_copied, sizeof codec_copied, "%s", buf);
+                    }
+                }
                 usleep(50000);
                 continue;
             }
             share_leave(o);
             following = false;
+            codec_copied[0] = 0;
             audio_close(o);
             if (audio_on)
                 audio_info(o, "");
@@ -3538,6 +3583,16 @@ static void *receiver(void *arg)
          * the last check (a flaky link drops often) is checked when that minute is up, not forgotten. */
         if (conns > 0 && prev_conns == 0 && got_frame && !hx_mode && hx_decode)
             recheck = true;
+        /* A reconnect too quick to see (conns never 0) is caught by its symptom: frames dropped while the
+         * NDI library decodes, which is what H.264 decoded in software does on a Pi 3/4. */
+        if (!hx_mode && hx_decode && *hw_dev && got_frame && now - drop_check >= 2000) {
+            NDIlib_recv_performance_t total, dropped;
+            ndi->recv_get_performance(recv, &total, &dropped);
+            if (drop_check && dropped.video_frames > drops_seen)
+                recheck = true;
+            drops_seen = dropped.video_frames;
+            drop_check = now;
+        }
         if (recheck && (hx_mode || (conns > 0 && codec_probe_start(o, bandwidth, cur_src, cur_url, 60000))))
             recheck = false;
         prev_conns = conns;
