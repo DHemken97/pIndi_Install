@@ -144,10 +144,30 @@ static void read_serial(char *out, size_t n)
         snprintf(out, n, "unknown");
 }
 
+/* The interface of the preferred default route (lowest metric), "" if none: with a static address on a
+ * USB gigabit adapter and DHCP on the Pi's own port, the adapter's address is the one to show. */
+static void default_route_iface(char *out, size_t n)
+{
+    char line[256], name[IF_NAMESIZE + 1];
+    unsigned long dest, metric, best = ~0ul;
+    out[0] = 0;
+    FILE *f = fopen("/proc/net/route", "r");
+    if (!f)
+        return;
+    while (fgets(line, sizeof line, f)) /* Iface Destination Gateway Flags RefCnt Use Metric ... */
+        if (sscanf(line, "%16s %lx %*x %*x %*d %*d %lu", name, &dest, &metric) == 3 && dest == 0 && metric < best) {
+            best = metric;
+            snprintf(out, n, "%s", name);
+        }
+    fclose(f);
+}
+
 static void read_ip(char *out, size_t n)
 {
     struct ifaddrs *ifa, *p;
     int best = 0;
+    char route[IF_NAMESIZE + 1];
+    default_route_iface(route, sizeof route);
     snprintf(out, n, "no network");
     if (getifaddrs(&ifa))
         return;
@@ -156,7 +176,7 @@ static void read_ip(char *out, size_t n)
             continue;
         if ((p->ifa_flags & IFF_LOOPBACK) || !(p->ifa_flags & IFF_UP))
             continue;
-        int score = strcmp(p->ifa_name, "eth0") == 0 ? 2 : 1;
+        int score = !strcmp(p->ifa_name, route) ? 3 : strcmp(p->ifa_name, "eth0") == 0 ? 2 : 1;
         if (score > best) {
             inet_ntop(AF_INET, &((struct sockaddr_in *)p->ifa_addr)->sin_addr, out, n);
             best = score;

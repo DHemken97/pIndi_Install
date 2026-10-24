@@ -61,7 +61,8 @@ rm -f /etc/systemd/system/sys-subsystem-net-devices-wlan0.device.wants/wpa_suppl
 rm -rf /etc/systemd/system/wpa_supplicant@wlan0.service.d
 rm -f /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
 # A static address set in the web interface is lost: set it again with nmtui / nmcli.
-rm -f /etc/systemd/network/20-pindi-wired.network /etc/systemd/network/25-pindi-wifi.network
+rm -f /etc/systemd/network/20-pindi-wired.network /etc/systemd/network/21-pindi-wired-others.network \
+      /etc/systemd/network/25-pindi-wifi.network
 systemctl disable systemd-networkd.service systemd-networkd.socket >/dev/null 2>&1 || true
 
 step "Services PiNDI switched off: back to the system's defaults"

@@ -256,14 +256,20 @@ def wifi_interfaces():
 
 
 def live_network(wifi=True):
-    """What the device is actually using right now: the wired address, else (wifi) the Wi-Fi one."""
+    """What the device is actually using right now: the port of the preferred default route (with a static
+    address on one port and DHCP on another, the static one), else the first wired port with an address,
+    else (wifi) the Wi-Fi one."""
     info = {"iface": "", "address": "", "prefix": "", "gateway": "", "dns": []}
     found = {}
     for line in run("ip", "-4", "-o", "addr", "show", "scope", "global").stdout.splitlines():
         parts = line.split()
         if len(parts) >= 4:
             found.setdefault(parts[1], parts[3])
-    for name in ether_interfaces() + (wifi_interfaces() if wifi else []):
+    candidates = ether_interfaces() + (wifi_interfaces() if wifi else [])
+    m = re.search(r"^default .*?\bdev (\S+)", run("ip", "-4", "route", "show", "default").stdout, re.M)
+    if m and m.group(1) in candidates:  # the kernel lists the lowest metric first
+        candidates.insert(0, m.group(1))
+    for name in candidates:
         if name in found:
             info["iface"] = name
             info["address"], _, info["prefix"] = found[name].partition("/")
@@ -294,8 +300,29 @@ def read_network_config():
     return cfg
 
 
-def render_network_config(dhcp, iface=None, gateway="", dns=(), ntp=()):
-    text = "# Written by the PiNDI web interface.\n[Match]\nType=ether\n\n[Network]\n"
+OTHER_PORTS_FILE = "/etc/systemd/network/21-pindi-wired-others.network"
+OTHER_PORTS_TEXT = ("# Written by the PiNDI web interface. With a static address, the wired ports that don't carry it\n"
+                    "# (20-pindi-wired.network names the one that does) use DHCP, with lower-priority routes.\n"
+                    "[Match]\nType=ether\n\n[Network]\nDHCP=yes\n\n[DHCPv4]\nClientIdentifier=mac\nRouteMetric=2048\n")
+
+
+def wired_port():
+    """The wired port a static address belongs on: one with a cable, the fastest (a gigabit dock or adapter
+    before a Pi 3's 100 Mbit/s port), then by name. "" if none has a cable."""
+    best = None
+    for name in ether_interfaces():
+        base = "/sys/class/net/" + name
+        if read_text(base + "/carrier").strip() == "1":
+            speed = int(read_text(base + "/speed", "0").strip() or 0)
+            if best is None or speed > best[0]:
+                best = (speed, name)
+    return best[1] if best else ""
+
+
+def render_network_config(dhcp, iface=None, gateway="", dns=(), ntp=(), port=""):
+    """port: with a static address, the one wired port it goes on (all of them would each claim it)."""
+    text = "# Written by the PiNDI web interface.\n[Match]\nType=ether\n%s\n[Network]\n" % (
+        "Name=%s\n" % port if port and not dhcp else "")
     for server in ntp:
         text += "NTP=%s\n" % server
     if dhcp:
@@ -364,6 +391,31 @@ class NetworkChange:
 
 
 NET = NetworkChange()
+
+
+def follow_wired_port():
+    """Broker, every few seconds: a static address stays on the wired port that has the cable (the fastest
+    if several do). Moving the cable - e.g. from a Pi 3's own port to a USB gigabit dock - takes it along,
+    and a second cable never makes two ports claim the same address."""
+    if read_text(OTHER_PORTS_FILE) != OTHER_PORTS_TEXT:
+        write_atomic(OTHER_PORTS_FILE, OTHER_PORTS_TEXT)
+        run("networkctl", "reload")
+    while True:
+        time.sleep(5)
+        try:
+            text = read_text(NETWORK_FILE)
+            if NET.pending() or not re.search(r"^Address=", text, re.M):
+                continue  # DHCP: every port takes part; a change being tried: left alone
+            port = wired_port()
+            m = re.search(r"^Name=(\S+)$", text, re.M)
+            if not port or (m and m.group(1) == port):
+                continue
+            new = re.sub(r"^Name=.*\n", "", text, flags=re.M).replace("Type=ether\n", "Type=ether\nName=%s\n" % port, 1)
+            write_atomic(NETWORK_FILE, new)
+            log("network: the static address now goes on %s (%s)" % (port, "cable moved" if m else "one port only"))
+            apply_network()
+        except Exception as e:
+            log("network: %s" % e)
 
 
 # ---------------------------------------------------------------- Wi-Fi (off by default: faster boot)
@@ -2029,12 +2081,12 @@ def act_network(form):
                 dns.append(str(ipaddress.IPv4Address(d)))
             except ValueError:
                 return ("err", "DNS server %s is not an IPv4 address." % d)
-        text = render_network_config(False, iface, gateway, dns, ntp)
+        text = render_network_config(False, iface, gateway, dns, ntp, wired_port())
         target = str(iface.ip)
     if text == read_text(NETWORK_FILE) and not NET.pending():
         return ("ok", "Network settings unchanged.")
     NET.apply(text, target)
-    where = ("http://%s/" % target) if target != "DHCP" else "the address shown on the splash screen"
+    where = ("https://%s/" % target) if target != "DHCP" else "the address shown on the splash screen"
     return ("warn", "Applying new network settings. Open %s within %d seconds, sign in and press Keep." %
             (where, ROLLBACK_SECONDS))
 
@@ -3058,6 +3110,7 @@ def broker_main():
             except Exception as e:
                 log("tls: %s" % e)
     threading.Thread(target=watch, daemon=True).start()
+    threading.Thread(target=follow_wired_port, daemon=True).start()
     try:
         os.remove(BROKER_SOCK)
     except FileNotFoundError:

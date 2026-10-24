@@ -198,6 +198,25 @@ USB:
 
 Tested with a StarTech USB3DOCKH2DP (two DisplayLink outputs) on a Pi 3B.
 
+Other USB displays and adapters work if Linux has a display driver for them.
+Results vary:
+
+- **DisplayLink** (most docks and many USB-to-HDMI adapters): with
+  `displaylink-setup.sh`.
+- **GUD-protocol USB displays:** driver built in, no setup.
+- **Many cheap MacroSilicon "USB to HDMI" sticks:** no driver in standard
+  Linux, so they don't appear. Some of these are actually capture devices,
+  which are inputs for outgoing streams, not displays.
+- **A dock's USB-C video (DisplayPort alt mode):** never works on a Pi, which
+  has no DisplayPort over USB.
+
+If a display appears under `/dev/dri` with a connected monitor, PiNDI uses it.
+
+A dock's or adapter's gigabit Ethernet port is a good upgrade for a Pi 3, whose
+own port is 100 Mbit/s. With a static address (Network card), the address goes
+on the port that has the cable, the fastest if several do. It moves with the
+cable, and any other cabled port uses DHCP.
+
 ## NDI|HX
 
 The standard NDI SDK sends and receives **Full NDI (SpeedHQ)** only.
