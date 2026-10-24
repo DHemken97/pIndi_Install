@@ -615,8 +615,10 @@ class NetTraffic:
         text = "%s in, %s out" % (mbit(self.rx), mbit(self.tx))
         if link:
             text += " (%d Mbit/s link)" % link
-            if max(self.rx, self.tx) > 0.8 * link * 1e6:
-                text += " – close to the link limit, expect dropped frames"
+            # NDI arrives in bursts well above its average: from about 70 % the audio, which waits behind the
+            # video in the same connection, starts to arrive late and cut out (seen on a Pi 3's 100 Mbit/s port).
+            if max(self.rx, self.tx) > 0.7 * link * 1e6:
+                text += " – close to the link limit: expect audio dropouts and dropped frames (send a smaller stream)"
         elif any(read_text("/sys/class/net/%s/operstate" % n).strip() == "up" for n in wifi_interfaces()):
             text += " (over Wi-Fi)"
         return text
