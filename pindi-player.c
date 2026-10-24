@@ -3115,6 +3115,8 @@ static void *receiver(void *arg)
     NDIlib_find_instance_t find = NULL;
     NDIlib_recv_instance_t recv = NULL;
     uint64_t find_created = 0, last_match = 0, recv_start = 0, last_alive = 0, last_frame = 0;
+    bool find_no_ip = false; /* the finder was made while the device had no IPv4 address */
+    uint64_t ip_check = 0;
     uint64_t last_stats = 0, last_sources = 0;
     uint32_t last_count = UINT32_MAX;
     char cur_src[256] = "", cur_url[128] = "", failed_src[256] = "", last_src[256] = "";
@@ -3301,6 +3303,19 @@ static void *receiver(void *arg)
             }
         }
 
+        /* A finder made before the device had an address (at boot, before the link is up) asks the
+         * network again only after several seconds: make a new one as soon as there is an address. */
+        if (find && find_no_ip && now - ip_check >= 250) {
+            char ip[64];
+            ip_check = now;
+            read_ip(ip, sizeof ip);
+            if (strcmp(ip, "no network")) {
+                LOG("ndi: output %d: network up (%s), restarting discovery", o->n, ip);
+                ndi->find_destroy(find);
+                find = NULL;
+            }
+        }
+
         /* Discovery needs avahi; give it up to 20 s to appear after boot. */
         if (!find) {
             if (access("/run/avahi-daemon/socket", F_OK) && now - start_ms < 20000) {
@@ -3313,6 +3328,9 @@ static void *receiver(void *arg)
             find = ndi->find_create_v2(&fc);
             find_created = last_match = now;
             last_count = UINT32_MAX;
+            char ip[64];
+            read_ip(ip, sizeof ip);
+            find_no_ip = !strcmp(ip, "no network");
             if (!find) {
                 LOG("ndi: output %d: cannot create finder", o->n);
                 usleep(1000000);
