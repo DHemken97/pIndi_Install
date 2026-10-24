@@ -118,6 +118,14 @@ tenth of the bandwidth, and decoded in hardware with almost no CPU. Give a
 Pi 5 a heatsink before heavy use; a Pi 3/4 with under-voltage runs at half
 speed (see [Troubleshooting](#troubleshooting)).
 
+**Over Wi-Fi** (a Pi 5 on a 433 Mbit/s link at -58 dBm) about 85 Mbit/s got
+through: two streams, Full NDI 1080p30 (about 50 Mbit/s) and NDI|HX 720p30,
+played at full rate with no dropped frames, at about 110 ms sender to screen
+with occasional peaks of 300 ms (wired: about 35-80 ms). A Full NDI 1080p60
+stream (about 150 Mbit/s) doesn't fit: it arrived at 35 fps and delayed the
+other stream too. On Wi-Fi, use NDI|HX or 1080p30. The device started to a
+picture in 6.6 s on Wi-Fi alone.
+
 ## Web interface
 
 | Section | What you can do |
