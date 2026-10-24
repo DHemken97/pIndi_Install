@@ -121,6 +121,14 @@ brightness and audio settings.
   lost, and the output reconnects by itself. With a **backup stream** set, the
   backup takes over instead (the last picture stays up meanwhile), and the
   output switches back as soon as the main stream returns.
+- **Frame timing:** with **Lowest delay** (the default) up to two decoded
+  frames wait for the next screen refresh, so a decoder that delivers two at
+  once loses neither. When two frames have been waiting for half a second (a
+  sender at exactly the display's rate never catches up), one is skipped,
+  saving a refresh of delay: 1080p60 on a Pi 5 went from 33 to 21 ms on the Pi.
+  With two different 60 fps streams this shows a frame twice about five times
+  a minute instead of once. **Smooth** puts frames on screen at an even
+  cadence instead.
 - **Display standby** switches the HDMI signal off after the chosen time
   without video, so the monitor sleeps. It comes back on when the stream
   appears. With **HDMI-CEC** ticked, a TV is also sent Standby and Image View
@@ -153,8 +161,14 @@ sending HX gives about 19 fps out and 22 fps on screen. Showing Full NDI
 1080p60 alone, a 3B+ holds 59 fps. A Pi 3B or 3B+ is a one-input device:
 three capture cards on a 3B+ got about 5 fps each. A Pi 4B showing Full NDI 1080p60
 on one output and 1080p on the other (no capture) holds 60 fps with no dropped
-frames at about 40% CPU and 66 °C, unthrottled; sending from a capture card on
-a Pi 4 is not measured yet.
+frames at about 40% CPU and 66 °C, unthrottled. A Pi 4B sends one 1080p30
+card as NDI|HX at the full 30 fps; two 1080p30 cards are CPU-bound by the
+MJPEG decoding (21 and 14 fps with one of them Full NDI). Both as NDI|HX with
+one card at 720p30 gives 24-27 fps each at about 95% CPU. A Pi 5 (1 GB, no
+heatsink, room fan) shows two different Full NDI 1080p60 streams at 60 fps
+each with no dropped frames, at about 38% CPU and 47-50 °C (10 minutes),
+unthrottled, with 20-35 ms spent on the Pi; one stream on both outputs
+(decoded once) takes about 16% CPU.
 
 ## NDI|HX
 
@@ -171,8 +185,12 @@ hardware decoder (1080p60 on a Pi 3B and 4B). The decoder is shared, so a
 Pi 4 with two different HX 1080p60 streams shows each at about 49 fps with
 about 250 ms of delay; use Full NDI (or 30 fps HX) for the second one. The same
 HX stream on both outputs is decoded only once. HEVC HX, and everything on a Pi 5
-(which has no H.264 decoder), is decoded in software by the NDI library, which
-manages only a few frames per second at 1080p on a Pi 3.
+(which has no H.264 decoder), is decoded in software by the NDI library. That
+manages only a few frames per second at 1080p on a Pi 3, but a Pi 5 shows two
+H.264 HX streams (1080p30 and 720p60) at their full rate with 10-24 ms on the
+Pi, at about 15% CPU: less delay than a Pi 3's hardware decoder (about 45 ms).
+If a sender switches to HX while it is being shown, the next format check (at
+most a minute later) moves a Pi 3/4 to its hardware decoder.
 
 With the Advanced SDK on a Pi 3 or 4, an outgoing stream can also be sent as
 **NDI|HX** (Codec under Outgoing streams): the Pi's hardware encoder makes

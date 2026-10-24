@@ -3340,12 +3340,28 @@ static void *receiver(void *arg)
 
         /* Keep the visible-sources list fresh for the web UI while playing too. */
         if (recv && now - last_sources >= 2000) {
-            if (o->n == 1) {
-                uint32_t count = 0;
-                const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+            uint32_t count = 0;
+            const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+            if (o->n == 1)
                 sources_publish(srcs, count);
-            }
             last_sources = now;
+            /* The sender restarted and our stream now has another address (its inputs can come back on
+             * each other's ports): the receiver would reconnect to the old one, i.e. to another stream. */
+            for (uint32_t i = 0; i < count; i++)
+                if (srcs[i].p_ndi_name && !strcmp(srcs[i].p_ndi_name, cur_src) && srcs[i].p_url_address &&
+                    *cur_url && strcmp(srcs[i].p_url_address, cur_url)) {
+                    LOG("ndi: output %d: %s moved from %s to %s, reconnecting", o->n, cur_src, cur_url,
+                        srcs[i].p_url_address);
+                    ndi->recv_destroy(recv);
+                    recv = NULL;
+                    break;
+                }
+            if (!recv) {
+                audio_close(o);
+                splash_at = now + 6000; /* keep the picture until the stream's first frame */
+                search_since = now;
+                continue;
+            }
             /* Our stream is one of this device's inputs again (pindi-sender restarted): take it from there. */
             char lpath[64];
             if (!on_backup && local_find(o, lpath, sizeof lpath)) {
