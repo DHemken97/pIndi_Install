@@ -156,6 +156,48 @@ on one output and 1080p on the other (no capture) holds 60 fps with no dropped
 frames at about 40% CPU and 66 °C, unthrottled; sending from a capture card on
 a Pi 4 is not measured yet.
 
+### External displays (DisplayLink docks and others)
+
+Displays on another display device than the Pi's own, such as a DisplayLink
+USB dock, become further outputs after the Pi's own. Each one gets its own
+card in the web interface and its own stream. The player looks for them every
+few seconds, so a dock plugged in later, or a dock whose service restarts,
+shows up by itself. They appear as outputs 2 and 3 on a Pi 3, or 3 and 4 on a
+Pi 4.
+
+DisplayLink needs its driver, which is closed source and comes under
+DisplayLink's own licence. On the device, run:
+
+```sh
+sudo bash /usr/local/lib/pindi/displaylink-setup.sh --accept-displaylink-license
+```
+
+It needs internet access. It builds the `evdi` kernel module with DKMS, so OS
+updates rebuild it for new kernels, and runs DisplayLink Manager as
+`pindi-displaylink`. `--remove` takes it out again, and `uninstall.sh` removes
+it too. A dock's own Ethernet port and USB sound work without it. With it, an
+output's audio setting "The display's own sound (dock)" plays on the dock.
+
+How these outputs differ from the Pi's own:
+
+- **CPU copy:** the picture is copied to them by the CPU, scaled and
+  letterboxed if needed. Rotation and mirroring work.
+- **Not available:** brightness, smooth pacing, display standby and HDMI-CEC.
+- **NDI|HX:** decoded in software, not by the hardware decoder.
+- **Not shared:** outputs never share a receiver with them (decode once).
+
+**Speed.** DisplayLink compresses every changed picture and sends it over
+USB:
+
+- **Pi 3B:** a full 1920×1080 screen takes DisplayLink Manager about 100 ms, so
+  video reaches about 8–10 frames per second per display. The Ethernet,
+  including a dock's, shares the same USB 2.0 link, so a Full NDI 1080p stream
+  and a busy DisplayLink display slow each other down. Use a smaller display
+  mode, the low-bandwidth preview, or a Pi 4/5.
+- **Pi 4/5:** not measured yet.
+
+Tested with a StarTech USB3DOCKH2DP (two DisplayLink outputs) on a Pi 3B.
+
 ## NDI|HX
 
 The standard NDI SDK sends and receives **Full NDI (SpeedHQ)** only.

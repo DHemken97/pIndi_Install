@@ -93,6 +93,17 @@ if [ -f "$CMDLINE.pindi-orig" ]; then
     mv -f "$CMDLINE.pindi-new" "$CMDLINE"
     rm -f "$CMDLINE.pindi-orig" "$CFG.pindi-orig"
 fi
+if [ -d /opt/pindi-displaylink ] || [ -f /etc/systemd/system/pindi-displaylink.service ]; then
+    step "DisplayLink (external displays)"
+    systemctl disable --now pindi-displaylink.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/pindi-displaylink.service /etc/modules-load.d/pindi-evdi.conf \
+          /etc/modprobe.d/pindi-evdi.conf
+    for v in $(dkms status evdi 2>/dev/null | sed -n 's|^evdi/\([^,: ]*\).*|\1|p' | sort -u); do
+        dkms remove "evdi/$v" --all >/dev/null 2>&1 || true
+        rm -rf "/usr/src/evdi-$v"
+    done
+    rm -rf /opt/pindi-displaylink
+fi
 systemctl daemon-reload
 sync
 

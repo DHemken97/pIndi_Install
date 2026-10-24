@@ -265,6 +265,10 @@ for g in pindi-media video systemd-journal; do
 done
 install -d /usr/local/lib/pindi
 put "$SRC/pindi-web.py" /usr/local/lib/pindi/pindi-web.py 755
+# Optional DisplayLink docks as external displays: sudo bash /usr/local/lib/pindi/displaylink-setup.sh
+if [ -f "$SRC/displaylink-setup.sh" ]; then
+    put "$SRC/displaylink-setup.sh" /usr/local/lib/pindi/displaylink-setup.sh 755
+fi
 cat > /etc/pam.d/pindi-web <<'EOF'
 # PiNDI web interface: same password check as a normal login / SSH.
 @include common-auth

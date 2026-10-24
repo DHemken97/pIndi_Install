@@ -30,7 +30,7 @@ VERSION=$(tr -d '\r\n' < VERSION)
 OUT="pindi-update-$VERSION.tar.gz"
 FILES=(VERSION README.md install.sh uninstall.sh pindi.conf Splash.jpg update-key.pub
        pindi-player.c pindi-sender.c pindi-web.py
-       pindi.service pindi-sender.service pindi-web.service pindi-webd.service)
+       pindi.service pindi-sender.service pindi-web.service pindi-webd.service displaylink-setup.sh)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 PKG="$TMP/pindi-$VERSION"

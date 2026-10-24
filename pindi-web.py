@@ -1001,6 +1001,7 @@ def outputs():
                 fmt += ", low-bandwidth preview"
         out.append({
             "n": n, "connector": parts[1], "link": parts[2], "mode": parts[3] if len(parts) > 3 else "",
+            "external": parts[4] if len(parts) > 4 else "",  # e.g. "external evdi": a DisplayLink dock
             "enabled": out_setting(env, n, "ENABLED", "1") != "0",
             "stream": out_setting(env, n, "STREAM"), "source_ip": out_setting(env, n, "SOURCE_IP"),
             "backup": out_setting(env, n, "BACKUP_STREAM"),
@@ -1495,8 +1496,9 @@ def dashboard(session):
              k, esc(o["format"] or "-"),
              k, esc(o["audio"] or "-"),
              k, esc(o["latency"] or "-")))
+        ext_off = " disabled" if o["external"] else ""  # done by the HVS: not on an external display
         parts.append(
-            '<section class="card" id="out%d"><h2>Output %d &middot; %s %s</h2>%s'
+            '<section class="card" id="out%d"><h2>Output %d &middot; %s %s%s</h2>%s'
             '<form method="post" action="/output">%s<input type="hidden" name="n" value="%d">'
             '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Enabled '
             '<span class="hint">(off: no NDI is received and this HDMI port is switched off)</span></label>'
@@ -1515,11 +1517,11 @@ def dashboard(session):
             '<div><label>Display mode</label><select name="display_mode">%s</select></div>'
             '<div><label>Rotation</label><select name="rotate">%s</select></div>'
             '<div><label>Mirror</label><select name="mirror">%s</select></div>'
-            '<div><label>Brightness</label><select name="brightness">%s</select></div>'
-            '<div><label>Frame pacing</label><select name="pacing">%s</select></div>'
-            '<div><label>Display off without video</label><select name="standby">%s</select>'
-            '<label class="check"><input type="checkbox" name="cec" value="1"%s> Also switch the TV off '
-            'and on (HDMI-CEC)</label></div></div>'
+            '<div><label>Brightness</label><select name="brightness"%s>%s</select></div>'
+            '<div><label>Frame pacing</label><select name="pacing"%s>%s</select></div>'
+            '<div><label>Display off without video</label><select name="standby"%s>%s</select>'
+            '<label class="check"><input type="checkbox" name="cec" value="1"%s%s> Also switch the TV off '
+            'and on (HDMI-CEC)</label></div></div>%s'
             '<p class="hint">180&deg; is for ceiling mounting, mirror for rear projection. With the display '
             'switched off the monitor goes to sleep; it comes back on as soon as the stream appears. Brightness '
             'lightens or darkens the mid-tones; black and white stay as they are. Smooth frame pacing shows '
@@ -1534,14 +1536,15 @@ def dashboard(session):
             '<button>Save output %d</button> '
             '<button class="secondary" formaction="/identify" name="identify" value="1">Identify</button> '
             '<button class="secondary" name="reset" value="1">Reset to default</button></form></section>' %
-            (n, n, esc(o["connector"]), badge, status_rows, hidden, n, " checked" if o["enabled"] else "",
+            (n, n, esc(o["connector"]), badge, external_badge(o), status_rows, hidden, n,
+             " checked" if o["enabled"] else "",
              n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]), esc(o["backup"]),
              options(BANDWIDTHS, o["bandwidth"]), esc(default_out_stream(n)),
              options(mode_choices(o), o["mode_setting"]),
              options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]),
-             options(BRIGHTNESSES, o["brightness"]), options(PACINGS, o["pacing"]),
-             options(STANDBYS, o["standby"]), " checked" if o["cec"] else "",
-             options(audio_choices(), o["audio_out"]), esc(o["audio_delay"]), n))
+             ext_off, options(BRIGHTNESSES, o["brightness"]), ext_off, options(PACINGS, o["pacing"]),
+             ext_off, options(STANDBYS, o["standby"]), " checked" if o["cec"] else "", ext_off, external_hint(o),
+             options(audio_choices(o["external"]), o["audio_out"]), esc(o["audio_delay"]), n))
 
     # NDI sources on the network
     srcs = visible_sources()
@@ -1811,8 +1814,23 @@ STANDBYS = [("0", "Never (always show the splash)"), ("1", "After 1 minute"), ("
 LEGACY_OUT1 = ("STREAM", "SOURCE_IP", "ROTATE", "MIRROR", "MODE")
 
 
-def audio_choices():
-    choices = [("hdmi", "HDMI (this output)")]
+def external_badge(o):
+    return ' <span class="badge">%s</span>' % ("DisplayLink" if "evdi" in o["external"] else "external display")         if o["external"] else ""
+
+
+def external_hint(o):
+    """An external display (another display device, e.g. a DisplayLink USB dock) works differently."""
+    if not o["external"]:
+        return ""
+    return ('<p class="hint">External display (%s): the picture is copied to it by the CPU, so brightness, '
+            'smooth pacing, display standby and HDMI-CEC aren&#39;t available, and NDI|HX is decoded in '
+            'software. Rotation and mirroring work. On a DisplayLink dock every changed picture is compressed '
+            'and sent over USB: on a Pi 3, full-screen video reaches about 8&ndash;10 frames per second; a '
+            'smaller display mode helps.</p>' % esc(o["external"].replace("external ", "")))
+
+
+def audio_choices(external=""):
+    choices = [("hdmi", "The display's own sound (dock)" if external else "HDMI (this output)")]
     if "Raspberry Pi 5" not in MODEL and "Raspberry Pi 500" not in MODEL:
         choices.append(("analog", "Headphone jack"))
     return choices + [("off", "Off")]

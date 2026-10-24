@@ -17,9 +17,11 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <limits.h>
 #include <math.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -66,7 +68,7 @@
 
 /* Text height cap: 16pt at 96 dpi. */
 #define FONT_PT_PX 21
-#define MAX_OUT 4
+#define MAX_OUT 8 /* the Pi's own outputs plus external displays (e.g. DisplayLink docks) */
 #define NBUF 8 /* per output; outputs showing its source hold some of them (decode once) */
 #define RUN_DIR "/run/pindi"     /* status, previews (this program and pindi-sender write here) */
 #define CTL_DIR "/run/pindi-ctl" /* live switches, Identify: written by the web interface only (root) */
@@ -495,8 +497,11 @@ static void uyvy_to_nv16(const uint8_t *s, uint8_t *y, uint8_t *uv, int w)
 enum { B_NONE = -1, B_FREE, B_WRITING, B_READY, B_QUEUED, B_SCANOUT };
 enum { P_NONE, P_SPLASH, P_VIDEO, P_EXT };
 
+struct xdisp; /* an external display (another KMS device): see "external displays" below */
+
 struct output {
     int n; /* 1-based, as shown in the web UI */
+    struct xdisp *xd; /* not NULL: an external display, shown by the CPU path instead of the HVS planes */
     char conn_name[32];
     uint32_t conn_id, crtc_id, plane_id;
     bool has_uyvy, has_nv16, has_nv12;
@@ -749,6 +754,8 @@ static void share_leave(struct output *o)
 static struct output *share_claim(struct output *o, const char *name, const char *url, int bw)
 {
     struct output *L = NULL;
+    if (o->xd) /* an external display's frames are CPU copies, not buffers the others could put on a plane */
+        return NULL;
     pthread_mutex_lock(&share_mu);
     share_drop_followers(o); /* they followed what o received before */
     for (int i = 0; i < nout && !L; i++)
@@ -1157,7 +1164,8 @@ static void draw_identify(struct output *o)
     }
 }
 
-static void splash_update_text(struct output *o, const char *ip, bool force)
+/* Returns true if it redrew the splash. */
+static bool splash_update_text(struct output *o, const char *ip, bool force)
 {
     char msg[192];
     pthread_mutex_lock(&o->lock);
@@ -1166,7 +1174,7 @@ static void splash_update_text(struct output *o, const char *ip, bool force)
     if (o->identify)
         snprintf(msg, sizeof msg, "%s", "");
     if (!o->active || (!force && !strcmp(ip, o->shown_ip) && !strcmp(msg, o->shown_msg)))
-        return;
+        return false;
     snprintf(o->shown_ip, sizeof o->shown_ip, "%s", ip);
     snprintf(o->shown_msg, sizeof o->shown_msg, "%s", msg);
     memcpy(o->comp, o->base, (size_t)o->W * o->H * 4);
@@ -1202,6 +1210,7 @@ static void splash_update_text(struct output *o, const char *ip, bool force)
         draw_identify(o);
     for (int y = 0; y < o->H; y++)
         memcpy(o->splash.map + (size_t)y * o->splash.pitch, o->comp + (size_t)y * o->W, (size_t)o->W * 4);
+    return true;
 }
 
 /* Free the video buffers. Caller holds o->lock and has made sure none is on screen. */
@@ -1497,6 +1506,8 @@ static void latency_publish(struct output *o, uint64_t now)
 {
     if (now - o->lat.since < 5000)
         return;
+    if (o->xd) /* its frames are counted by the receiver thread */
+        pthread_mutex_lock(&o->lock);
     char path[64], buf[384] = "";
     snprintf(path, sizeof path, RUN_DIR "/out%d.latency", o->n);
     if (o->lat.n)
@@ -1518,6 +1529,8 @@ static void latency_publish(struct output *o, uint64_t now)
     memset(&o->lat, 0, sizeof o->lat);
     memset(o->cad.hist, 0, sizeof o->cad.hist);
     o->lat.since = now;
+    if (o->xd)
+        pthread_mutex_unlock(&o->lock);
     h = o->cad.log_hist;
     if (!o->cad.log_since)
         o->cad.log_since = now;
@@ -1595,9 +1608,15 @@ static void on_flip(int fd, unsigned seq, unsigned sec, unsigned usec, unsigned 
     o->pending = P_NONE;
 }
 
+static void xd_service(struct output *o);
+
 /* Main thread: push the next thing to the screen if the output is idle. */
 static void output_service(struct output *o)
 {
+    if (o->xd) {
+        xd_service(o);
+        return;
+    }
     if (!o->active || o->pending != P_NONE)
         return;
     pthread_mutex_lock(&o->lock);
@@ -1827,9 +1846,15 @@ static void frame_end(struct output *o, int idx, double aspect, int64_t sent, ui
     share_publish(o, idx);
 }
 
+static bool xd_post_ndi(struct output *o, const NDIlib_video_frame_v2_t *v, uint64_t recv_us);
+static bool xd_post_planar(struct output *o, const uint8_t *y, const uint8_t *u, const uint8_t *v, int w, int h,
+                           bool is420, int64_t sent, uint64_t recv_us);
+
 /* Receiver thread: hand a frame to the display. Drops it if no buffer is free. */
 static bool post_frame(struct output *o, const NDIlib_video_frame_v2_t *v, uint64_t recv_us)
 {
+    if (o->xd)
+        return xd_post_ndi(o, v, recv_us);
     uint32_t fmt;
     switch (v->FourCC) {
     case NDIlib_FourCC_video_type_UYVY:
@@ -1902,6 +1927,8 @@ static void yuv422p_to_uyvy(const uint8_t *y, const uint8_t *u, const uint8_t *v
 static bool post_planar(struct output *o, const uint8_t *y, const uint8_t *u, const uint8_t *v, int w, int h,
                         bool is420, int64_t sent, uint64_t recv_us)
 {
+    if (o->xd)
+        return xd_post_planar(o, y, u, v, w, h, is420, sent, recv_us);
     uint32_t fmt = is420 ? (o->has_nv12 ? DRM_FORMAT_NV12 : 0)
                          : (o->has_nv16 ? DRM_FORMAT_NV16 : o->has_uyvy ? DRM_FORMAT_UYVY : 0);
     if (!fmt)
@@ -2366,6 +2393,10 @@ static void status_set(struct output *o, const char *state, const char *source, 
     wake();
 }
 
+static const char *xd_kind(const struct output *o);
+
+/* RUN_DIR/outputs, one line per output: n, connector, link state, mode, and for an external display
+ * what it is (e.g. "external evdi"). */
 static void outputs_publish(void)
 {
     static char last[1024];
@@ -2377,9 +2408,9 @@ static void outputs_publish(void)
         char mode[48] = "";
         if (o->active)
             snprintf(mode, sizeof mode, "%dx%d@%d", o->W, o->H, o->mode.vrefresh);
-        len += snprintf(buf + len, sizeof buf - len, "%d\t%s\t%s\t%s\n", o->n, o->conn_name,
+        len += snprintf(buf + len, sizeof buf - len, "%d\t%s\t%s\t%s\t%s\n", o->n, o->conn_name,
                         o->disabled ? "disabled" : o->active ? "connected" : o->standby ? "standby" : "disconnected",
-                        mode);
+                        mode, xd_kind(o));
     }
     if (!strcmp(buf, last))
         return;
@@ -2441,10 +2472,16 @@ static void audio_close(struct output *o)
 }
 
 /* ALSA device for this output: its own HDMI port (Pi 4/5: vc4hdmi0/1, Pi 3: vc4hdmi), or the jack. */
+static const char *xd_alsa(const struct output *o);
+
 static void audio_device(struct output *o, char *dev, size_t n)
 {
     if (!strcasecmp(o->audio_s, "analog")) {
         snprintf(dev, n, "plughw:CARD=Headphones,DEV=0");
+        return;
+    }
+    if (o->xd) { /* "HDMI" on an external display: the dock's own sound card, if it has one */
+        snprintf(dev, n, "plughw:CARD=%s,DEV=0", xd_alsa(o));
         return;
     }
     int port = 0;
@@ -3659,6 +3696,8 @@ static void configure_output(struct output *o)
 
 #define THUMB_W 384
 
+static struct buf *xd_screen(struct output *o);
+
 /* Pixel (x, y) of buffer b as 0xRRGGBB. Dumb buffers are write-combined: only sample what we need. */
 static uint32_t buf_pixel(const struct buf *b, int x, int y)
 {
@@ -3705,7 +3744,9 @@ static void thumb_publish(struct output *o)
     }
     o->thumb_reading = true;
     struct buf *b = (!o->on_splash && o->scanout >= 0) ? &o->vid[o->scanout] : NULL;
-    double ar = b ? o->vaspect[o->scanout] : 0;
+    if (o->xd && !o->on_splash)
+        b = xd_screen(o); /* an external display: what is on its screen buffer (its aspect: the screen's) */
+    double ar = b && !o->xd ? o->vaspect[o->scanout] : 0;
     const uint32_t *comp = o->comp;
     int W = o->W, sw = b ? b->w : o->W, sh = b ? b->h : o->H;
     struct output *L = NULL; /* showing another output's buffer (decode once): pin that one instead */
@@ -3800,6 +3841,8 @@ static void thumb_publish(struct output *o)
     free(out);
 }
 
+static void xd_splash_changed(struct output *o);
+
 /* /run/pindi-ctl/identify (written by the web UI): first line the output number (0 = all), then the
  * text to show. Shown for 15 s after the file was written. */
 static void identify_poll(const char *ip)
@@ -3831,7 +3874,8 @@ static void identify_poll(const char *ip)
         pthread_mutex_unlock(&o->lock);
         snprintf(o->ident, sizeof o->ident, "%s", want);
         LOG("display: output %d: identify %s", o->n, on ? "on" : "off");
-        splash_update_text(o, ip, true);
+        if (splash_update_text(o, ip, true) && o->xd)
+            xd_splash_changed(o);
         wake();
     }
 }
@@ -3892,11 +3936,746 @@ static bool load_ndi(void)
     return true;
 }
 
+static bool ndi_ok; /* the NDI library is loaded: receivers can start */
+
 static void start_receivers(void)
 {
     for (int i = 0; i < nout; i++)
         if (!outs[i].thr_started && !pthread_create(&outs[i].thr, NULL, receiver, &outs[i]))
             outs[i].thr_started = true;
+}
+
+/* ------------------------------------------------------------------ external displays */
+
+/* Displays on another KMS device than the Pi's own display controller: a DisplayLink USB dock (evdi), a
+ * USB monitor (GUD), a small SPI panel, the Pi 5's RP1 DPI/DSI. They have no HVS - no YUV planes, hardware
+ * rotation, zero-copy decoding or vblank-timed flips. So NDI delivers their frames as RGB (BGRX), which
+ * are copied - scaled and letterboxed if the size differs, turned or mirrored if set - into the display's
+ * one screen buffer, and the driver is told which area changed (DIRTYFB: DisplayLink only sends what it is
+ * told about). They become further outputs after the Pi's own, found by a scan every few seconds:
+ * DisplayLink's service creates its devices after boot, and docks get unplugged. */
+
+#define XD_MAX_DEV 8
+#ifndef XD_LOG_US
+#define XD_LOG_US 60000000 /* how often an external display's timing is logged */
+#endif
+
+static struct xdev {
+    int fd;         /* shared by the device's displays (one DRM master), -1 = closed */
+    char card[24];  /* /dev/dri/cardN */
+    char sys[64];   /* /sys/class/drm/cardN */
+    dev_t rdev;
+    bool gone;      /* went away (unplugged, or its service restarted): found again by a scan */
+} xdevs[XD_MAX_DEV] = { [0 ... XD_MAX_DEV - 1] = { .fd = -1 } };
+
+struct xdisp {
+    int dev;              /* xdevs[] */
+    char key[48];         /* driver#k/c: finds the display again when its device is re-created */
+    char drv[16];
+    char kind[32];        /* for the web UI: "external <driver>" */
+    char alsa[32];        /* the dock's own sound card ("" if none) */
+    struct buf scr;       /* XRGB8888 screen buffer, on the device */
+    pthread_mutex_t draw; /* scr is written by the receiver (video) and the main thread (splash) */
+    int vx, vy, vw, vh;   /* where the last video frame went: the borders are cleared when it moves */
+    int *xmap, xmap_n, xmap_src, xmap_flip; /* source column of each column of the video rectangle */
+    /* Reporting a change can block: DisplayLink's takes as long as it needs to compress and send the
+     * previous one (~100 ms for a 1080p frame on a Pi 3). So a thread of its own does it, for the newest
+     * picture each time; the receiver only copies and never waits (its audio would stall otherwise). */
+    pthread_t fl;
+    bool fl_on, fl_stop, fl_pending, fl_video;
+    pthread_mutex_t fl_mu;
+    pthread_cond_t fl_cv;
+    int fx0, fy0, fx1, fy1; /* the area to report */
+    int64_t fl_sent;        /* the newest video frame's times, for the latency figures */
+    uint64_t fl_recv;
+    uint64_t t_copy, t_copies, t_dirty, t_shown, t_since; /* fl_mu: time per frame, logged every minute */
+};
+
+static const char *xd_kind(const struct output *o) { return o->xd ? o->xd->kind : ""; }
+static const char *xd_alsa(const struct output *o) { return o->xd ? o->xd->alsa : ""; }
+static struct buf *xd_screen(struct output *o) { return o->xd && o->xd->scr.map ? &o->xd->scr : NULL; }
+static int xd_fd(const struct output *o) { return xdevs[o->xd->dev].fd; }
+
+static bool xd_buf_create(int fd, int w, int h, struct buf *b)
+{
+    struct drm_mode_create_dumb c = { .width = w, .height = h, .bpp = 32 };
+    struct drm_mode_map_dumb m = { 0 };
+    memset(b, 0, sizeof *b);
+    if (drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &c))
+        return false;
+    b->handle = c.handle;
+    b->pitch = c.pitch;
+    b->size = c.size;
+    b->w = w;
+    b->h = h;
+    b->fmt = DRM_FORMAT_XRGB8888;
+    m.handle = c.handle;
+    if (!drmModeAddFB(fd, w, h, 24, 32, c.pitch, c.handle, &b->fb) && !drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &m)) {
+        b->map = mmap(NULL, c.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, m.offset);
+        if (b->map != MAP_FAILED)
+            return true;
+        b->map = NULL;
+    }
+    if (b->fb)
+        drmModeRmFB(fd, b->fb);
+    struct drm_mode_destroy_dumb d = { .handle = c.handle };
+    drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &d);
+    memset(b, 0, sizeof *b);
+    return false;
+}
+
+static void xd_buf_destroy(int fd, struct buf *b)
+{
+    if (b->map)
+        munmap(b->map, b->size);
+    if (fd >= 0 && b->fb)
+        drmModeRmFB(fd, b->fb);
+    if (fd >= 0 && b->handle) {
+        struct drm_mode_destroy_dumb d = { .handle = b->handle };
+        drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &d);
+    }
+    memset(b, 0, sizeof *b);
+}
+
+/* Ask the flusher to report area (x0,y0)-(x1,y1) as changed; video: a new video frame, with its times. */
+static void xd_queue(struct output *o, int x0, int y0, int x1, int y1, bool video, int64_t sent, uint64_t recv)
+{
+    struct xdisp *x = o->xd;
+    pthread_mutex_lock(&x->fl_mu);
+    if (x->fl_pending) {
+        x->fx0 = x0 < x->fx0 ? x0 : x->fx0;
+        x->fy0 = y0 < x->fy0 ? y0 : x->fy0;
+        x->fx1 = x1 > x->fx1 ? x1 : x->fx1;
+        x->fy1 = y1 > x->fy1 ? y1 : x->fy1;
+    } else {
+        x->fx0 = x0, x->fy0 = y0, x->fx1 = x1, x->fy1 = y1;
+    }
+    x->fl_pending = true;
+    if (video) {
+        x->fl_video = true;
+        x->fl_sent = sent;
+        x->fl_recv = recv;
+    }
+    pthread_cond_signal(&x->fl_cv);
+    pthread_mutex_unlock(&x->fl_mu);
+}
+
+/* Tell the driver what changed (DisplayLink sends only that; drivers that scan out directly ignore it),
+ * as fast as it takes it, and count what reached the screen. */
+static void *xd_flusher(void *arg)
+{
+    struct output *o = arg;
+    struct xdisp *x = o->xd;
+    pthread_mutex_lock(&x->fl_mu);
+    while (!x->fl_stop) {
+        if (!x->fl_pending) {
+            pthread_cond_wait(&x->fl_cv, &x->fl_mu);
+            continue;
+        }
+        drmModeClip clip = { (uint16_t)x->fx0, (uint16_t)x->fy0, (uint16_t)x->fx1, (uint16_t)x->fy1 };
+        bool video = x->fl_video;
+        int64_t sent = x->fl_sent;
+        uint64_t recv = x->fl_recv;
+        x->fl_pending = x->fl_video = false;
+        pthread_mutex_unlock(&x->fl_mu);
+        uint64_t t1 = clock_us(CLOCK_MONOTONIC);
+        drmModeDirtyFB(xd_fd(o), x->scr.fb, &clip, 1);
+        uint64_t t2 = clock_us(CLOCK_MONOTONIC);
+        if (video) {
+            pthread_mutex_lock(&o->lock);
+            latency_add(o, sent, recv, t2);
+            pthread_mutex_unlock(&o->lock);
+        }
+        pthread_mutex_lock(&x->fl_mu);
+        x->t_dirty += t2 - t1;
+        x->t_shown += video;
+        if (!x->t_since)
+            x->t_since = t2;
+        if (t2 - x->t_since >= XD_LOG_US) {
+            double secs = (t2 - x->t_since) / 1e6;
+            LOG("video: output %d: %.1f frames/s received, %.1f on screen; %.1f ms copying, %.1f ms reporting each",
+                o->n, x->t_copies / secs, x->t_shown / secs, x->t_copies ? x->t_copy / 1000.0 / x->t_copies : 0.0,
+                x->t_shown ? x->t_dirty / 1000.0 / x->t_shown : 0.0);
+            x->t_copy = x->t_copies = x->t_dirty = x->t_shown = 0;
+            x->t_since = t2;
+        }
+    }
+    pthread_mutex_unlock(&x->fl_mu);
+    return NULL;
+}
+
+static void xd_flusher_start(struct output *o)
+{
+    struct xdisp *x = o->xd;
+    x->fl_stop = x->fl_pending = x->fl_video = false;
+    x->fl_on = !pthread_create(&x->fl, NULL, xd_flusher, o);
+}
+
+static void xd_flusher_stop(struct output *o)
+{
+    struct xdisp *x = o->xd;
+    if (!x->fl_on)
+        return;
+    pthread_mutex_lock(&x->fl_mu);
+    x->fl_stop = true;
+    pthread_cond_signal(&x->fl_cv);
+    pthread_mutex_unlock(&x->fl_mu);
+    pthread_join(x->fl, NULL);
+    x->fl_on = false;
+}
+
+/* Main thread: the splash (o->splash, a plain copy in memory here) onto the screen. */
+static void xd_show_splash(struct output *o)
+{
+    struct xdisp *x = o->xd;
+    pthread_mutex_lock(&x->draw);
+    if (!x->scr.map || !o->splash.map) {
+        pthread_mutex_unlock(&x->draw);
+        return;
+    }
+    for (int y = 0; y < o->H; y++)
+        memcpy(x->scr.map + (size_t)y * x->scr.pitch, o->splash.map + (size_t)y * o->splash.pitch, (size_t)o->W * 4);
+    x->vw = 0; /* the next video frame clears its borders */
+    pthread_mutex_unlock(&x->draw);
+    xd_queue(o, 0, 0, o->W, o->H, false, 0, 0);
+}
+
+/* Main thread: the splash text was redrawn: put it on screen if the splash is showing. */
+static void xd_splash_changed(struct output *o)
+{
+    pthread_mutex_lock(&o->lock);
+    bool on = o->on_splash;
+    pthread_mutex_unlock(&o->lock);
+    if (on)
+        xd_show_splash(o);
+}
+
+/* Main thread: splash on request (stream lost, Identify). Video frames come from the receiver directly. */
+static void xd_service(struct output *o)
+{
+    if (!o->active)
+        return;
+    pthread_mutex_lock(&o->lock);
+    bool show = (o->want_splash || o->identify) && !o->on_splash;
+    if (show) {
+        o->on_splash = true;
+        o->splash_since = now_ms();
+    }
+    o->want_splash = false;
+    pthread_mutex_unlock(&o->lock);
+    if (show)
+        xd_show_splash(o);
+}
+
+static bool xd_enable(struct output *o)
+{
+    struct xdisp *x = o->xd;
+    int fd = xd_fd(o);
+    drmModeConnector *c = drmModeGetConnector(fd, o->conn_id); /* probes the monitor */
+    bool ok = c && c->connection == DRM_MODE_CONNECTED;
+    if (ok) {
+        modes_publish(o, c);
+        ok = pick_mode(o, c, &o->mode);
+    }
+    drmModeFreeConnector(c);
+    if (!ok)
+        return false;
+    o->W = o->mode.hdisplay;
+    o->H = o->mode.vdisplay;
+    struct buf scr;
+    if (!xd_buf_create(fd, o->W, o->H, &scr)) {
+        LOG("display: output %d: cannot allocate %dx%d: %s", o->n, o->W, o->H, strerror(errno));
+        return false;
+    }
+    memset(scr.map, 0, scr.size);
+    if (drmModeSetCrtc(fd, o->crtc_id, scr.fb, 0, 0, &o->conn_id, 1, &o->mode)) {
+        LOG("display: output %d: mode set %dx%d@%d failed: %s", o->n, o->W, o->H, o->mode.vrefresh, strerror(errno));
+        xd_buf_destroy(fd, &scr);
+        return false;
+    }
+    memset(&o->splash, 0, sizeof o->splash); /* the splash is composed in memory and copied to the screen */
+    o->splash.map = malloc((size_t)o->W * o->H * 4);
+    o->splash.pitch = o->W * 4;
+    o->base = malloc((size_t)o->W * o->H * 4);
+    o->comp = malloc((size_t)o->W * o->H * 4);
+    if (!o->splash.map || !o->base || !o->comp) {
+        free(o->splash.map);
+        free(o->base);
+        free(o->comp);
+        o->splash.map = NULL;
+        o->base = o->comp = NULL;
+        drmModeSetCrtc(fd, o->crtc_id, 0, 0, 0, NULL, 0, NULL);
+        xd_buf_destroy(fd, &scr);
+        return false;
+    }
+    render_fit(o->base, o->W, o->H, &splash_img);
+    pthread_mutex_lock(&x->draw);
+    x->scr = scr;
+    x->vw = 0;
+    pthread_mutex_unlock(&x->draw);
+    xd_flusher_start(o);
+    o->active = true;
+    char ip[64];
+    read_ip(ip, sizeof ip);
+    splash_update_text(o, ip, true);
+    xd_show_splash(o);
+    pthread_mutex_lock(&o->lock);
+    o->on_splash = true;
+    o->want_splash = false;
+    o->usable = true;
+    pthread_mutex_unlock(&o->lock);
+    o->splash_since = now_ms();
+    LOG("display: output %d (%s, %s): %dx%d@%d", o->n, o->conn_name, x->kind, o->W, o->H, o->mode.vrefresh);
+    if (strcmp(o->rot_s, "0") || strcasecmp(o->mirror_s, "none"))
+        LOG("display: output %d: rotate %s, mirror %s (done while copying the picture)", o->n, o->rot_s, o->mirror_s);
+    return true;
+}
+
+static void xd_disable(struct output *o)
+{
+    struct xdisp *x = o->xd;
+    pthread_mutex_lock(&o->lock);
+    o->usable = false;
+    pthread_mutex_unlock(&o->lock);
+    for (int tries = 0; tries < 100 && o->thumb_reading; tries++)
+        usleep(10000);
+    xd_flusher_stop(o);
+    int fd = xdevs[x->dev].gone ? -1 : xd_fd(o);
+    pthread_mutex_lock(&x->draw); /* a frame being copied finishes first */
+    if (fd >= 0)
+        drmModeSetCrtc(fd, o->crtc_id, 0, 0, 0, NULL, 0, NULL);
+    xd_buf_destroy(fd, &x->scr);
+    pthread_mutex_unlock(&x->draw);
+    free(o->splash.map);
+    free(o->base);
+    free(o->comp);
+    memset(&o->splash, 0, sizeof o->splash);
+    o->base = o->comp = NULL;
+    o->active = false;
+    o->shown_ip[0] = 0;
+}
+
+/* Main thread, about once a second: the monitor plugged in or out, the device gone. */
+static void xd_hotplug(struct output *o)
+{
+    struct xdev *d = &xdevs[o->xd->dev];
+    if (d->gone || o->disabled)
+        return;
+    drmModeConnector *c = drmModeGetConnectorCurrent(d->fd, o->conn_id);
+    if (!c) {
+        LOG("display: output %d: %s (%s) went away", o->n, d->card, o->xd->kind);
+        d->gone = true;
+        if (o->active)
+            xd_disable(o);
+        for (int i = 0; i < nout; i++) /* the device's other displays went with it */
+            if (outs[i].xd && outs[i].xd->dev == o->xd->dev && outs[i].active)
+                xd_disable(&outs[i]);
+        return;
+    }
+    bool connected = c->connection == DRM_MODE_CONNECTED;
+    drmModeFreeConnector(c);
+    if (connected && !o->active && now_ms() >= o->enable_retry_at) {
+        if (!xd_enable(o))
+            o->enable_retry_at = now_ms() + 5000;
+    } else if (!connected && o->active) {
+        LOG("display: output %d: monitor disconnected", o->n);
+        xd_disable(o);
+    }
+}
+
+/* Receiver thread: where a frame of aspect ar goes, turned/mirrored as set. Holds x->draw on success. */
+static bool xd_begin(struct output *o, double ar, int sw, bool *hflip, bool *vflip)
+{
+    struct xdisp *x = o->xd;
+    /* The last frame hasn't gone out yet (the display takes fewer frames than arrive): skip this one
+     * instead of copying it for nothing; the next one after it has gone out is shown. */
+    pthread_mutex_lock(&x->fl_mu);
+    bool busy = x->fl_pending && x->fl_video;
+    pthread_mutex_unlock(&x->fl_mu);
+    if (busy)
+        return false;
+    pthread_mutex_lock(&o->lock);
+    bool ok = o->usable && !o->identify;
+    if (ok)
+        o->want_splash = false;
+    pthread_mutex_unlock(&o->lock);
+    if (!ok)
+        return false;
+    pthread_mutex_lock(&x->draw);
+    if (!x->scr.map) {
+        pthread_mutex_unlock(&x->draw);
+        return false;
+    }
+    bool r180 = !strcmp(o->rot_s, "180");
+    *hflip = r180 ^ !strcasecmp(o->mirror_s, "horizontal");
+    *vflip = r180 ^ !strcasecmp(o->mirror_s, "vertical");
+    int dw = o->W, dh = (int)(o->W / ar + 0.5);
+    if (dh > o->H) {
+        dh = o->H;
+        dw = (int)(o->H * ar + 0.5);
+    }
+    if (dw < 1 || dh < 1) {
+        pthread_mutex_unlock(&x->draw);
+        return false;
+    }
+    int dx = (o->W - dw) / 2, dy = (o->H - dh) / 2;
+    if (dx != x->vx || dy != x->vy || dw != x->vw || dh != x->vh) { /* new place: black borders */
+        for (int y = 0; y < o->H; y++)
+            memset(x->scr.map + (size_t)y * x->scr.pitch, 0, (size_t)o->W * 4);
+        x->vx = dx, x->vy = dy, x->vw = dw, x->vh = dh;
+    }
+    if (x->xmap_n != dw || x->xmap_src != sw || x->xmap_flip != *hflip) {
+        int *m = realloc(x->xmap, sizeof *m * dw);
+        if (!m) {
+            pthread_mutex_unlock(&x->draw);
+            return false;
+        }
+        for (int i = 0; i < dw; i++) {
+            int sx = (int)(((long)i * sw + sw / 2) / dw);
+            sx = sx >= sw ? sw - 1 : sx;
+            m[i] = *hflip ? sw - 1 - sx : sx;
+        }
+        x->xmap = m, x->xmap_n = dw, x->xmap_src = sw, x->xmap_flip = *hflip;
+    }
+    return true;
+}
+
+/* Receiver thread: frame copied; release the screen, report the change and count it. */
+static void xd_end(struct output *o, int64_t sent, uint64_t recv_us, uint64_t t0)
+{
+    struct xdisp *x = o->xd;
+    int x0 = x->vx, y0 = x->vy, x1 = x->vx + x->vw, y1 = x->vy + x->vh;
+    pthread_mutex_unlock(&x->draw);
+    uint64_t t1 = clock_us(CLOCK_MONOTONIC);
+    pthread_mutex_lock(&x->fl_mu);
+    x->t_copy += t1 - t0;
+    x->t_copies++;
+    pthread_mutex_unlock(&x->fl_mu);
+    xd_queue(o, x0, y0, x1, y1, true, sent, recv_us);
+    pthread_mutex_lock(&o->lock);
+    o->on_splash = false;
+    o->splash_since = 0;
+    pthread_mutex_unlock(&o->lock);
+}
+
+static inline uint32_t yuv709(int Y, int U, int V)
+{
+    int c = Y - 16, d = U - 128, e = V - 128;
+    int r = (298 * c + 459 * e + 128) >> 8, g = (298 * c - 55 * d - 136 * e + 128) >> 8, b = (298 * c + 541 * d + 128) >> 8;
+    r = r < 0 ? 0 : r > 255 ? 255 : r;
+    g = g < 0 ? 0 : g > 255 ? 255 : g;
+    b = b < 0 ? 0 : b > 255 ? 255 : b;
+    return (uint32_t)r << 16 | (uint32_t)g << 8 | (uint32_t)b;
+}
+
+/* Receiver thread: an NDI frame (normally BGRX: the receiver asks NDI for RGB on these displays). */
+static bool xd_post_ndi(struct output *o, const NDIlib_video_frame_v2_t *v, uint64_t recv_us)
+{
+    int kind;
+    switch (v->FourCC) {
+    case NDIlib_FourCC_video_type_BGRX: case NDIlib_FourCC_video_type_BGRA: kind = 0; break;
+    case NDIlib_FourCC_video_type_RGBX: case NDIlib_FourCC_video_type_RGBA: kind = 1; break;
+    case NDIlib_FourCC_video_type_UYVY: case NDIlib_FourCC_video_type_UYVA: kind = 2; break;
+    default: return true;
+    }
+    if (!v->p_data || v->xres < 2 || v->yres < 2)
+        return true;
+    double ar = v->picture_aspect_ratio > 0 ? v->picture_aspect_ratio : (double)v->xres / v->yres;
+    bool hflip, vflip;
+    uint64_t t0 = clock_us(CLOCK_MONOTONIC);
+    if (!xd_begin(o, ar, v->xres, &hflip, &vflip))
+        return true;
+    struct xdisp *x = o->xd;
+    const int *xm = x->xmap;
+    for (int y = 0; y < x->vh; y++) {
+        int sy = (int)(((long)y * v->yres + v->yres / 2) / x->vh);
+        sy = sy >= v->yres ? v->yres - 1 : sy;
+        if (vflip)
+            sy = v->yres - 1 - sy;
+        const uint8_t *s = v->p_data + (size_t)sy * v->line_stride_in_bytes;
+        uint32_t *d = (uint32_t *)(x->scr.map + (size_t)(x->vy + y) * x->scr.pitch) + x->vx;
+        const uint32_t *s32 = (const uint32_t *)s;
+        if (kind == 0 && x->vw == v->xres && !hflip) {
+            memcpy(d, s, (size_t)x->vw * 4); /* same size: straight copy */
+        } else if (kind == 0) {
+            for (int i = 0; i < x->vw; i++)
+                d[i] = s32[xm[i]];
+        } else if (kind == 1) {
+            for (int i = 0; i < x->vw; i++) {
+                uint32_t p = s32[xm[i]];
+                d[i] = (p & 0xFF00FF00u) | ((p >> 16) & 0xFF) | ((p & 0xFF) << 16);
+            }
+        } else {
+            for (int i = 0; i < x->vw; i++) {
+                const uint8_t *q = s + (xm[i] & ~1) * 2;
+                d[i] = yuv709(q[1 + (xm[i] & 1) * 2], q[0], q[2]);
+            }
+        }
+    }
+    xd_end(o, frame_pts(v), recv_us, t0);
+    return true;
+}
+
+/* Receiver thread: a planar 4:2:0 / 4:2:2 picture (this device's own capture input). */
+static bool xd_post_planar(struct output *o, const uint8_t *y, const uint8_t *u, const uint8_t *v, int w, int h,
+                           bool is420, int64_t sent, uint64_t recv_us)
+{
+    if (w < 2 || h < 2)
+        return true;
+    bool hflip, vflip;
+    uint64_t t0 = clock_us(CLOCK_MONOTONIC);
+    if (!xd_begin(o, (double)w / h, w, &hflip, &vflip))
+        return true;
+    struct xdisp *x = o->xd;
+    const int *xm = x->xmap;
+    int cw = w / 2;
+    for (int r = 0; r < x->vh; r++) {
+        int sy = (int)(((long)r * h + h / 2) / x->vh);
+        sy = sy >= h ? h - 1 : sy;
+        if (vflip)
+            sy = h - 1 - sy;
+        const uint8_t *yr = y + (size_t)sy * w;
+        const uint8_t *ur = u + (size_t)(is420 ? sy / 2 : sy) * cw, *vr = v + (size_t)(is420 ? sy / 2 : sy) * cw;
+        uint32_t *d = (uint32_t *)(x->scr.map + (size_t)(x->vy + r) * x->scr.pitch) + x->vx;
+        for (int i = 0; i < x->vw; i++)
+            d[i] = yuv709(yr[xm[i]], ur[xm[i] / 2], vr[xm[i] / 2]);
+    }
+    xd_end(o, sent, recv_us, t0);
+    return true;
+}
+
+/* sysfs: the USB device a sysfs object belongs to ("" if none). */
+static void usb_dev_of(const char *sys, char *out, size_t n)
+{
+    char p[PATH_MAX];
+    out[0] = 0;
+    if (!realpath(sys, p))
+        return;
+    for (char *s; (s = strrchr(p, '/')) && s != p; *s = 0) {
+        char f[PATH_MAX + 16];
+        snprintf(f, sizeof f, "%s/idVendor", p);
+        if (!access(f, F_OK)) {
+            snprintf(out, n, "%s", p);
+            return;
+        }
+    }
+}
+
+/* The sound card of the same USB device as the display. DisplayLink's displays (evdi) aren't children of
+ * their USB device in sysfs: for them, the sound card of a DisplayLink USB device (vendor 17e9). */
+static void xd_find_alsa(struct xdisp *x, const char *drm_sys)
+{
+    char want[PATH_MAX], dev[PATH_MAX], p[96], id[32];
+    snprintf(p, sizeof p, "%s/device", drm_sys);
+    usb_dev_of(p, want, sizeof want);
+    for (int i = 0; i < 16 && !x->alsa[0]; i++) {
+        snprintf(p, sizeof p, "/sys/class/sound/card%d/device", i);
+        usb_dev_of(p, dev, sizeof dev);
+        if (!dev[0])
+            continue;
+        bool match = want[0] ? !strcmp(want, dev) : false;
+        if (!want[0] && !strcmp(x->drv, "evdi")) {
+            char vf[PATH_MAX + 16], vendor[8] = "";
+            snprintf(vf, sizeof vf, "%s/idVendor", dev);
+            FILE *f = fopen(vf, "r");
+            if (f) {
+                if (!fgets(vendor, sizeof vendor, f))
+                    vendor[0] = 0;
+                fclose(f);
+            }
+            match = !strncmp(vendor, "17e9", 4);
+        }
+        snprintf(p, sizeof p, "/sys/class/sound/card%d/id", i);
+        FILE *f = match ? fopen(p, "r") : NULL;
+        if (f) {
+            if (fgets(id, sizeof id, f)) {
+                id[strcspn(id, "\n")] = 0;
+                snprintf(x->alsa, sizeof x->alsa, "%s", id);
+            }
+            fclose(f);
+        }
+    }
+}
+
+static int card_cmp(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
+
+/* Main thread, every few seconds: external display devices that appeared (or came back). Uses sysfs, so
+ * devices are only opened when new: evdi logs every open. */
+static void xd_scan(void)
+{
+    struct stat pst;
+    if (drm_fd < 0 || fstat(drm_fd, &pst))
+        return;
+    /* Devices that went away and whose displays are all off: close. */
+    for (int k = 0; k < XD_MAX_DEV; k++)
+        if (xdevs[k].gone && xdevs[k].fd >= 0) {
+            bool busy = false;
+            for (int i = 0; i < nout; i++)
+                busy |= outs[i].xd && outs[i].xd->dev == k && outs[i].active;
+            if (!busy) {
+                close(xdevs[k].fd);
+                xdevs[k].fd = -1;
+            }
+        }
+    int cards[16], nc = 0;
+    DIR *dir = opendir("/sys/class/drm");
+    for (struct dirent *e; dir && (e = readdir(dir));) {
+        int n;
+        char rest;
+        if (sscanf(e->d_name, "card%d%c", &n, &rest) == 1 && nc < 16)
+            cards[nc++] = n;
+    }
+    if (dir)
+        closedir(dir);
+    qsort(cards, nc, sizeof cards[0], card_cmp);
+    char seen_drv[16][16];
+    int seen_n = 0;
+    for (int ci = 0; ci < nc; ci++) {
+        char sys[64], path[24], link[PATH_MAX], drv[16];
+        snprintf(sys, sizeof sys, "/sys/class/drm/card%d", cards[ci]);
+        snprintf(path, sizeof path, "/dev/dri/card%d", cards[ci]);
+        struct stat st;
+        if (stat(path, &st) || st.st_rdev == pst.st_rdev)
+            continue; /* the Pi's own display controller */
+        /* Only devices with display connectors (cardN-*): not the 3D GPU. */
+        bool has_conn = false;
+        DIR *dd = opendir("/sys/class/drm");
+        char prefix[32];
+        snprintf(prefix, sizeof prefix, "card%d-", cards[ci]);
+        for (struct dirent *e; dd && (e = readdir(dd));)
+            has_conn |= !strncmp(e->d_name, prefix, strlen(prefix)) && !strstr(e->d_name, "Writeback");
+        if (dd)
+            closedir(dd);
+        if (!has_conn)
+            continue;
+        char dl[96];
+        snprintf(dl, sizeof dl, "%s/device/driver", sys);
+        ssize_t len = readlink(dl, link, sizeof link - 1);
+        link[len > 0 ? len : 0] = 0;
+        const char *base = strrchr(link, '/');
+        snprintf(drv, sizeof drv, "%.15s", base ? base + 1 : len > 0 ? link : "kms");
+        /* k: this card's place among the external cards of its driver (DisplayLink numbers them anew). */
+        int k = 0;
+        for (int s = 0; s < seen_n; s++)
+            k += !strcmp(seen_drv[s], drv);
+        if (seen_n < 16)
+            snprintf(seen_drv[seen_n++], sizeof seen_drv[0], "%s", drv);
+        bool tracked = false;
+        for (int d = 0; d < XD_MAX_DEV; d++)
+            tracked |= xdevs[d].fd >= 0 && !xdevs[d].gone && xdevs[d].rdev == st.st_rdev;
+        if (tracked)
+            continue;
+        int slot = -1;
+        for (int d = 0; d < XD_MAX_DEV && slot < 0; d++)
+            if (xdevs[d].fd < 0)
+                slot = d;
+        if (slot < 0)
+            continue;
+        int fd = open(path, O_RDWR | O_CLOEXEC);
+        if (fd < 0)
+            continue;
+        drmModeRes *res = drmModeGetResources(fd);
+        if (!res || !res->count_connectors || !res->count_crtcs) {
+            drmModeFreeResources(res);
+            close(fd);
+            continue;
+        }
+        struct xdev *xd = &xdevs[slot];
+        xd->fd = fd;
+        xd->rdev = st.st_rdev;
+        xd->gone = false;
+        snprintf(xd->card, sizeof xd->card, "%s", path);
+        snprintf(xd->sys, sizeof xd->sys, "%s", sys);
+        uint32_t used = 0;
+        int found = 0;
+        for (int i = 0; i < res->count_connectors; i++) {
+            drmModeConnector *c = drmModeGetConnectorCurrent(fd, res->connectors[i]);
+            if (!c)
+                continue;
+            if (c->connector_type == DRM_MODE_CONNECTOR_WRITEBACK || c->connector_type == DRM_MODE_CONNECTOR_VIRTUAL) {
+                drmModeFreeConnector(c);
+                continue;
+            }
+            uint32_t possible = 0;
+            for (int e = 0; e < c->count_encoders; e++) {
+                drmModeEncoder *enc = drmModeGetEncoder(fd, c->encoders[e]);
+                if (enc)
+                    possible |= enc->possible_crtcs;
+                drmModeFreeEncoder(enc);
+            }
+            int crtc = -1;
+            for (int j = 0; j < res->count_crtcs && crtc < 0; j++)
+                if ((possible & (1u << j)) && !(used & (1u << j)))
+                    crtc = j;
+            if (crtc < 0) {
+                drmModeFreeConnector(c);
+                continue;
+            }
+            used |= 1u << crtc;
+            char key[48], name[32];
+            snprintf(key, sizeof key, "%s#%d/%d", drv, k, i);
+            const char *tn = drmModeGetConnectorTypeName(c->connector_type);
+            snprintf(name, sizeof name, "%s-%u", tn ? tn : "Unknown", c->connector_type_id);
+            uint32_t conn_id = c->connector_id;
+            drmModeFreeConnector(c);
+            found++;
+            struct output *o = NULL; /* seen before (its device was re-created): the same output again */
+            for (int j = 0; j < nout && !o; j++)
+                if (outs[j].xd && !strcmp(outs[j].xd->key, key))
+                    o = &outs[j];
+            if (o) {
+                o->xd->dev = slot;
+                o->conn_id = conn_id;
+                o->crtc_id = res->crtcs[crtc];
+                snprintf(o->conn_name, sizeof o->conn_name, "%s", name);
+                o->enable_retry_at = 0;
+                LOG("display: output %d (%s) is back on %s", o->n, o->xd->kind, path);
+                continue;
+            }
+            if (nout >= MAX_OUT) {
+                LOG("display: %s %s: no room for another output (%d)", path, name, MAX_OUT);
+                continue;
+            }
+            o = &outs[nout];
+            memset(o, 0, sizeof *o);
+            o->xd = calloc(1, sizeof *o->xd);
+            if (!o->xd)
+                continue;
+            struct xdisp *x = o->xd;
+            pthread_mutex_init(&x->draw, NULL);
+            pthread_mutex_init(&x->fl_mu, NULL);
+            pthread_cond_init(&x->fl_cv, NULL);
+            x->dev = slot;
+            snprintf(x->key, sizeof x->key, "%s", key);
+            snprintf(x->drv, sizeof x->drv, "%s", drv);
+            snprintf(x->kind, sizeof x->kind, "external %s", drv);
+            xd_find_alsa(x, sys);
+            o->n = nout + 1;
+            snprintf(o->conn_name, sizeof o->conn_name, "%s", name);
+            o->conn_id = conn_id;
+            o->crtc_id = res->crtcs[crtc];
+            pthread_mutex_init(&o->lock, NULL);
+            o->ext_ready = o->ext_ready2 = o->ext_queued = o->ext_scanout = -1;
+            o->ready = o->ready2 = o->queued = o->scanout = o->last_video = -1;
+            for (int b = 0; b < NBUF; b++)
+                o->vstate[b] = B_NONE;
+            configure_output(o);
+            if (!strcasecmp(o->audio_s, "hdmi") && !x->alsa[0]) {
+                LOG("display: output %d: no sound device found for this display: audio off", o->n);
+                o->audio_s = "off";
+            }
+            LOG("display: output %d = %s on %s (%s)%s%s", o->n, name, path, x->kind, x->alsa[0] ? ", sound: " : "",
+                x->alsa);
+            __atomic_store_n(&nout, nout + 1, __ATOMIC_RELEASE); /* receivers read nout */
+            if (ndi_ok)
+                start_receivers();
+        }
+        drmModeFreeResources(res);
+        if (!found) { /* nothing usable on it: forget it (it is looked at again next time) */
+            close(fd);
+            xd->fd = -1;
+        }
+    }
 }
 
 /* HDMI-CEC to the TV on this output's port (cec0 = HDMI-A-1, cec1 = HDMI-A-2), in the background:
@@ -3953,11 +4732,20 @@ static void standby_service(struct output *o)
     }
 }
 
-/* Called about once a second: follows HDMI hotplug on every output. */
+/* Called about once a second: follows HDMI hotplug on every output, and external displays coming and going. */
 static void hotplug_poll(void)
 {
+    static uint64_t last_scan;
+    if (now_ms() - last_scan >= 3000) {
+        last_scan = now_ms();
+        xd_scan();
+    }
     for (int i = 0; i < nout; i++) {
         struct output *o = &outs[i];
+        if (o->xd) {
+            xd_hotplug(o);
+            continue;
+        }
         if (o->pending != P_NONE || o->disabled)
             continue;
         drmModeConnector *c = drmModeGetConnectorCurrent(drm_fd, o->conn_id);
@@ -4030,7 +4818,7 @@ int main(void)
 
     pthread_t thumb_thr;
     bool thumb_ok = !pthread_create(&thumb_thr, NULL, thumb_thread, NULL);
-    bool ndi_ok = load_ndi();
+    ndi_ok = load_ndi();
     if (ndi_ok)
         start_receivers();
 
@@ -4075,7 +4863,8 @@ int main(void)
             identify_poll(ip);
         }
         for (int i = 0; i < nout; i++)
-            splash_update_text(&outs[i], ip, false); /* only redraws on a change */
+            if (splash_update_text(&outs[i], ip, false) && outs[i].xd) /* only redraws on a change */
+                xd_splash_changed(&outs[i]); /* an external display shows a copy of it: refresh that */
     }
 
     LOG("shutting down");
