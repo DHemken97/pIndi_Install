@@ -1615,14 +1615,12 @@ static void *audio_thread(void *arg)
 static void *input_thread(void *arg)
 {
     struct input *in = arg;
-    NDIlib_send_create_t sc = { .p_ndi_name = in->name, .p_groups = NULL, .clock_video = false, .clock_audio = false };
-    NDIlib_send_instance_t send = ndi->send_create(&sc);
+    NDIlib_send_instance_t send = in->send; /* made by main, in input order */
     if (!send) {
         LOG("input %d: cannot create NDI sender \"%s\"", in->n, in->name);
         status(in, "cannot create NDI sender", NULL, 0, 0, 0);
         return NULL;
     }
-    in->send = send;
     bool athr = in->audio_on && !pthread_create(&in->athr, NULL, audio_thread, in);
     if (!in->audio_on)
         set_audio_status(in, "off");
@@ -1741,6 +1739,14 @@ int main(void)
     ndi_keyframe_required = (bool (*)(NDIlib_send_instance_t, const NDIlib_video_frame_v2_t *))dlsym(
         lib, "NDIlib_send_is_keyframe_required");
     hwenc_find();
+    /* The senders are made one after another in input order, not by the input threads as they start:
+     * each takes the next free port, so input 1 gets the lower port every time (receivers that remember
+     * a stream's address are less likely to find another input there after a restart). */
+    for (int i = 0; i < nin; i++) {
+        NDIlib_send_create_t sc = { .p_ndi_name = ins[i].name, .p_groups = NULL, .clock_video = false,
+                                    .clock_audio = false };
+        ins[i].send = ndi->send_create(&sc);
+    }
     for (int i = 0; i < nin; i++)
         pthread_create(&ins[i].thr, NULL, input_thread, &ins[i]);
     for (int i = 0; i < nin; i++)

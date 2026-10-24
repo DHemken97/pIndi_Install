@@ -1,7 +1,13 @@
 #!/usr/bin/python3
 """PiNDI web administration.
 
-Small standard-library HTTPS server (runs as root, port 443, self-signed certificate; port 80 redirects):
+Two processes from this one file:
+  - the front end (user pindi-web, ports 443/80): TLS, HTTP, pages, uploads. It reads the device's state
+    but can't change it, and holds no secrets beyond the TLS key.
+  - the broker (--broker, root, no network): sign-in (PAM), sessions and CSRF, and every change to the
+    device, asked for over a local socket. A flaw in the exposed front end is then not a root compromise.
+
+Small standard-library HTTPS server (port 443, self-signed or uploaded certificate; port 80 redirects pages):
   - login with the Pi's own user accounts (PAM, members of the sudo group)
   - per display output (detected by the player): enable/disable, NDI stream
     (default OUT_<serial>[_n]), source IP (default any), rotation, mirror, status
@@ -28,8 +34,13 @@ import socket
 import shutil
 import ssl
 import subprocess
+import socketserver
+import struct
+import sys
 import tarfile
+import tempfile
 import threading
+import traceback
 import time
 import urllib.parse
 
@@ -45,7 +56,12 @@ ENV_DEFAULTS = "/usr/share/pindi/pindi.conf"
 VERSION_FILE = "/usr/share/pindi/version"
 NDI_CONFIG = "/etc/pindi/ndi-config.v1.json"  # NDI_CONFIG_DIR=/etc/pindi in the player/sender units
 NETWORK_FILE = "/etc/systemd/network/20-pindi-wired.network"
-RUN_DIR = "/run/pindi"
+RUN_DIR = "/run/pindi"  # written by the player and sender (pindi-media): read here, never written by root
+CTL_DIR = "/run/pindi-ctl"  # root-only (the broker): live switches and Identify for the player
+WEB_RUN = "/run/pindi-web"  # the web front end's own: preview requests for the player
+BROKER_DIR = "/run/pindi-webd"
+BROKER_SOCK = BROKER_DIR + "/broker.sock"
+WEB_USER = "pindi-web"  # the network-facing front end runs as this user
 ADMIN_GROUP = "sudo"
 MEDIA_GROUP = "pindi-media"  # pindi-player and pindi-sender run as this user
 SESSION_TTL = 8 * 3600
@@ -138,20 +154,29 @@ def run(*cmd, input=None):
 
 def write_atomic(path, text, mode=0o644, group=None):
     """Replace path with text, safely even if the power is cut right after (synced to the SD card).
-    mode None: leave it to the file system (the FAT boot partition has no permissions)."""
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    if mode is not None:
-        os.chmod(tmp, mode)
-    if group:
+    mode None: leave it to the file system (the FAT boot partition has no permissions).
+    The temporary file gets a fresh random name and is created exclusively (O_EXCL), so a link planted
+    under a predictable name can't redirect the write to another file."""
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        if group:
+            try:
+                os.chown(tmp, 0, grp.getgrnam(group).gr_gid)
+            except KeyError:
+                pass  # not installed yet
+        os.replace(tmp, path)
+    except BaseException:
         try:
-            os.chown(tmp, 0, grp.getgrnam(group).gr_gid)
-        except KeyError:
-            pass  # not installed yet
-    os.replace(tmp, path)
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     try:
         d = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
         try:
@@ -226,17 +251,25 @@ def ether_interfaces():
     return out
 
 
-def live_network():
-    """What the interface is actually using right now."""
+def wifi_interfaces():
+    return sorted(n for n in os.listdir("/sys/class/net") if os.path.exists("/sys/class/net/%s/wireless" % n))
+
+
+def live_network(wifi=True):
+    """What the device is actually using right now: the wired address, else (wifi) the Wi-Fi one."""
     info = {"iface": "", "address": "", "prefix": "", "gateway": "", "dns": []}
-    ifaces = ether_interfaces()
+    found = {}
     for line in run("ip", "-4", "-o", "addr", "show", "scope", "global").stdout.splitlines():
         parts = line.split()
-        if len(parts) >= 4 and parts[1] in ifaces:
-            info["iface"] = parts[1]
-            info["address"], _, info["prefix"] = parts[3].partition("/")
+        if len(parts) >= 4:
+            found.setdefault(parts[1], parts[3])
+    for name in ether_interfaces() + (wifi_interfaces() if wifi else []):
+        if name in found:
+            info["iface"] = name
+            info["address"], _, info["prefix"] = found[name].partition("/")
             break
-    m = re.search(r"default via (\S+)", run("ip", "-4", "route", "show", "default").stdout)
+    m = re.search(r"default via (\S+)", run("ip", "-4", "route", "show", "default", "dev", info["iface"]).stdout
+                  if info["iface"] else "")
     if m:
         info["gateway"] = m.group(1)
     for line in read_text("/run/systemd/resolve/resolv.conf").splitlines():
@@ -545,7 +578,7 @@ def clock_text():
 
 
 class NetTraffic:
-    """Received/sent bit rate of the wired interfaces, sampled in the background."""
+    """Received/sent bit rate of the wired and Wi-Fi interfaces, sampled in the background."""
 
     def __init__(self, interval=2.0):
         self.interval = interval
@@ -554,7 +587,7 @@ class NetTraffic:
     @staticmethod
     def _counters():
         rx = tx = 0
-        for name in ether_interfaces():
+        for name in ether_interfaces() + wifi_interfaces():
             base = "/sys/class/net/%s/statistics/" % name
             rx += int(read_text(base + "rx_bytes", "0").strip() or 0)
             tx += int(read_text(base + "tx_bytes", "0").strip() or 0)
@@ -582,8 +615,12 @@ class NetTraffic:
         text = "%s in, %s out" % (mbit(self.rx), mbit(self.tx))
         if link:
             text += " (%d Mbit/s link)" % link
-            if max(self.rx, self.tx) > 0.8 * link * 1e6:
-                text += " – close to the link limit, expect dropped frames"
+            # NDI arrives in bursts well above its average: from about 70 % the audio, which waits behind the
+            # video in the same connection, starts to arrive late and cut out (seen on a Pi 3's 100 Mbit/s port).
+            if max(self.rx, self.tx) > 0.7 * link * 1e6:
+                text += " – close to the link limit: expect audio dropouts and dropped frames (send a smaller stream)"
+        elif any(read_text("/sys/class/net/%s/operstate" % n).strip() == "up" for n in wifi_interfaces()):
+            text += " (over Wi-Fi)"
         return text
 
 
@@ -841,15 +878,19 @@ def os_update_text():
         return "installing now"
     try:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(OS_UPDATE_LOG)))
+        text = read_text(OS_UPDATE_LOG)
+        state = "OK" if "PINDI-OS-UPDATE-OK" in text else '<span class="warn">failed (see the log)</span>'
+        out = "last run %s, %s" % (when, state)
     except OSError:
-        return "never installed from this device" + (" (daily at %s)" % os_update_time() if os_update_time() else
-                                                      " (off)")
-    text = read_text(OS_UPDATE_LOG)
-    state = "OK" if "PINDI-OS-UPDATE-OK" in text else '<span class="warn">failed (see the log)</span>'
-    out = "last run %s, %s" % (when, state)
+        out = "never installed from this device"
     out += " &middot; daily at %s" % os_update_time() if os_update_time() else " &middot; automatic: off"
     if os.path.exists("/run/reboot-required"):
         out += ' &middot; <span class="warn">reboot needed to finish</span>'
+    if os_update_overdue():
+        days = int((time.time() - last_package_update()) // 86400)
+        out += ('<span class="hint block warn">No operating-system updates for %d days: security fixes are '
+                'missing. Press <b>Install OS updates now</b> (System) or set a daily time (Device settings).'
+                '</span>' % days)
     return out
 
 
@@ -1153,36 +1194,44 @@ WELL_KNOWN_PASSWORDS = {"pindi", "raspberry", "password", "admin", "1234", "1234
 
 
 class Lockout:
-    """After 5 failed sign-ins within 10 minutes an address must wait 10 minutes."""
-    LIMIT, WINDOW, PENALTY = 5, 600, 600
+    """After limit failures for one key within 10 minutes, that key must wait 10 minutes."""
+    WINDOW, PENALTY = 600, 600
 
-    def __init__(self):
+    def __init__(self, limit, what):
+        self.limit, self.what = limit, what
         self.lock = threading.Lock()
-        self.fails = {}  # ip -> [timestamps]
-        self.until = {}  # ip -> locked until
+        self.fails = {}  # key -> [timestamps]
+        self.until = {}  # key -> locked until
 
-    def blocked(self, ip):
+    def blocked(self, key):
         with self.lock:
-            return max(0, int(self.until.get(ip, 0) - time.time()))
+            return max(0, int(self.until.get(key, 0) - time.time()))
 
-    def failure(self, ip):
+    def failure(self, key):
         now = time.time()
         with self.lock:
             for old in [a for a, t in self.until.items() if t < now]:  # forget served lockouts
                 del self.until[old]
-            recent = [t for t in self.fails.get(ip, []) if now - t < self.WINDOW] + [now]
-            self.fails[ip] = recent
-            if len(recent) >= self.LIMIT:
-                self.until[ip] = now + self.PENALTY
-                self.fails.pop(ip, None)
-                log("login: %s locked out for %d s after %d failures" % (ip, self.PENALTY, self.LIMIT))
+            for old in [a for a, f in self.fails.items() if now - f[-1] >= self.WINDOW]:
+                del self.fails[old]
+            recent = [t for t in self.fails.get(key, []) if now - t < self.WINDOW] + [now]
+            self.fails[key] = recent
+            if len(recent) >= self.limit:
+                self.until[key] = now + self.PENALTY
+                self.fails.pop(key, None)
+                log("login: %s locked out for %d s after %d failures" % (self.what(key), self.PENALTY, self.limit))
 
-    def success(self, ip):
+    def success(self, key):
         with self.lock:
-            self.fails.pop(ip, None)
+            self.fails.pop(key, None)
 
 
-LOCKOUT = Lockout()
+# Sign-ins are locked per address and user name: someone guessing (or deliberately failing) from an address
+# shared with others (NAT) blocks only that name from there, not every user behind it. A wider limit per
+# address stops guessing across many names. API tokens are 192-bit random values that can't be guessed, so
+# wrong ones are only slowed down, never locked out: a valid token always works.
+LOGIN_LOCK = Lockout(5, lambda k: "%s from %s" % (k[1], k[0]))
+ADDRESS_LOCK = Lockout(30, lambda k: "every user from %s" % k)
 
 
 # ---------------------------------------------------------------- pages
@@ -1202,7 +1251,7 @@ main{max-width:860px;margin:0 auto;padding:16px}
 .card h2{margin:0 0 12px;font-size:16px}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:0}dt{color:var(--muted)}dd{margin:0;word-break:break-all}
 label{display:block;margin:10px 0 4px;color:var(--muted);font-size:13px}
-input[type=text],input[type=password],input[type=number],input[type=time],select{width:100%;padding:9px 10px;border-radius:7px;border:1px solid var(--line);
+input[type=text],input[type=password],input[type=number],input[type=time],select,textarea{width:100%;padding:9px 10px;border-radius:7px;border:1px solid var(--line);
 background:#0d1319;color:var(--text);font:inherit}
 option:disabled{color:var(--muted)}
 input:focus{outline:2px solid var(--accent2);border-color:var(--accent2)}
@@ -1325,6 +1374,33 @@ def login_page(error=""):
     return page("Sign in", body)
 
 
+def certificate_html(hidden):
+    """Device settings: the HTTPS certificate, how to check it, and uploading one's own."""
+    c = cert_info()
+    if not c:
+        return ""
+    back = ('<form class="inline" method="post" action="/tls/self" data-confirm="Go back to the device\'s own '
+            'certificate?">%s<button class="secondary">Use the device\'s own certificate</button></form>' % hidden
+            if not c["self"] else "")
+    return (
+        '<h3 class="group">HTTPS certificate</h3><dl><dt>Certificate</dt><dd>%s</dd><dt>For</dt><dd>%s</dd>'
+        '<dt>Valid until</dt><dd>%s</dd><dt>SHA-256 fingerprint</dt><dd><code>%s</code></dd>'
+        '<dt>Public-key pin</dt><dd><code>sha256//%s</code></dd></dl>'
+        '<p class="hint">%s To make sure a client talks to this device and not an impostor, compare the '
+        'fingerprint with what the browser shows, or pin the key: <code>curl --pinnedpubkey sha256//%s -k '
+        'https://...</code> (the connection is refused if the key differs, even with <code>-k</code>).</p>'
+        '<form method="post" action="/tls">%s<div class="row"><div><label>Your own certificate (PEM, with any '
+        'intermediate certificates)</label><textarea name="cert" rows="4" placeholder="-----BEGIN CERTIFICATE-----"'
+        '></textarea></div><div><label>Its private key (PEM, not password-protected)</label><textarea name="key" '
+        'rows="4" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div></div><p class="hint">From your '
+        'organisation\'s certificate authority, for this device\'s name or address: browsers that trust that '
+        'authority then show no warning.</p><button class="secondary">Install certificate</button> %s</form>' %
+        ("Uploaded" if not c["self"] else "This device's own (self-signed); made again when its name or address "
+         "changes", esc(", ".join(c["names"]) or "-"), esc(c["until"]), esc(c["fingerprint"]), esc(c["pin"]),
+         "Browsers warn about a self-signed certificate until it is accepted." if c["self"] else "",
+         esc(c["pin"]), hidden, back))
+
+
 def dashboard(session):
     csrf = session["csrf"]
     hidden = '<input type="hidden" name="csrf" value="%s">' % csrf
@@ -1335,12 +1411,12 @@ def dashboard(session):
     if flash:
         parts.append('<div class="msg %s">%s</div>' % (flash[0], esc(flash[1])))
 
-    if NET.pending():
+    if session.get("net") is not None:  # the broker's pending network change
         parts.append(
             '<div class="msg warn"><b>New network settings are active.</b> They will be undone in '
             '<span id="countdown">%d</span> s unless you keep them.<form method="post" action="/network/confirm">'
             '%s<button>Keep these settings</button> <button class="secondary" formaction="/network/revert">'
-            'Undo now</button></form></div>' % (NET.seconds_left(), hidden))
+            'Undo now</button></form></div>' % (session["net"], hidden))
 
     net = live_network()
     outs = outputs()
@@ -1371,7 +1447,7 @@ def dashboard(session):
         ("IP address", '<span data-k="ip">%s</span>' % esc(net["address"] or "-")),
     ] + ([("Wi-Fi", wifi_state_text())] if wifi_enabled() else []) + [
         ("Network traffic", '<span data-k="net">%s</span><span class="hint block">Everything this device '
-                            'receives and sends on the wired network. A Full NDI 1080p60 stream takes up to about '
+                            'receives and sends on the network (wired and Wi-Fi). A Full NDI 1080p60 stream takes up to about '
                             '130 Mbit/s, depending on the picture (still images far less).</span>' %
                             esc(TRAFFIC.text())),
         ("Health", '<span data-k="health">%s</span>' % esc(hl)),
@@ -1595,24 +1671,27 @@ def dashboard(session):
         '<button>Save device settings</button></form>'
         '<h3 class="group">HTTP API</h3><p class="hint">For control systems (e.g. Bitfocus Companion, Crestron) '
         'and scripts. Send the token as <code>Authorization: Bearer &lt;token&gt;</code>.</p>'
-        '<dl><dt>Token</dt><dd><code>%s</code></dd><dt>Status</dt><dd><code>GET /api/v1/status</code></dd>'
+        '<dl><dt>Token</dt><dd><code>%s</code>%s</dd><dt>Status</dt><dd><code>GET /api/v1/status</code></dd>'
         '<dt>Switch</dt><dd><code>POST /api/v1/outputs/1/source</code> with <code>{"stream": "CAM 2", '
         '"source_ip": ""}</code></dd><dt>Identify</dt><dd><code>POST /api/v1/identify</code> with '
         '<code>{"output": 1}</code> (0 = all)</dd><dt>Restart</dt><dd><code>POST /api/v1/restart</code></dd>'
         '</dl><form method="post" action="/api-token" data-confirm="Generate a new API token? The current one '
-        'stops working.">%s<button class="secondary">New token</button></form></section>' %
+        'stops working.">%s<button class="secondary">New token</button></form>%s</section>' %
         (hidden, esc(device_name()), esc(socket.gethostname()), esc(ns["discovery"]), esc(ns["recv_groups"]),
          esc(ns["send_groups"]), options(TRANSPORTS, ns["transport"]), licence_fields,
          "" if env.get("PINDI_NET_BUFFERS") == "0" else " checked",
          options([(z, esc(z)) for z in timezones()], current_timezone()),
          esc(reboot_time()), esc(os_update_time()), "" if env.get("PINDI_SPLASH_INFO") == "0" else " checked",
          " checked" if (env.get("PINDI_FRAME_TIMEOUT_MS") or "0") not in ("", "0") else "",
-         esc(api_token()), hidden))
+         esc(session["secrets"]["api_token"]),
+         '<span class="hint block warn">%s</span>' % esc(session["secrets"]["token_note"])
+         if session["secrets"]["token_note"] else "", hidden, certificate_html(hidden)))
 
     # Network
     cfg = read_network_config()
-    fill = cfg if not cfg["dhcp"] else {"address": net["address"], "prefix": net["prefix"],
-                                         "gateway": net["gateway"], "dns": net["dns"]}
+    wired = net if net["iface"] in ether_interfaces() else live_network(wifi=False)  # this card is the cable's
+    fill = cfg if not cfg["dhcp"] else {"address": wired["address"], "prefix": wired["prefix"],
+                                         "gateway": wired["gateway"], "dns": wired["dns"]}
     mask = ""
     if fill["prefix"]:
         try:
@@ -1641,10 +1720,10 @@ def dashboard(session):
          esc(", ".join(cfg["ntp"])), ROLLBACK_SECONDS))
 
     # Wi-Fi
-    wifi = read_wifi_config()
+    wifi = session["secrets"]["wifi"]  # the configuration file is root's
     wifi_on = wifi_enabled()
     country = wifi["country"] or timezone_country()
-    ssids = wifi_scan() if wifi_on else []
+    ssids = session["secrets"]["ssids"]
     reboot = ""
     if wifi_needs_reboot():
         reboot = ('<form method="post" action="/reboot" data-confirm="Reboot the device now?">%s'
@@ -2016,7 +2095,7 @@ def act_password(session, form):
 
 def write_switch(n, stream, source_ip, backup):
     """Tell the running player to switch output n to another stream (see switch_poll in the player)."""
-    write_atomic("%s/out%d.source" % (RUN_DIR, n),
+    write_atomic("%s/out%d.source" % (CTL_DIR, n),
                  "stream=%s\nsource_ip=%s\nbackup=%s\n" % (stream, source_ip, backup))
 
 
@@ -2097,10 +2176,11 @@ def api_post(path, data):
 
 
 def act_api_token():
-    try:
-        os.remove(API_TOKEN_FILE)
-    except OSError:
-        pass
+    for f in (API_TOKEN_FILE, API_TOKEN_NOTE):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
     api_token()
     log("api: new token generated")
     return ("ok", "A new API token was generated; the old one no longer works.")
@@ -2119,7 +2199,7 @@ def act_identify(form):
              "IP %s" % (live_network()["address"] or "-"),
              "%s · serial %s" % (outs[n]["connector"], SERIAL) if n else "Serial %s" % SERIAL]
     text = "\n".join(l for l in lines if l)
-    write_atomic(RUN_DIR + "/identify", "%d\n%s\n" % (n, text))
+    write_atomic(CTL_DIR + "/identify", "%d\n%s\n" % (n, text))
     return ("ok", "%s shows its name for 15 seconds." % ("Output %d" % n if n else "Every output"))
 
 
@@ -2220,6 +2300,7 @@ def act_device(form):
     def apply():
         if renamed:
             run("systemctl", "restart", "avahi-daemon.service")
+            ensure_cert()  # the device's own certificate names the new host name
         restart_media()
     later(0.5, apply)
     return ("ok", "Device settings saved. Video and outgoing streams are restarting.")
@@ -2309,14 +2390,14 @@ def act_reset():
     return ("ok", "All PiNDI settings are back to the defaults (network settings and passwords kept).")
 
 
-def journal(lines, units=("pindi", "pindi-sender", "pindi-web")):
+def journal(lines, units=("pindi", "pindi-sender", "pindi-web", "pindi-webd")):
     cmd = ["journalctl", "--no-pager", "-o", "short-iso", "-n", str(lines)]
     for u in units:
         cmd += ["-u", u]
     return run(*cmd).stdout
 
 
-def diagnostics_text():
+def diagnostics_text(wifi):
     out = ["PiNDI diagnostics", "=" * 60]
     hl, hw = health()
     out += ["Created: %s" % time.strftime("%Y-%m-%d %H:%M:%S %z"), "Version: %s" % version(),
@@ -2338,7 +2419,6 @@ def diagnostics_text():
                 out += ["---- " + name, read_text(os.path.join(RUN_DIR, name)).rstrip(), ""]
     except OSError:
         pass
-    wifi = read_wifi_config()
     out += ["---- Wi-Fi", "%s; network %s, country %s, %s" % (
         re.sub(r"<[^>]+>", "", html.unescape(wifi_state_text())), wifi["ssid"] or "-", wifi["country"] or "-",
         "password set" if wifi["psk"] else "no password"), ""]
@@ -2533,7 +2613,447 @@ def logs_page(session):
     return page("Log", body, session["user"], session["csrf"])
 
 
-# ---------------------------------------------------------------- HTTP
+# ---------------------------------------------------------------- HTTPS certificate
+
+TLS_CERT, TLS_KEY = TLS_DIR + "/cert.pem", TLS_DIR + "/key.pem"
+TLS_SELF = TLS_DIR + "/self-signed"  # while the certificate is the device's own: the names it was made for
+TLS_UPLOADED = TLS_DIR + "/uploaded"  # while it is one uploaded in Device settings (install.sh keeps it)
+OS_UPDATE_OVERDUE_DAYS = 30
+
+
+def tls_names():
+    """What the device is reached as: host name, <name>.local and every current IPv4 address."""
+    host = socket.gethostname()
+    ifaces = set(ether_interfaces() + wifi_interfaces())
+    ips = set()
+    for line in run("ip", "-4", "-o", "addr", "show", "scope", "global").stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[1] in ifaces:
+            ips.add(parts[3].split("/")[0])
+    return ["DNS:%s" % host, "DNS:%s.local" % host] + ["IP:%s" % a for a in sorted(ips)]
+
+
+def tls_permissions():
+    """Key readable by the front end (it serves TLS), nobody else."""
+    try:
+        gid = grp.getgrnam(WEB_USER).gr_gid
+    except KeyError:
+        gid = 0
+    os.makedirs(TLS_DIR, mode=0o750, exist_ok=True)
+    os.chown(TLS_DIR, 0, gid)
+    os.chmod(TLS_DIR, 0o750)
+    for path, mode in ((TLS_KEY, 0o640), (TLS_CERT, 0o644)):
+        if os.path.exists(path):
+            os.chown(path, 0, gid)
+            os.chmod(path, mode)
+
+
+def ensure_cert():
+    """Broker: the device's own certificate, made again whenever its host name or addresses change (so it
+    keeps matching the address in the browser). An uploaded certificate is left alone."""
+    have = os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY)
+    if have and not os.path.exists(TLS_SELF):
+        tls_permissions()
+        return
+    names = tls_names()
+    if have and read_text(TLS_SELF).split() == names:
+        tls_permissions()
+        return
+    os.makedirs(TLS_DIR, mode=0o750, exist_ok=True)
+    fd, key = tempfile.mkstemp(prefix=".key.", dir=TLS_DIR)
+    os.close(fd)
+    cert = key + ".crt"
+    try:
+        r = run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                "-days", "3650", "-subj", "/CN=%s" % socket.gethostname(),
+                "-addext", "subjectAltName=" + ",".join(names), "-keyout", key, "-out", cert)
+        if r.returncode:
+            raise RuntimeError("cannot create the TLS certificate: %s" % r.stderr.strip())
+        os.replace(key, TLS_KEY)
+        os.replace(cert, TLS_CERT)
+    finally:
+        for f in (key, cert):
+            if os.path.exists(f):
+                os.remove(f)
+    write_atomic(TLS_SELF, " ".join(names) + "\n")
+    tls_permissions()
+    log("tls: new self-signed certificate for %s" % ", ".join(n.split(":", 1)[1] for n in names))
+
+
+def act_tls(form):
+    """Use an uploaded certificate (PEM, may include the chain) and its unencrypted private key."""
+    cert, key = form.get("cert", "").strip() + "\n", form.get("key", "").strip() + "\n"
+    if "BEGIN CERTIFICATE" not in cert or "PRIVATE KEY" not in key:
+        return ("err", "Paste the certificate (BEGIN CERTIFICATE...) and its private key (BEGIN ... PRIVATE KEY).")
+    if "ENCRYPTED" in key:
+        return ("err", "The private key is password-protected; export it without a password.")
+    files = {}
+    try:
+        for name, text in (("crt", cert), ("key", key)):
+            fd, files[name] = tempfile.mkstemp(prefix=".upload.", dir=TLS_DIR)
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+        pub_c = run("openssl", "x509", "-in", files["crt"], "-noout", "-pubkey")
+        pub_k = run("openssl", "pkey", "-in", files["key"], "-pubout", "-passin", "pass:")
+        if pub_c.returncode or pub_k.returncode:
+            return ("err", "That is not a valid PEM certificate and private key.")
+        if pub_c.stdout.strip() != pub_k.stdout.strip():
+            return ("err", "The private key does not belong to that certificate.")
+        if run("openssl", "x509", "-in", files["crt"], "-noout", "-checkend", "0").returncode:
+            return ("err", "That certificate has expired.")
+        try:
+            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(files["crt"], files["key"])
+        except (ssl.SSLError, OSError) as e:
+            return ("err", "The certificate can't be used: %s" % e)
+        os.replace(files.pop("key"), TLS_KEY)
+        os.replace(files.pop("crt"), TLS_CERT)
+    finally:
+        for f in files.values():
+            os.remove(f)
+    try:
+        os.remove(TLS_SELF)
+    except FileNotFoundError:
+        pass
+    write_atomic(TLS_UPLOADED, time.strftime("%Y-%m-%d %H:%M") + "\n")
+    tls_permissions()
+    log("tls: uploaded certificate in use")
+    return ("ok", "Certificate installed. Reload the page; the browser now sees the new certificate.")
+
+
+def act_tls_self():
+    for f in (TLS_CERT, TLS_SELF, TLS_UPLOADED):
+        try:
+            os.remove(f)
+        except FileNotFoundError:
+            pass
+    ensure_cert()
+    return ("ok", "The device's own certificate is in use again (the browser warns about it once more).")
+
+
+_cert_cache = {"mtime": None, "info": None}
+
+
+def cert_info():
+    """The certificate being served: kind, names, expiry, SHA-256 fingerprint and public-key pin."""
+    try:
+        mtime = os.path.getmtime(TLS_CERT)
+    except OSError:
+        return None
+    if _cert_cache["mtime"] == mtime:
+        return _cert_cache["info"]
+    pem = read_text(TLS_CERT)
+    try:
+        der = ssl.PEM_cert_to_DER_cert(pem[:pem.index("-----END CERTIFICATE-----") + 25])
+    except ValueError:
+        return None
+    fp = hashlib.sha256(der).hexdigest().upper()
+    pub = subprocess.run(["openssl", "x509", "-in", TLS_CERT, "-noout", "-pubkey"], capture_output=True).stdout
+    spki = subprocess.run(["openssl", "pkey", "-pubin", "-outform", "der"], input=pub, capture_output=True).stdout
+    text = run("openssl", "x509", "-in", TLS_CERT, "-noout", "-enddate", "-ext", "subjectAltName").stdout
+    end = re.search(r"notAfter=(.+)", text)
+    names = re.findall(r"(?:DNS|IP Address):([^,\s]+)", text)
+    info = {"self": os.path.exists(TLS_SELF), "names": names, "until": end.group(1).strip() if end else "?",
+            "fingerprint": ":".join(fp[i:i + 2] for i in range(0, len(fp), 2)),
+            "pin": base64.b64encode(hashlib.sha256(spki).digest()).decode() if spki else ""}
+    _cert_cache.update(mtime=mtime, info=info)
+    return info
+
+
+def tls_context():
+    """Front end: serve the broker's certificate, and pick up a new one when it changes."""
+    for _ in range(60):  # the broker makes it at its first start
+        if os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY):
+            break
+        time.sleep(0.5)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(TLS_CERT, TLS_KEY)
+
+    def reload():
+        seen = (os.path.getmtime(TLS_CERT), os.path.getmtime(TLS_KEY))
+        while True:
+            time.sleep(10)
+            try:
+                now = (os.path.getmtime(TLS_CERT), os.path.getmtime(TLS_KEY))
+                if now != seen:
+                    ctx.load_cert_chain(TLS_CERT, TLS_KEY)  # new connections get it
+                    seen = now
+                    log("tls: certificate reloaded")
+            except (OSError, ssl.SSLError):
+                pass  # being replaced: next round
+    threading.Thread(target=reload, daemon=True).start()
+    return ctx
+
+
+def last_package_update():
+    """When packages last changed (OS update, install.sh's upgrade, apt by hand)."""
+    try:
+        return os.path.getmtime("/var/lib/dpkg/status")
+    except OSError:
+        return 0
+
+
+def os_update_overdue():
+    return time.time() - last_package_update() > OS_UPDATE_OVERDUE_DAYS * 86400
+
+
+# ---------------------------------------------------------------- broker (root): the only part that changes things
+
+BROKER_MAX = UPDATE_MAX * 4 // 3 + 4 * BODY_MAX  # an update package is the largest request
+API_TOKEN_NOTE = "/etc/pindi/api-token.note"
+_api_fail_logged = {}
+
+
+def _send_msg(sock, obj):
+    data = json.dumps(obj).encode()
+    sock.sendall(struct.pack("!I", len(data)) + data)
+
+
+def _recv_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(min(n - len(buf), 1 << 20))
+        if not chunk:
+            raise ConnectionError("closed")
+        buf += chunk
+    return bytes(buf)
+
+
+def _recv_msg(sock, limit):
+    (n,) = struct.unpack("!I", _recv_exact(sock, 4))
+    if n > limit:
+        raise ValueError("message too large")
+    return json.loads(_recv_exact(sock, n))
+
+
+def broker(op, **args):
+    """Front end: ask the broker. None if it can't be reached."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(300)
+            s.connect(BROKER_SOCK)
+            _send_msg(s, dict(args, op=op))
+            return _recv_msg(s, 16 << 20)
+    except (OSError, ValueError, ConnectionError) as e:
+        log("broker %s: %s" % (op, e))
+        return None
+
+
+def token_ok(given):
+    return isinstance(given, str) and bool(given) and secrets.compare_digest(given.encode(), api_token().encode())
+
+
+def api_failure(ip):
+    """Wrong API token: slowed down (and logged at most once a minute per address), never locked out."""
+    now = time.time()
+    if now - _api_fail_logged.get(ip, 0) > 60:
+        _api_fail_logged[ip] = now
+        log("api: wrong or missing token from %s" % ip)
+    time.sleep(1)
+
+
+def op_login(user="", password="", ip=""):
+    user, password = str(user).strip(), str(password)
+    key = (str(ip), user.lower())
+    wait = max(LOGIN_LOCK.blocked(key), ADDRESS_LOCK.blocked(key[0]))
+    if wait:
+        log("login refused: %s from %s is locked out for %d s" % (user, ip, wait))
+        return {"code": 429, "error": "Too many failed sign-ins. Try again in %d minute%s." %
+                ((wait + 59) // 60, "" if wait <= 60 else "s")}
+    if user and len(user) <= 64 and is_admin(user) and check_password(user, password):
+        LOGIN_LOCK.success(key)
+        token = SESSIONS.create(user)
+        notes = []
+        if password in WELL_KNOWN_PASSWORDS:
+            notes.append("You signed in with a well-known default password. Please change it below.")
+        if os_update_overdue():
+            notes.append("No operating-system updates have been installed for over %d days: install them "
+                         "(System) or set a daily time (Device settings)." % OS_UPDATE_OVERDUE_DAYS)
+        if notes:
+            SESSIONS.get(token)["flash"] = ("warn", " ".join(notes))
+        log("login: %s from %s" % (user, ip))
+        return {"token": token}
+    LOGIN_LOCK.failure(key)
+    ADDRESS_LOCK.failure(key[0])
+    log("login failed: %r from %s" % (user[:64], ip))
+    time.sleep(2)
+    return {"code": 401, "error": "Wrong user or password, or the user is not an administrator."}
+
+
+def op_session(token="", pop_flash=False, with_secrets=False):
+    s = SESSIONS.get(token)
+    if not s:
+        return None
+    out = {"user": s["user"], "csrf": s["csrf"], "net": NET.seconds_left() if NET.pending() else None}
+    if pop_flash:
+        out["flash"], s["flash"] = s["flash"], None
+    if with_secrets:
+        wifi = read_wifi_config()
+        out["secrets"] = {"api_token": api_token(), "token_note": read_text(API_TOKEN_NOTE).strip(),
+                          "wifi": {"ssid": wifi["ssid"], "psk": bool(wifi["psk"]), "country": wifi["country"]},
+                          "ssids": wifi_scan() if wifi_enabled() else []}
+    return out
+
+
+def op_logout(token=""):
+    SESSIONS.drop(token)
+    return {}
+
+
+def _restart(s):
+    log("video restart requested by %s" % s["user"])
+    later(0.5, restart_media)
+    return ("ok", "Video and outgoing streams are restarting.")
+
+
+def _reboot(s):
+    log("reboot requested by %s" % s["user"])
+    later(1, run, "systemctl", "reboot")
+    return {"page": "reboot"}
+
+
+def _network_confirm(s):
+    NET.confirm()
+    return ("ok", "Network settings kept.")
+
+
+def _network_revert(s):
+    NET.revert()
+    return ("ok", "Previous network settings restored.")
+
+
+ACTIONS = {
+    "/output": lambda s, f: act_output(f), "/outgoing": lambda s, f: act_outgoing(f),
+    "/network": lambda s, f: act_network(f), "/wifi": lambda s, f: act_wifi(f),
+    "/network/confirm": lambda s, f: _network_confirm(s), "/network/revert": lambda s, f: _network_revert(s),
+    "/password": act_password, "/device": lambda s, f: act_device(f), "/restore": lambda s, f: act_restore(f),
+    "/reset": lambda s, f: act_reset(), "/identify": lambda s, f: act_identify(f),
+    "/update": lambda s, f: act_update(f), "/os-update": lambda s, f: act_os_update_now(),
+    "/api-token": lambda s, f: act_api_token(), "/restart": lambda s, f: _restart(s),
+    "/reboot": lambda s, f: _reboot(s), "/tls": lambda s, f: act_tls(f), "/tls/self": lambda s, f: act_tls_self(),
+}
+
+
+def op_action(token="", csrf="", path="", form=None):
+    """A change from the web interface: only for a valid session with its CSRF token (checked here, not by
+    the front end)."""
+    s = SESSIONS.get(token)
+    if not s or not isinstance(csrf, str) or not secrets.compare_digest(csrf.encode(), s["csrf"].encode()):
+        return {"login": True}
+    if path == "/logout":
+        SESSIONS.drop(token)
+        return {"logout": True}
+    fn = ACTIONS.get(path)
+    if not fn:
+        return {"code": 404}
+    form = {str(k): str(v) for k, v in (form or {}).items()} if isinstance(form, dict) else {}
+    r = fn(s, form)
+    if isinstance(r, dict):
+        return r
+    s["flash"] = r
+    return {"redirect": "/update" if path == "/update" and r[0] == "ok" else "/"}
+
+
+def op_api_auth(token="", ip=""):
+    if token_ok(token):
+        return True
+    api_failure(ip)
+    return False
+
+
+def op_api_post(token="", ip="", path="", data=None):
+    if not token_ok(token):
+        api_failure(ip)
+        return [401, {"error": "missing or wrong API token"}]
+    return list(api_post(str(path), data if isinstance(data, dict) else {}))
+
+
+def op_http_token(token="", ip=""):
+    """A token sent over plain HTTP went over the network unencrypted: if it is the valid one, it is replaced."""
+    if not token_ok(token):
+        return False
+    try:
+        os.remove(API_TOKEN_FILE)
+    except OSError:
+        pass
+    api_token()
+    write_atomic(API_TOKEN_NOTE, "Replaced on %s: the previous token was sent over plain HTTP (not HTTPS) "
+                                 "from %s.\n" % (time.strftime("%Y-%m-%d %H:%M"), ip), 0o600)
+    log("api: the token was sent over plain HTTP from %s: replaced with a new one" % ip)
+    return True
+
+
+BROKER_OPS = {"login": op_login, "session": op_session, "logout": op_logout, "action": op_action,
+              "api_auth": op_api_auth, "api_post": op_api_post, "http_token": op_http_token}
+
+
+class BrokerHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        cred = self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", cred)
+        if uid not in self.server.allowed:
+            return
+        self.request.settimeout(120)
+        try:
+            msg = _recv_msg(self.request, BROKER_MAX)
+            fn = BROKER_OPS[msg.pop("op")]
+        except (OSError, ValueError, KeyError, TypeError, ConnectionError):
+            return
+        try:
+            result = fn(**msg)
+        except TypeError:
+            result = {"code": 400}
+        except Exception:
+            log("broker: %s" % traceback.format_exc())
+            result = {"code": 500}
+        try:
+            _send_msg(self.request, result)
+        except OSError:
+            pass
+
+
+class BrokerServer(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+
+
+def broker_main():
+    """Root, no network access (pindi-webd.service): serves the front end on BROKER_SOCK."""
+    try:
+        web = pwd.getpwnam(WEB_USER)
+        allowed, gid = {0, web.pw_uid}, web.pw_gid
+    except KeyError:
+        allowed, gid = {0}, 0
+    os.makedirs(BROKER_DIR, exist_ok=True)
+    os.chown(BROKER_DIR, 0, gid)
+    os.chmod(BROKER_DIR, 0o750)
+    os.makedirs(CTL_DIR, exist_ok=True)
+    os.chmod(CTL_DIR, 0o755)
+    if update_state() != "running":
+        shutil.rmtree(UPDATE_DIR, ignore_errors=True)  # an earlier update's unpacked files
+    ensure_cert()
+
+    def watch():  # a new address or host name: a certificate that matches it
+        while True:
+            time.sleep(60)
+            try:
+                ensure_cert()
+            except Exception as e:
+                log("tls: %s" % e)
+    threading.Thread(target=watch, daemon=True).start()
+    try:
+        os.remove(BROKER_SOCK)
+    except FileNotFoundError:
+        pass
+    old = os.umask(0o117)
+    srv = BrokerServer(BROKER_SOCK, BrokerHandler)
+    os.umask(old)
+    os.chown(BROKER_SOCK, 0, gid)
+    srv.allowed = allowed
+    log("PiNDI web broker on %s" % BROKER_SOCK)
+    srv.serve_forever()
+
+
+# ---------------------------------------------------------------- front end (pindi-web): HTTP
 
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "PiNDI"
@@ -2545,11 +3065,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # --- plumbing
     def cookie_token(self):
-        c = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+        try:
+            c = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+        except http.cookies.CookieError:
+            return None
         return c["pindi_session"].value if "pindi_session" in c else None
 
-    def session(self):
-        return SESSIONS.get(self.cookie_token())
+    def session(self, **opts):
+        token = self.cookie_token()
+        return broker("session", token=token, **opts) if token else None
+
+    def given_token(self):
+        given = self.headers.get("X-API-Key", "")
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            given = auth[7:].strip()
+        return given
 
     def send(self, code, body, ctype="text/html; charset=utf-8", headers=()):
         data = body.encode() if isinstance(body, str) else body
@@ -2573,6 +3104,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for k, v in headers:
             self.send_header(k, v)
         self.end_headers()
+
+    def unavailable(self):
+        return self.send(503, "The web interface's broker (pindi-webd) is not running.", "text/plain")
 
     def body(self, limit=BODY_MAX):
         """The request body, or None (and an error sent) when its length is missing, invalid or over limit.
@@ -2607,12 +3141,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path in ("/favicon.svg", "/favicon.ico"):
             return self.send(200, FAVICON, "image/svg+xml")
         if path.startswith("/api/v1/"):
-            if not self.api_authorised():
+            if not broker("api_auth", token=self.given_token(), ip=self.client_address[0]):
                 return self.send(401, json.dumps({"error": "missing or wrong API token"}), "application/json")
             if path == "/api/v1/status":
                 return self.send(200, json.dumps(api_status(), indent=1), "application/json")
             return self.send(404, json.dumps({"error": "unknown endpoint"}), "application/json")
-        s = self.session()
+        s = self.session(pop_flash=path == "/", with_secrets=path in ("/", "/diagnostics"))
         if path == "/login":
             return self.redirect("/") if s else self.send(200, login_page())
         if not s:
@@ -2632,7 +3166,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if m:
             # Asking for it keeps the player rendering it (for 15 s); the first request may find none yet.
             n = int(m.group(1))
-            req = "%s/out%d.thumbreq" % (RUN_DIR, n)
+            req = "%s/out%d.thumbreq" % (WEB_RUN, n)
             try:
                 with open(req, "a"):
                     os.utime(req)
@@ -2642,14 +3176,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(404, "", "text/plain")
         stamp = time.strftime("%Y%m%d-%H%M")
         if path == "/diagnostics":
-            return self.send(200, diagnostics_text(), "text/plain; charset=utf-8", [
+            return self.send(200, diagnostics_text(s["secrets"]["wifi"]), "text/plain; charset=utf-8", [
                 ("Content-Disposition", 'attachment; filename="pindi-%s-diagnostics-%s.txt"' % (SERIAL, stamp))])
         if path == "/backup":
             return self.send(200, backup_json(), "application/json", [
                 ("Content-Disposition", 'attachment; filename="pindi-%s-settings-%s.json"' % (SERIAL, stamp))])
         if path == "/api/status":
-            st = {"ip": live_network()["address"], "rollback": NET.seconds_left() if NET.pending() else None,
-                  "net": TRAFFIC.text()}
+            st = {"ip": live_network()["address"], "rollback": s["net"], "net": TRAFFIC.text()}
             st["health"], st["power"] = health()
             for o in outputs():
                 for k in ("state", "target", "source", "video", "shown", "format", "audio", "latency"):
@@ -2661,23 +3194,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, json.dumps(st), "application/json")
         self.send(404, "Not found", "text/plain")
 
-    def api_authorised(self):
-        """API token as "Authorization: Bearer <token>" or "X-API-Key: <token>". Not in the URL: links end
-        up in browser histories, proxy logs and bookmarks."""
-        token = api_token()
-        given = self.headers.get("X-API-Key", "")
-        auth = self.headers.get("Authorization", "")
-        if auth.lower().startswith("bearer "):
-            given = auth[7:].strip()
-        ok = bool(given) and secrets.compare_digest(given.encode(), token.encode())
-        if not ok:
-            LOCKOUT.failure(self.client_address[0])
-        return ok and not LOCKOUT.blocked(self.client_address[0])
-
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
         if path.startswith("/api/v1/"):
-            if not self.api_authorised():
+            token, ip = self.given_token(), self.client_address[0]
+            if not broker("api_auth", token=token, ip=ip):  # before reading the body
                 return self.send(401, json.dumps({"error": "missing or wrong API token"}), "application/json")
             raw = self.body()
             if raw is None:
@@ -2688,112 +3209,71 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
             except ValueError:
                 return self.send(400, json.dumps({"error": "body must be JSON or form data"}), "application/json")
-            code, result = api_post(path, data if isinstance(data, dict) else {})
-            return self.send(code, json.dumps(result), "application/json")
+            r = broker("api_post", token=token, ip=ip, path=path, data=data if isinstance(data, dict) else {})
+            if not r:
+                return self.send(503, json.dumps({"error": "broker not running"}), "application/json")
+            return self.send(r[0], json.dumps(r[1]), "application/json")
         if path == "/update" and not self.session():
             return self.redirect("/login")  # the one large body: only read for a signed-in user
         form = self.form(UPDATE_MAX * 4 // 3 + BODY_MAX if path == "/update" else BODY_MAX)
         if form is None:
             return
         if path == "/login":
-            user = form.get("user", "").strip()
-            password = form.get("password", "")
-            ip = self.client_address[0]
-            wait = LOCKOUT.blocked(ip)
-            if wait:
-                log("login refused: %s is locked out for %d s" % (ip, wait))
-                return self.send(429, login_page("Too many failed sign-ins from this address. Try again in %d "
-                                                 "minute%s." % ((wait + 59) // 60, "" if wait <= 60 else "s")))
-            if user and is_admin(user) and check_password(user, password):
-                LOCKOUT.success(ip)
-                token = SESSIONS.create(user)
-                if password in WELL_KNOWN_PASSWORDS:
-                    SESSIONS.get(token)["flash"] = ("warn", "You signed in with a well-known default password. "
-                                                    "Please change it below.")
-                log("login: %s from %s" % (user, ip))
+            r = broker("login", user=form.get("user", ""), password=form.get("password", ""),
+                       ip=self.client_address[0])
+            if r is None:
+                return self.unavailable()
+            if "token" in r:
                 return self.redirect("/", [("Set-Cookie", "pindi_session=%s; Path=/; Secure; HttpOnly; "
-                                                          "SameSite=Strict" % token)])
-            LOCKOUT.failure(ip)
-            log("login failed: %r from %s" % (user, ip))
-            time.sleep(2)
-            return self.send(401, login_page("Wrong user or password, or the user is not an administrator."))
-
-        s = self.session()
-        if not s or not secrets.compare_digest(form.get("csrf", ""), s["csrf"]):
+                                                          "SameSite=Strict" % r["token"])])
+            return self.send(r.get("code", 401), login_page(r.get("error", "")))
+        r = broker("action", token=self.cookie_token() or "", csrf=form.pop("csrf", ""), path=path, form=form)
+        if r is None:
+            return self.unavailable()
+        if r.get("login"):
             return self.redirect("/login")
-
-        if path == "/logout":
-            SESSIONS.drop(self.cookie_token())
+        if r.get("logout"):
             return self.redirect("/login", [("Set-Cookie", "pindi_session=; Path=/; Secure; Max-Age=0")])
-        if path == "/output":
-            s["flash"] = act_output(form)
-        elif path == "/outgoing":
-            s["flash"] = act_outgoing(form)
-        elif path == "/network":
-            s["flash"] = act_network(form)
-        elif path == "/wifi":
-            s["flash"] = act_wifi(form)
-        elif path == "/network/confirm":
-            NET.confirm()
-            s["flash"] = ("ok", "Network settings kept.")
-        elif path == "/network/revert":
-            NET.revert()
-            s["flash"] = ("ok", "Previous network settings restored.")
-        elif path == "/password":
-            s["flash"] = act_password(s, form)
-        elif path == "/device":
-            s["flash"] = act_device(form)
-        elif path == "/restore":
-            s["flash"] = act_restore(form)
-        elif path == "/reset":
-            s["flash"] = act_reset()
-        elif path == "/identify":
-            s["flash"] = act_identify(form)
-        elif path == "/update":
-            s["flash"] = act_update(form)
-            if s["flash"][0] == "ok":
-                return self.redirect("/update")
-        elif path == "/os-update":
-            s["flash"] = act_os_update_now()
-        elif path == "/api-token":
-            s["flash"] = act_api_token()
-        elif path == "/restart":
-            log("video restart requested by %s" % s["user"])
-            later(0.5, restart_media)
-            s["flash"] = ("ok", "Video and outgoing streams are restarting.")
-        elif path == "/reboot":
-            log("reboot requested by %s" % s["user"])
-            later(1, run, "systemctl", "reboot")
+        if r.get("page") == "reboot":
             return self.send(200, page("PiNDI", '<div class="card"><h2>Rebooting&hellip;</h2>'
                                                  '<p>The device will be back in about 20 seconds.</p></div>'))
-        else:
-            return self.send(404, "Not found", "text/plain")
-        self.redirect("/")
+        if "redirect" in r:
+            return self.redirect(r["redirect"])
+        self.send(r.get("code", 404), "Not found", "text/plain")
 
 
-class RedirectHandler(http.server.BaseHTTPRequestHandler):
-    """Plain HTTP (port 80): everything is sent to the same address over HTTPS."""
-    server_version = "PiNDI"
-    sys_version = ""
-    timeout = REQUEST_TIMEOUT
+class RedirectHandler(Handler):
+    """Plain HTTP (port 80). Browsers asking for a page are sent to HTTPS. Nothing else is accepted: no
+    sign-in, no form, no API call, so nothing is redirected with its body. A request carrying the valid API
+    token has already sent it unencrypted, so that token is replaced (the client must then be fixed)."""
 
-    def log_message(self, fmt, *args):
-        pass
+    def refuse(self):
+        token = self.given_token()
+        leaked = bool(token) and broker("http_token", token=token, ip=self.client_address[0])
+        msg = "Use https:// - plain HTTP is not accepted for sign-in, forms or the API."
+        if leaked:
+            msg += (" The API token sent here travelled unencrypted and has been replaced: get the new one from "
+                    "Device settings and use https:// in the client.")
+        self.close_connection = True
+        self.send(403, json.dumps({"error": msg}) + "\n", "application/json", [("Connection", "close")])
 
-    def redirect(self):
+    def do_GET(self):
+        if self.given_token() or self.path.startswith("/api/"):
+            return self.refuse()
         host = self.headers.get("Host", "")
         if not re.match(r"^[A-Za-z0-9.-]{1,253}(:\d{1,5})?$", host):
             host = self.connection.getsockname()[0]  # no usable Host header: the address it came in on
         host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
         if PORT != 443:
             host += ":%d" % PORT
-        self.send_response(301 if self.command in ("GET", "HEAD") else 308)
+        self.send_response(301)
         self.send_header("Location", "https://%s%s" % (host, self.path if self.path.startswith("/") else "/"))
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
         self.end_headers()
 
-    do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = redirect
+    do_HEAD = do_GET
+    do_POST = do_PUT = do_DELETE = do_PATCH = refuse
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -2854,33 +3334,12 @@ class Server(http.server.ThreadingHTTPServer):
         pass  # broken connections are normal (browsers, port scans)
 
 
-def tls_context():
-    """The device's own self-signed certificate (made once, ten years). Browsers warn about it the first
-    time; it still encrypts the sign-in, the session and API tokens."""
-    cert, key = TLS_DIR + "/cert.pem", TLS_DIR + "/key.pem"
-    if not (os.path.exists(cert) and os.path.exists(key)):
-        os.makedirs(TLS_DIR, mode=0o700, exist_ok=True)
-        host = socket.gethostname()
-        names = ["DNS:%s" % host, "DNS:%s.local" % host] + ["IP:%s" % a for a in (live_network()["address"],) if a]
-        r = run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
-                "-days", "3650", "-subj", "/CN=%s" % host, "-addext", "subjectAltName=" + ",".join(names),
-                "-keyout", key + ".tmp", "-out", cert + ".tmp")
-        if r.returncode:
-            raise RuntimeError("cannot create the TLS certificate: %s" % r.stderr.strip())
-        os.chmod(key + ".tmp", 0o600)
-        os.replace(key + ".tmp", key)
-        os.replace(cert + ".tmp", cert)
-        log("tls: new self-signed certificate for %s" % host)
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(cert, key)
-    return ctx
-
-
 def main():
+    if "--broker" in sys.argv:
+        return broker_main()
+    if os.geteuid() == 0:
+        log("warning: the front end is running as root; it is meant to run as %s (pindi-web.service)" % WEB_USER)
     TRAFFIC.start()
-    if update_state() != "running":
-        shutil.rmtree(UPDATE_DIR, ignore_errors=True)  # an earlier update's unpacked files
     srv = Server(("", PORT), Handler, tls_context())
     if HTTP_PORT:
         threading.Thread(target=Server(("", HTTP_PORT), RedirectHandler).serve_forever, daemon=True).start()

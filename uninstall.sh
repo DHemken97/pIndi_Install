@@ -28,18 +28,21 @@ step() { echo; echo "==> $*"; }
 unit_exists() { [ -n "$(systemctl list-unit-files --no-legend "$1" 2>/dev/null)" ]; }
 
 step "Stopping and removing the PiNDI services"
-for u in pindi.service pindi-sender.service pindi-web.service pindi-reboot.timer pindi-os-update.timer \
+for u in pindi.service pindi-sender.service pindi-web.service pindi-webd.service pindi-reboot.timer pindi-os-update.timer \
          pindi-os-update.service pindi-reboot.service; do
     systemctl disable --now "$u" >/dev/null 2>&1 || true
 done
 rm -f /etc/systemd/system/pindi.service /etc/systemd/system/pindi-sender.service \
-      /etc/systemd/system/pindi-web.service /etc/systemd/system/pindi-reboot.timer \
+      /etc/systemd/system/pindi-web.service /etc/systemd/system/pindi-webd.service /etc/systemd/system/pindi-reboot.timer \
       /etc/systemd/system/pindi-reboot.service /etc/systemd/system/pindi-os-update.timer \
       /etc/systemd/system/pindi-os-update.service /etc/systemd/system/pindi-drivers.service
 rm -f /usr/local/bin/pindi-player /usr/local/bin/pindi-sender /etc/pam.d/pindi-web
-rm -rf /usr/local/lib/pindi /usr/share/pindi /etc/pindi /var/lib/pindi /var/lib/pindi-media /run/pindi
+rm -rf /usr/local/lib/pindi /usr/share/pindi /etc/pindi /var/lib/pindi /var/lib/pindi-media /run/pindi \
+       /run/pindi-ctl /run/pindi-web /run/pindi-webd
 rm -f /etc/default/pindi /var/log/pindi-update.log /var/log/pindi-os-update.log
-if id pindi-media >/dev/null 2>&1; then userdel pindi-media || true; fi
+for u in pindi-media pindi-web; do
+    if id "$u" >/dev/null 2>&1; then userdel "$u" || true; fi
+done
 if [ "$KEEP_SDK" -eq 0 ]; then
     rm -f /usr/local/lib/libndi.so* /usr/local/lib/libndi_advanced.so*
     rm -rf /usr/local/include/ndi /usr/local/share/doc/ndi

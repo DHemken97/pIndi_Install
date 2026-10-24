@@ -68,7 +68,9 @@
 #define FONT_PT_PX 21
 #define MAX_OUT 4
 #define NBUF 8 /* per output; outputs showing its source hold some of them (decode once) */
-#define RUN_DIR "/run/pindi"
+#define RUN_DIR "/run/pindi"     /* status, previews (this program and pindi-sender write here) */
+#define CTL_DIR "/run/pindi-ctl" /* live switches, Identify: written by the web interface only (root) */
+#define WEB_RUN "/run/pindi-web" /* preview requests from the web front end */
 
 static const NDIlib_v6 *ndi;
 static bool hx_decode; /* the SDK can decode NDI|HX, so a sender may use either codec */
@@ -534,6 +536,7 @@ struct output {
     uint32_t wfmt; /* format the receiver needs */
     bool want_realloc, want_splash, on_splash;
     int ready, ready2, queued, scanout; /* ready, ready2: the next frames to show, oldest first */
+    int backlog;          /* refreshes in a row that found two frames waiting (lock) */
     char splash_msg[192]; /* what the receiver is doing, shown on the splash */
     bool thumb_reading;   /* the preview thread is reading a buffer: don't free any */
     bool cant_display;    /* no buffers for the current frame size (pw x ph) */
@@ -547,6 +550,7 @@ struct output {
     bool disabled; /* PINDI_OUT<n>_ENABLED=0: no NDI, HDMI signal off (e.g. encoder-only units) */
     char target[160], alt[160], source_ip[64];
     char backup[160]; /* PINDI_OUT<n>_BACKUP_STREAM: played while the main stream is unavailable */
+    uint64_t source_stale; /* out<n>.source's time stamp at start: a switch from before then is ignored */
     const char *rot_s, *mirror_s;
     const char *audio_s; /* PINDI_OUT<n>_AUDIO: hdmi, analog or off */
     int audio_delay_ms;  /* PINDI_OUT<n>_AUDIO_DELAY_MS: audio buffer = lip-sync delay */
@@ -635,6 +639,10 @@ static void ext_release(struct output *owner, int idx)
     if (owner && idx >= 0 && owner->vuse[idx] > 0)
         owner->vuse[idx]--;
 }
+
+/* Two frames waiting at this many refreshes in a row is not a burst but a standing backlog (a sender
+ * at exactly the display rate never drains it): one frame is skipped, saving a refresh of delay. */
+#define BACKLOG_DROP 30
 
 /* o->lock held: frame idx is complete. Up to two frames wait to be shown, so a frame that arrives
  * right after another (decoders work in bursts) waits one refresh instead of replacing it; with
@@ -1677,6 +1685,16 @@ static void output_service(struct output *o)
         ext_clear_ready(o);
         L = NULL;
     } else if (L && o->ready < 0 && !o->identify) {
+        if (o->ext_ready2 < 0) {
+            o->backlog = 0;
+        } else if (++o->backlog >= BACKLOG_DROP) { /* a standing backlog: skip a frame to lose it */
+            ext_release(L, li);
+            L = o->ext_ready2_of;
+            li = o->ext_ready2;
+            o->ext_ready2 = -1;
+            o->ext_ready2_of = NULL;
+            o->backlog = 0;
+        }
         o->ext_queued = li;
         o->ext_queued_of = L;
         o->ext_ready = o->ext_ready2;
@@ -1734,6 +1752,14 @@ static void output_service(struct output *o)
         }
     }
     if (o->ready >= 0) {
+        if (o->ready2 < 0 || (o->pacing && o->pace.on)) {
+            o->backlog = 0;
+        } else if (++o->backlog >= BACKLOG_DROP) { /* a standing backlog: skip a frame to lose it */
+            o->vstate[o->ready] = B_FREE;
+            o->ready = o->ready2;
+            o->ready2 = -1;
+            o->backlog = 0;
+        }
         int idx = o->ready;
         double ar = o->vaspect[idx];
         o->ready = o->ready2;
@@ -2676,11 +2702,11 @@ static int switch_poll(struct output *o, uint64_t *seen)
 {
     char path[64], buf[1024], stream[160] = "", ip[64] = "", backup[160] = "";
     struct stat st;
-    snprintf(path, sizeof path, RUN_DIR "/out%d.source", o->n);
+    snprintf(path, sizeof path, CTL_DIR "/out%d.source", o->n);
     if (stat(path, &st))
         return 0;
     uint64_t stamp = (uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec;
-    if (stamp == *seen)
+    if (stamp == *seen || stamp == o->source_stale)
         return 0;
     *seen = stamp;
     FILE *f = fopen(path, "r");
@@ -3011,28 +3037,28 @@ static void *codec_probe_thread(void *arg)
 /* One check at a time. min_gap_ms: skip it if the last one started more recently than that - the
  * check's own connection to the sender briefly takes the receiver's down when it ends (the NDI library
  * shares it), which would otherwise look like "the sender came back" and start the next one, endlessly,
- * cutting the audio each time. */
-static void codec_probe_start(struct output *o, NDIlib_recv_bandwidth_e bandwidth, const char *name,
+ * cutting the audio each time. False: skipped for that reason (ask again later). */
+static bool codec_probe_start(struct output *o, NDIlib_recv_bandwidth_e bandwidth, const char *name,
                               const char *url, uint64_t min_gap_ms)
 {
     uint64_t now = now_ms();
     pthread_mutex_lock(&o->lock);
-    bool skip = o->probing || (o->probe_ms && now - o->probe_ms < min_gap_ms);
-    if (!skip) {
+    bool running_now = o->probing, too_soon = !running_now && o->probe_ms && now - o->probe_ms < min_gap_ms;
+    if (!running_now && !too_soon) {
         o->probing = true;
         o->probe_ms = now;
         o->probe_codec = NULL;
     }
     pthread_mutex_unlock(&o->lock);
-    if (skip)
-        return;
+    if (running_now || too_soon)
+        return !too_soon;
     struct codec_probe *p = calloc(1, sizeof *p);
     pthread_t t;
     if (!p) {
         pthread_mutex_lock(&o->lock);
         o->probing = false;
         pthread_mutex_unlock(&o->lock);
-        return;
+        return true;
     }
     p->o = o;
     p->bandwidth = bandwidth;
@@ -3046,6 +3072,7 @@ static void codec_probe_start(struct output *o, NDIlib_recv_bandwidth_e bandwidt
         o->probing = false;
         pthread_mutex_unlock(&o->lock);
     }
+    return true;
 }
 
 /* Leader thread: an audio frame for the outputs following o (each plays it with its own settings). */
@@ -3088,6 +3115,8 @@ static void *receiver(void *arg)
     NDIlib_find_instance_t find = NULL;
     NDIlib_recv_instance_t recv = NULL;
     uint64_t find_created = 0, last_match = 0, recv_start = 0, last_alive = 0, last_frame = 0;
+    bool find_no_ip = false; /* the finder was made while the device had no IPv4 address */
+    uint64_t ip_check = 0;
     uint64_t last_stats = 0, last_sources = 0;
     uint32_t last_count = UINT32_MAX;
     char cur_src[256] = "", cur_url[128] = "", failed_src[256] = "", last_src[256] = "";
@@ -3100,7 +3129,12 @@ static void *receiver(void *arg)
     int last_w = 0, last_h = 0;
     uint64_t key_asked = 0;
     int prev_conns = -1; /* connections to the sender at the last check; -1: none yet */
+    bool recheck = false; /* the sender reconnected: check its codec once the last check is a minute old */
+    uint64_t drop_check = 0;  /* when the dropped-frame count was last looked at (0: not yet) */
+    int64_t drops_seen = 0;   /* the receiver's dropped video frames then */
     bool following = false; /* showing another output's receiver (decode once) */
+    uint64_t codec_copy_at = 0;
+    char codec_copied[512] = ""; /* the leader's out<n>.codec as last copied to ours */
 
     while (running) {
         uint64_t now = now_ms();
@@ -3115,9 +3149,11 @@ static void *receiver(void *arg)
          * Stop when it stops receiving, this display goes away or this output gets another stream. */
         if (following) {
             char src[256] = "", url[128] = "", vid[64] = "";
+            int lead_n = 0;
             pthread_mutex_lock(&share_mu);
             struct output *L = o->leader;
             if (L) {
+                lead_n = L->n;
                 snprintf(src, sizeof src, "%s", L->share_src);
                 snprintf(url, sizeof url, "%s", L->share_url);
                 snprintf(vid, sizeof vid, "%s", L->share_video);
@@ -3133,11 +3169,27 @@ static void *receiver(void *arg)
             }
             if (L && use && !sw) {
                 status_set(o, on_backup ? "playing (backup)" : "playing", src, url, vid);
+                if (now - codec_copy_at >= 1000) { /* the leader checks the codec: show its answer here too */
+                    codec_copy_at = now;
+                    char path[64], buf[512] = "";
+                    snprintf(path, sizeof path, RUN_DIR "/out%d.codec", lead_n);
+                    FILE *f = fopen(path, "r");
+                    if (f) {
+                        buf[fread(buf, 1, sizeof buf - 1, f)] = 0;
+                        fclose(f);
+                    }
+                    if (*buf && strcmp(buf, codec_copied)) {
+                        snprintf(path, sizeof path, RUN_DIR "/out%d.codec", o->n);
+                        write_file_atomic(path, buf);
+                        snprintf(codec_copied, sizeof codec_copied, "%s", buf);
+                    }
+                }
                 usleep(50000);
                 continue;
             }
             share_leave(o);
             following = false;
+            codec_copied[0] = 0;
             audio_close(o);
             if (audio_on)
                 audio_info(o, "");
@@ -3251,6 +3303,19 @@ static void *receiver(void *arg)
             }
         }
 
+        /* A finder made before the device had an address (at boot, before the link is up) asks the
+         * network again only after several seconds: make a new one as soon as there is an address. */
+        if (find && find_no_ip && now - ip_check >= 250) {
+            char ip[64];
+            ip_check = now;
+            read_ip(ip, sizeof ip);
+            if (strcmp(ip, "no network")) {
+                LOG("ndi: output %d: network up (%s), restarting discovery", o->n, ip);
+                ndi->find_destroy(find);
+                find = NULL;
+            }
+        }
+
         /* Discovery needs avahi; give it up to 20 s to appear after boot. */
         if (!find) {
             if (access("/run/avahi-daemon/socket", F_OK) && now - start_ms < 20000) {
@@ -3263,6 +3328,9 @@ static void *receiver(void *arg)
             find = ndi->find_create_v2(&fc);
             find_created = last_match = now;
             last_count = UINT32_MAX;
+            char ip[64];
+            read_ip(ip, sizeof ip);
+            find_no_ip = !strcmp(ip, "no network");
             if (!find) {
                 LOG("ndi: output %d: cannot create finder", o->n);
                 usleep(1000000);
@@ -3272,12 +3340,28 @@ static void *receiver(void *arg)
 
         /* Keep the visible-sources list fresh for the web UI while playing too. */
         if (recv && now - last_sources >= 2000) {
-            if (o->n == 1) {
-                uint32_t count = 0;
-                const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+            uint32_t count = 0;
+            const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+            if (o->n == 1)
                 sources_publish(srcs, count);
-            }
             last_sources = now;
+            /* The sender restarted and our stream now has another address (its inputs can come back on
+             * each other's ports): the receiver would reconnect to the old one, i.e. to another stream. */
+            for (uint32_t i = 0; i < count; i++)
+                if (srcs[i].p_ndi_name && !strcmp(srcs[i].p_ndi_name, cur_src) && srcs[i].p_url_address &&
+                    *cur_url && strcmp(srcs[i].p_url_address, cur_url)) {
+                    LOG("ndi: output %d: %s moved from %s to %s, reconnecting", o->n, cur_src, cur_url,
+                        srcs[i].p_url_address);
+                    ndi->recv_destroy(recv);
+                    recv = NULL;
+                    break;
+                }
+            if (!recv) {
+                audio_close(o);
+                splash_at = now + 6000; /* keep the picture until the stream's first frame */
+                search_since = now;
+                continue;
+            }
             /* Our stream is one of this device's inputs again (pindi-sender restarted): take it from there. */
             char lpath[64];
             if (!on_backup && local_find(o, lpath, sizeof lpath)) {
@@ -3529,9 +3613,22 @@ static void *receiver(void *arg)
         if (conns > 0 && now > last_alive)
             last_alive = now;
         /* The sender came back (e.g. restarted with another codec): the NDI library reconnects by itself,
-         * so check the codec again, or HX would stay decoded in software. */
+         * so check the codec again, or HX would stay decoded in software. A reconnect within a minute of
+         * the last check (a flaky link drops often) is checked when that minute is up, not forgotten. */
         if (conns > 0 && prev_conns == 0 && got_frame && !hx_mode && hx_decode)
-            codec_probe_start(o, bandwidth, cur_src, cur_url, 60000);
+            recheck = true;
+        /* A reconnect too quick to see (conns never 0) is caught by its symptom: frames dropped while the
+         * NDI library decodes, which is what H.264 decoded in software does on a Pi 3/4. */
+        if (!hx_mode && hx_decode && *hw_dev && got_frame && now - drop_check >= 2000) {
+            NDIlib_recv_performance_t total, dropped;
+            ndi->recv_get_performance(recv, &total, &dropped);
+            if (drop_check && dropped.video_frames > drops_seen)
+                recheck = true;
+            drops_seen = dropped.video_frames;
+            drop_check = now;
+        }
+        if (recheck && (hx_mode || (conns > 0 && codec_probe_start(o, bandwidth, cur_src, cur_url, 60000))))
+            recheck = false;
         prev_conns = conns;
 
         if (stats_ms > 0 && now - last_stats >= (uint64_t)stats_ms) {
@@ -3617,9 +3714,12 @@ static void set_target(struct output *o, const char *stream, const char *source_
 static void configure_output(struct output *o)
 {
     set_target(o, ocfg(o->n, "STREAM", ""), ocfg(o->n, "SOURCE_IP", ""), ocfg(o->n, "BACKUP_STREAM", ""));
+    /* A live switch from before a restart: the saved settings win. (The file is the web interface's, in a
+     * directory only it can write to: noted, not removed.) */
     char path[64];
-    snprintf(path, sizeof path, RUN_DIR "/out%d.source", o->n);
-    unlink(path); /* a live switch from before a restart: the saved settings win */
+    struct stat st;
+    snprintf(path, sizeof path, CTL_DIR "/out%d.source", o->n);
+    o->source_stale = stat(path, &st) ? 0 : (uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec;
     o->rot_s = ocfg(o->n, "ROTATE", "0");
     o->mirror_s = ocfg(o->n, "MIRROR", "none");
     o->audio_s = ocfg(o->n, "AUDIO", "hdmi");
@@ -3681,7 +3781,7 @@ static void thumb_publish(struct output *o)
 {
     char path[64], tmp[72];
     struct stat st;
-    snprintf(path, sizeof path, RUN_DIR "/out%d.thumbreq", o->n);
+    snprintf(path, sizeof path, WEB_RUN "/out%d.thumbreq", o->n);
     if (stat(path, &st) || time(NULL) - st.st_mtime > 15)
         return;
 
@@ -3789,15 +3889,15 @@ static void thumb_publish(struct output *o)
     free(out);
 }
 
-/* /run/pindi/identify (written by the web UI): first line the output number (0 = all), then the
+/* /run/pindi-ctl/identify (written by the web UI): first line the output number (0 = all), then the
  * text to show. Shown for 15 s after the file was written. */
 static void identify_poll(const char *ip)
 {
     struct stat st;
     char buf[sizeof outs[0].ident + 16] = "";
     int which = -1;
-    if (!stat(RUN_DIR "/identify", &st) && time(NULL) - st.st_mtime < 15) {
-        FILE *f = fopen(RUN_DIR "/identify", "r");
+    if (!stat(CTL_DIR "/identify", &st) && time(NULL) - st.st_mtime < 15) {
+        FILE *f = fopen(CTL_DIR "/identify", "r");
         if (f) {
             size_t len = fread(buf, 1, sizeof buf - 1, f);
             buf[len] = 0;
