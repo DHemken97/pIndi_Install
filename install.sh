@@ -66,7 +66,8 @@ trap rollback ERR
 
 # Files edited on Windows get CRLF line endings; normalise the ones we use.
 sed -i 's/\r$//' "$SRC/pindi-player.c" "$SRC/pindi.service" "$SRC/pindi.conf" \
-    "$SRC/pindi-web.py" "$SRC/pindi-web.service" "$SRC/pindi-sender.c" "$SRC/pindi-sender.service"
+    "$SRC/pindi-web.py" "$SRC/pindi-web.service" "$SRC/pindi-webd.service" "$SRC/pindi-sender.c" \
+    "$SRC/pindi-sender.service"
 
 MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)
 echo "Model: $MODEL"
@@ -253,6 +254,15 @@ for g in video audio render; do
 done
 
 # Web administration (HTTPS on port 443; port 80 redirects). Logins are the Pi's own users in the sudo group.
+# Two services: the network-facing front end runs as the unprivileged pindi-web user; a root broker without
+# network access (pindi-webd) signs users in and makes every change, asked over a local socket.
+if ! id pindi-web >/dev/null 2>&1; then
+    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin pindi-web
+fi
+# NDI config (pindi-media), capture modes and throttling (video), the logs page (systemd-journal).
+for g in pindi-media video systemd-journal; do
+    if getent group "$g" >/dev/null; then usermod -aG "$g" pindi-web; fi
+done
 install -d /usr/local/lib/pindi
 put "$SRC/pindi-web.py" /usr/local/lib/pindi/pindi-web.py 755
 cat > /etc/pam.d/pindi-web <<'EOF'
@@ -260,7 +270,19 @@ cat > /etc/pam.d/pindi-web <<'EOF'
 @include common-auth
 @include common-account
 EOF
+put "$SRC/pindi-webd.service" /etc/systemd/system/pindi-webd.service 644
 put "$SRC/pindi-web.service" /etc/systemd/system/pindi-web.service 644
+# The front end serves TLS: its key is readable by pindi-web (the broker keeps it that way).
+if [ -d /etc/pindi/tls ]; then
+    # A certificate from before certificates could be uploaded is the device's own: the web interface makes
+    # it again for the current names and addresses (an empty list never matches).
+    if [ -f /etc/pindi/tls/cert.pem ] && [ ! -f /etc/pindi/tls/self-signed ] && [ ! -f /etc/pindi/tls/uploaded ]; then
+        : > /etc/pindi/tls/self-signed
+    fi
+    chown -R root:pindi-web /etc/pindi/tls
+    chmod 750 /etc/pindi/tls
+    chmod 640 /etc/pindi/tls/key.pem 2>/dev/null || true
+fi
 
 # Outgoing NDI streams from capture devices: does nothing until enabled in the web UI.
 put "$SRC/pindi-sender.service" /etc/systemd/system/pindi-sender.service 644
@@ -339,7 +361,7 @@ EOF
 systemctl try-restart systemd-resolved.service || true
 
 systemctl daemon-reload
-systemctl enable pindi.service pindi-web.service pindi-sender.service
+systemctl enable pindi.service pindi-webd.service pindi-web.service pindi-sender.service
 
 # ---------------------------------------------------------------- boot speed
 step "Optimising boot ($BOOT)"

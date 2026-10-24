@@ -1,0 +1,32 @@
+[Unit]
+Description=PiNDI web administration: privileged broker
+# The only part of the web interface that runs as root: sign-in, sessions and every change to the device,
+# asked for by the front end (pindi-web.service) over /run/pindi-webd/broker.sock. It has no network access.
+After=network.target pindi.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/pindi/pindi-web.py --broker
+# pindi-webd: the socket (group pindi-web); pindi-ctl: live switches and Identify for the player.
+RuntimeDirectory=pindi-webd pindi-ctl
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+Restart=always
+RestartSec=2
+RestartSteps=5
+RestartMaxDelaySec=30
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# Local socket and netlink (ip, iw, networkctl) only: nothing from the network reaches it directly.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

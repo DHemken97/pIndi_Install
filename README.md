@@ -85,8 +85,11 @@ Open `https://<IP shown on the splash>/` and sign in with the Pi's own user (a
 member of the `sudo` group, e.g. the user from step 1). If you signed in with a
 well-known default password, the page reminds you to change it.
 
-The device makes its own certificate, so the browser warns the first time:
-accept it for this device. `http://` addresses are redirected to `https://`.
+The device makes its own certificate, so the browser warns the first time. To
+be sure it's this device, compare the browser's certificate fingerprint with the
+one under **Device settings → HTTPS certificate**, then accept it. To avoid the warning altogether, upload a
+certificate from your organisation's certificate authority there. `http://`
+page addresses are redirected to `https://`.
 
 Out of the box, output 1 shows the stream `OUT_<serial>` and output 2 shows
 `OUT_<serial>_2`, from any host. Either name your sender like that, or pick a
@@ -198,9 +201,22 @@ The token is under **Device settings → HTTP API**. Send it as
 (`?token=`) are not accepted: URLs end up in logs and browser histories.
 Request bodies can be JSON or form data.
 
-The API is served over HTTPS only, with the device's own certificate. Tell the
-client to accept it: `curl -k`, or in Bitfocus Companion's generic HTTP module
-turn off certificate checking.
+The API is served over HTTPS only. A request with a token sent to `http://`
+gets a 403. If it was the valid token, it has crossed the network unencrypted,
+so it is replaced at once (Device settings shows a note): fix the client's URL
+and give it the new token.
+
+With the device's own (self-signed) certificate, don't just switch off
+certificate checks (`curl -k` alone): pin the device's key instead, so an
+impostor is refused. The pin is under **Device settings → HTTPS certificate**:
+
+```sh
+curl -k --pinnedpubkey "sha256//<pin>" -H "Authorization: Bearer $TOKEN" https://192.168.1.50/api/v1/status
+```
+
+`--pinnedpubkey` is checked even with `-k`. Clients that can't pin, such as
+Bitfocus Companion's generic HTTP module, need either a certificate from a CA
+they trust (upload it in Device settings), or a network you trust.
 
 | Request | Body | Does |
 | --- | --- | --- |
@@ -212,11 +228,13 @@ turn off certificate checking.
 Example:
 
 ```sh
-curl -k -H "Authorization: Bearer $TOKEN" -d stream="CAM 2" https://192.168.1.50/api/v1/outputs/1/source
+curl -k --pinnedpubkey "sha256//<pin>" -H "Authorization: Bearer $TOKEN" -d stream="CAM 2" \
+    https://192.168.1.50/api/v1/outputs/1/source
 ```
 
-Wrong tokens count as failed sign-ins: after 5 failures in 10 minutes, the
-address is locked out for 10 minutes.
+Wrong tokens are answered after a second's delay. They never lock anyone out:
+the token is a random 192-bit value that can't be guessed, and a valid token
+always works.
 
 ## Files
 
@@ -224,7 +242,7 @@ address is locked out for 10 minutes.
 | --- | --- |
 | `/etc/default/pindi` | Settings (`PINDI_*`), documented in `pindi.conf`. Normally edited through the web interface. |
 | `/etc/pindi/ndi-config.v1.json` | NDI Discovery Server, groups, machine name, receive transport, NDI licence (readable by root and `pindi-media` only) |
-| `/etc/pindi/tls/` | The web interface's certificate and key (delete both and restart `pindi-web` to make new ones) |
+| `/etc/pindi/tls/` | The web interface's certificate and key (root and `pindi-web` only). The device's own is made again when its name or addresses change; an uploaded one is kept |
 | `/usr/share/pindi/update-key.pub` | Public key that software updates must be signed with |
 | `/var/lib/pindi/previous/` | Files the last installation replaced (for a manual rollback) |
 | `/var/log/pindi-os-update.log` | Last operating-system update |
@@ -233,38 +251,59 @@ address is locked out for 10 minutes.
 | `/etc/pindi/api-token` | HTTP API token |
 | `/etc/systemd/network/20-pindi-wired.network` | Network settings |
 | `/etc/wpa_supplicant/wpa_supplicant-wlan0.conf`, `/etc/systemd/network/25-pindi-wifi.network` | Wi-Fi settings (the password is stored only as the derived WPA key) |
-| `/run/pindi/` | Live state for the web interface (status, previews) |
+| `/run/pindi/` | Live state from the player and sender (status, previews); root never writes here |
+| `/run/pindi-ctl/` | Live switches and Identify, from the web interface to the player (root only) |
 
 Services: `pindi` (splash and receiver), `pindi-sender` (outgoing streams),
-`pindi-web` (web interface), `pindi-os-update` (operating-system updates).
-Logs: `journalctl -u pindi -u pindi-sender -u pindi-web`, or **View logs** in
-the web interface.
+`pindi-web` (web interface), `pindi-webd` (the web interface's privileged
+part), `pindi-os-update` (operating-system updates). Logs:
+`journalctl -u pindi -u pindi-sender -u pindi-web -u pindi-webd`, or **View
+logs** in the web interface.
 
 ## Security
 
-- **Web interface:** HTTPS only (TLS 1.2 or later). Sign-in uses the Pi's own
+- **Web interface:** HTTPS only (TLS 1.2 or later). Port 80 only redirects
+  browsers asking for a page; sign-ins, forms and API calls sent there are
+  refused (403), not redirected with their contents. Sign-in uses the Pi's own
   accounts and is limited to the `sudo` group. Session cookies are `Secure`,
   `HttpOnly` and `SameSite=Strict`, and every change needs the page's CSRF
   token.
+- **Certificate:** the device's own self-signed certificate names its host
+  name, `<name>.local` and current addresses, and is made again when they
+  change. Device settings shows its fingerprint and public-key pin so clients
+  can check it, or you can upload your own (see the HTTP API section).
 - **Sessions:** changing a password signs that user out everywhere else.
-- **Lockout:** after 5 failed sign-ins (or wrong API tokens) in 10 minutes, an
-  address is locked out for 10 minutes.
+- **Lockout:** after 5 failed sign-ins for one user name from one address in
+  10 minutes, that name is locked out from that address for 10 minutes. Others
+  behind the same address (NAT) can still sign in. After 30 failures from one
+  address (any names), the whole address waits 10 minutes. Wrong API tokens
+  don't lock anyone out (see the HTTP API section).
 - **Request limits:** requests are size-checked before they are read, and idle
   connections are closed after 20 s. At most 8 connections from one address
   are handled at a time (64 in all), so one misbehaving client can't lock
   everyone out.
 - **Privileges:** the player and sender run as the unprivileged `pindi-media`
   user (groups `video`, `audio`, `render`), in a systemd sandbox with a
-  read-only system. The web interface has to run as root, because it changes
-  passwords, the host name, the network and the boot configuration. It still
-  runs with the systemd restrictions that don't get in the way of that.
+  read-only system.
+- **Web interface split in two:**
+  - The part on the network, `pindi-web` (TLS, HTTP, pages, uploads), runs as
+    the unprivileged `pindi-web` user on a read-only system. It can only read
+    the device's state.
+  - Every change goes through `pindi-webd`, a small root process with no
+    network access, over a local socket only `pindi-web` can use. It checks the
+    session and CSRF token itself: sign-in, passwords, settings, network,
+    updates.
+  - A flaw in the exposed part therefore doesn't give root.
+  - Root never writes into a directory the media user can write to, so a
+    compromised player can't redirect its writes.
 - **Software updates** must be signed (see Updating).
 - **Operating-system updates are off by default,** so nothing downloads or
   upgrades during a show. Under **Device settings**, set a daily time for them,
   ideally just before the daily reboot. You can also press **Install OS updates
   now** under System. Either needs internet access. Devices that never get OS
-  updates miss security fixes: turn it on, or re-run `install.sh` (which runs
-  `apt full-upgrade`) now and then.
+  updates miss security fixes. When no packages have been updated for 30 days,
+  the Device card and every sign-in say so. Then turn OS updates on, or re-run
+  `install.sh` (which runs `apt full-upgrade`) now and then.
 - **Network exposure:** the device listens on 80/443 (web interface), 22 (SSH),
   5353 (mDNS) and the NDI ports (5960 and up). LLMNR is switched off. SSH
   accepts the Pi user's password. Use a strong password, or SSH keys with
