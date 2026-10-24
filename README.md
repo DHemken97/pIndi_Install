@@ -40,6 +40,14 @@ or 5 has two HDMI outputs and Gigabit Ethernet.
 - `--no-reboot` skips the reboot at the end. Without a reboot, restart the
   services yourself: `sudo systemctl restart pindi pindi-sender pindi-web`.
 
+On a Pi 4, 400 or 5 (models with a bootloader EEPROM), `install.sh` also
+switches off the bootloader's own HDMI screen (`DISABLE_HDMI=1`,
+`NET_INSTALL_AT_POWER_ON=0`). Otherwise its network-install prompt flashes up
+before the splash at every power-on. This also skips network install, so
+booting is up to a second faster. Boot errors are still signalled by the green
+LED. The EEPROM is updated at the next reboot, and `sudo rpi-eeprom-config
+--edit` changes it back.
+
 The NDI SDK archive is downloaded by hand, and NDI publishes no checksums.
 `install.sh` prints the archive's SHA-256. If a checksum file
 `Install_NDI_..._Linux.tar.gz.sha256` (from `sha256sum`) is next to the

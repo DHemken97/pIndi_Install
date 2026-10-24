@@ -456,6 +456,21 @@ done
 # The Pi 3 has no bootloader EEPROM.
 if ! grep -qE "Raspberry Pi (4|5|400|500|Compute Module (4|5))" /proc/device-tree/model 2>/dev/null; then
     unit_exists rpi-eeprom-update.service && systemctl disable rpi-eeprom-update.service >/dev/null 2>&1 || true
+elif command -v rpi-eeprom-config >/dev/null; then
+    # Pi 4/5: the bootloader draws its own screen on HDMI - the network-install prompt after every cold boot
+    # (NET_INSTALL_AT_POWER_ON=1 in Raspberry Pi's images), flashing up before the splash. DISABLE_HDMI=1
+    # keeps it off HDMI and skips network install (up to a second faster); boot errors still show on the
+    # green LED. Written only when different; the EEPROM is updated at the next reboot.
+    EEPROM=$(rpi-eeprom-config 2>/dev/null || true)
+    if [ -n "$EEPROM" ] && ! { grep -qx "DISABLE_HDMI=1" <<<"$EEPROM" && grep -qx "NET_INSTALL_AT_POWER_ON=0" <<<"$EEPROM"; }; then
+        { grep -v -E "^(DISABLE_HDMI|NET_INSTALL_AT_POWER_ON)=" <<<"$EEPROM"; printf '[all]\nDISABLE_HDMI=1\nNET_INSTALL_AT_POWER_ON=0\n'; } \
+            > "$TMP/bootloader.conf"
+        if rpi-eeprom-config --apply "$TMP/bootloader.conf" >/dev/null 2>&1; then
+            echo "Bootloader: its HDMI screen switched off (applied at the next reboot)"
+        else
+            echo "Bootloader: could not update its configuration (it keeps its HDMI screen)" >&2
+        fi
+    fi
 fi
 
 # Camera / ISP drivers are never used; they cost boot time. The Pi 3/4 hardware H.264
