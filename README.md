@@ -100,6 +100,24 @@ Outputs showing the same stream share one receiver: it is received and decoded
 once, and each output shows the decoded picture with its own rotation, mirror,
 brightness and audio settings.
 
+## Which Pi for which job
+
+Measured with USB capture cards (MJPEG) and 1080p monitors; the details are
+under [Outgoing streams](#outgoing-streams) and [NDI|HX](#ndihx).
+
+| Board | One input (send) | One output (show) | Two outputs | Input and output |
+| --- | --- | --- | --- | --- |
+| Pi 3B / 3B+ | Limited: NDI\|HX 720p60 at 50 fps, 1080p at 19-28 fps; Full NDI 7-16 fps | Yes: Full NDI 1080p60 at 55-59 fps, HX 1080p30 at full rate (about 45 ms on the Pi) | No (one HDMI port) | Only at 720p60 HX (50 fps out, 52-57 ms display delay); at 1080p the display delay reaches 200-900 ms |
+| Pi 4B | Yes: 1080p30 HX at the full rate (1080p60 card about 28 fps). Two cards: 24-27 fps each with one at 720p, CPU at its limit | Yes: 60 fps | Yes: 1080p60 on both, no dropped frames, about 40% CPU | Yes: sends about 28 fps HX while showing two streams, 33-40 ms (86% CPU) |
+| Pi 5 | Full NDI only (no H.264 encoder, so no HX); not measured yet | Yes: 1080p60 at 60 fps, about 21 ms on the Pi | Best: two different 1080p60 streams at 60 fps, 38% CPU; HX decoded in software at full rate | Not measured yet |
+
+In short: a Pi 3 does one job (shows one stream, or sends one input at 720p
+HX); a Pi 4 is the all-rounder and the board for capture; a Pi 5 is the best
+display box. Wherever a Pi 3 or 4 shows a stream, have it sent as NDI|HX: a
+tenth of the bandwidth, and decoded in hardware with almost no CPU. Give a
+Pi 5 a heatsink before heavy use; a Pi 3/4 with under-voltage runs at half
+speed (see [Troubleshooting](#troubleshooting)).
+
 ## Web interface
 
 | Section | What you can do |
@@ -144,6 +162,12 @@ encoding CPU while no one is receiving it. If its picture stops (for example
 the HDMI source is unplugged), receivers get black instead of a frozen frame.
 When a switcher (vMix, TriCaster, ...) has the stream on program, the web
 interface shows it **ON AIR** (or "on preview").
+
+Inputs are USB (UVC) capture devices: MJPEG, YUYV or UYVY. HDMI-to-CSI boards
+(TC358743) are not supported yet: they need the board's overlay, an EDID and the
+source's timings set up, which PiNDI doesn't do. On a Pi 5 (two 4-lane camera
+ports) they could take 1080p60 without any MJPEG decoding; a Pi 3/4 camera port
+has 2 lanes, enough for about 1080p30.
 
 MJPEG from capture cards is decoded on two CPU cores (three with NDI|HX), so
 1080p60 cards deliver their full frame rate. An output showing one of the
