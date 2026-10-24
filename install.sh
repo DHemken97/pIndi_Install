@@ -92,6 +92,7 @@ PACKAGES=(gcc libc6-dev pkg-config
     avahi-daemon libavahi-client3
     systemd-resolved
     python3 libpam-runtime
+    iw wpasupplicant  # web interface: Wi-Fi connection, its status (network, signal) and the network scan
     openssl)  # web interface: HTTPS certificate, update signatures
 # The NDI Advanced SDK decodes NDI|HX (H.264/HEVC) with FFmpeg 7's libavcodec, loaded at run time.
 if [ -f "$SRC/Install_NDI_Advanced_SDK_v6_Linux.tar.gz" ]; then
